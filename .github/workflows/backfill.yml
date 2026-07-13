@@ -14,10 +14,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Warteschlange abarbeiten
+      - name: Warteschlange abarbeiten (SQP + PPC)
         run: node backfill-worker.mjs
         env:
           SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
           SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
+          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
+          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
+          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
