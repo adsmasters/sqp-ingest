@@ -1,0 +1,23 @@
+name: SQP Backfill Queue
+on:
+  workflow_dispatch: {}     # sofortiger Start per Button (via Vercel-Dispatch)
+  schedule:
+    - cron: '30 4 * * *'    # tägliches Auffangnetz 04:30 UTC
+concurrency:
+  group: sqp-quota          # nie parallel zu anderen SQP-Läufen (Amazon-Quota)
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Warteschlange abarbeiten
+        run: node backfill-worker.mjs
+        env:
+          SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
+          SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
