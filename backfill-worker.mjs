@@ -7,7 +7,9 @@ const H = { apikey: KEY, Authorization: 'Bearer ' + KEY, 'Content-Type': 'applic
 const iso = d => d.toISOString().slice(0, 10);
 
 async function queuedJobs() {
-  const r = await fetch(`${U}/rest/v1/sqp_backfill_jobs?status=eq.queued&order=requested_at.asc`, { headers: H });
+  // queued + verwaiste running-Jobs (>6h ohne Abschluss = abgebrochener Lauf)
+  const stale = new Date(Date.now() - 6 * 3600e3).toISOString();
+  const r = await fetch(`${U}/rest/v1/sqp_backfill_jobs?or=(status.eq.queued,and(status.eq.running,started_at.lt.${stale}))&order=requested_at.asc`, { headers: H });
   return r.ok ? await r.json() : [];
 }
 async function patch(id, body) {
