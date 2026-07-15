@@ -165,7 +165,7 @@ async function main() {
       await token(); // frisches Token je Kunde (Laeufe dauern lange, Access-Token ~60 Min)
       const ids = await createReports(cl.ads_profile_id);
       if (!Object.keys(ids).length) { console.log('  keine Reports erstellt — uebersprungen'); continue; }
-      console.log(`  ${Object.keys(ids).length}/6 Reports angefordert, warte auf Amazon…`);
+      console.log(`  ${Object.keys(ids).length}/${Object.keys(DEFS).length} Reports angefordert, warte auf Amazon…`);
       const data = await waitAndDownload(cl.ads_profile_id, ids);
       const entities = await spEntities(cl.ads_profile_id);
       const payload = aggregate(data, entities);
