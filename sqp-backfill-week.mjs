@@ -91,11 +91,27 @@ async function listAsinsFromDb(){
   }catch(e){ return null; }
 }
 async function listAsins(){
-  const db=await listAsinsFromDb(); if(db&&db.length){ console.log(`  ${db.length} ASINs aus DB (neuester Monat)`); return db; }
+  const db=await listAsinsFromDb(); if(db&&db.length){ console.log(`  ${db.length} ASINs aus DB (neuester Monat)`); return applyBrandFilter(db); }
   console.log('  DB leer -> Merchant-Report (Fallback)');
-  for(let a=0;a<5;a++){ try{ const r=await listAsinsOnce(); if(r&&r.length) return r; }catch(e){ console.log(`  listAsins Versuch ${a+1}: ${e.message}`); }
+  for(let a=0;a<5;a++){ try{ const r=await listAsinsOnce(); if(r&&r.length) return applyBrandFilter(r); }catch(e){ console.log(`  listAsins Versuch ${a+1}: ${e.message}`); }
     console.log(`  listAsins gedrosselt/leer, warte 40s (Versuch ${a+1}/5)…`); await sleep(40000); }
   throw new Error('listAsins fehlgeschlagen (DB leer + SP-API-Drossel?)');
+}
+// Marken-Filter (Union der brand_filter aller aktiven Kunden dieses Sellers); Fallback = alle
+async function applyBrandFilter(asins){
+  const hd={apikey:KEY,Authorization:'Bearer '+KEY};
+  const cr=await fetch(`${U}/rest/v1/sqp_clients?spid=eq.${SPID}&active=eq.true&select=brand_filter`,{headers:hd});
+  const cl=cr.ok?await cr.json():[];
+  if(!cl.length||cl.some(c=>!c.brand_filter||!c.brand_filter.length)) return asins;
+  const want=new Set(cl.flatMap(c=>c.brand_filter));
+  const mr=await fetch(`${U}/rest/v1/sqp_asin_meta?spid=eq.${SPID}&brand=not.is.null&select=asin,brand&limit=10000`,{headers:{...hd,Range:'0-9999'}});
+  const meta=mr.ok?await mr.json():[];
+  if(!meta.length){ console.log('WARNUNG: Marken-Filter gesetzt, aber keine Marken in sqp_asin_meta — nehme ALLE ASINs.'); return asins; }
+  const byAsin=new Map(meta.map(m=>[m.asin,m.brand]));
+  const keep=asins.filter(a=>want.has(byAsin.get(a)));
+  if(!keep.length){ console.log('WARNUNG: Marken-Filter matcht 0 ASINs — nehme ALLE ASINs.'); return asins; }
+  console.log(`  Marken-Filter aktiv [${[...want].join(', ')}]: ${keep.length} von ${asins.length} ASINs.`);
+  return keep;
 }
 const num=x=>(x&&typeof x==='object'&&'amount'in x)?x.amount:x;
 function mapRows(data,asin){ return (data.dataByAsin||[]).map(r=>({

@@ -69,6 +69,29 @@ async function main() {
       if (up.ok) ok += Math.min(500, rows.length - i); else console.log('  UPSERT', up.status, (await up.text()).slice(0, 120));
     }
     console.log(`  ${cl.name}: ${ok} ASINs mit Titel/SKU gespeichert`);
+    // Marke je ASIN via Listings-Items-API ergaenzen (attributes.brand; Catalog-API-Rolle fehlt im Consent)
+    const br = await fetch(`${U}/rest/v1/sqp_asin_meta?spid=eq.${cl.spid}&brand=is.null&select=asin&limit=10000`, { headers: { ...sbHead, Range: '0-9999' } });
+    const missing = new Set(br.ok ? (await br.json()).map(x => x.asin) : []);
+    if (missing.size) {
+      const brandByAsin = {}; let pageToken = null;
+      for (let p = 0; p < 100; p++) {
+        const u = `/listings/2021-08-01/items/${cl.spid}?marketplaceIds=${mkt}&pageSize=20&includedData=summaries,attributes` + (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '');
+        const r = await api(H, u); if (!r || !r.ok) break;
+        const j = await r.json();
+        for (const it of (j.items || [])) {
+          const s = (it.summaries || [])[0] || {};
+          const b = it.attributes && it.attributes.brand && it.attributes.brand[0] && it.attributes.brand[0].value;
+          if (s.asin && b && missing.has(s.asin)) brandByAsin[s.asin] = b;
+        }
+        pageToken = j.pagination && j.pagination.nextToken; if (!pageToken) break;
+        await sleep(250);
+      }
+      const bu = Object.entries(brandByAsin).map(([asin, brand]) => ({ spid: cl.spid, asin, brand }));
+      for (let i = 0; i < bu.length; i += 500) {
+        await fetch(`${U}/rest/v1/sqp_asin_meta?on_conflict=spid,asin`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(bu.slice(i, i + 500)) });
+      }
+      console.log(`  ${cl.name}: Marken ergänzt für ${bu.length}/${missing.size} ASINs`);
+    }
   }
   console.log('FERTIG.');
 }

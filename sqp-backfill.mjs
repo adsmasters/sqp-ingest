@@ -64,7 +64,24 @@ async function listAsins(){
   let asins=[...new Set(lines.slice(1).map(l=>l.split('\t')).filter(r=>act.has((r[iS]||'').trim().toLowerCase())).map(r=>r[iA]).filter(Boolean))];
   if(!asins.length) asins=[...new Set(lines.slice(1).flatMap(l=>l.split('\t')).filter(a=>/^B0[A-Z0-9]{8}$/.test((a||'').trim())))]; // Fallback: alle Zellen nach ASIN-Muster scannen
   if(!asins.length){ console.error('FEHLER: keine ASINs im Listings-Report gefunden.'); process.exit(1); }
-  return asins;
+  return applyBrandFilter(asins);
+}
+// Marken-Filter: Union der brand_filter aller aktiven Kunden dieses Sellers (sqp_clients).
+// Kein Filter bei irgendeinem Kunden = alle Marken. Fallback auf alle, wenn Marken-Infos fehlen.
+async function applyBrandFilter(asins){
+  const hd={apikey:KEY,Authorization:'Bearer '+KEY};
+  const cr=await fetch(`${U}/rest/v1/sqp_clients?spid=eq.${SPID}&active=eq.true&select=brand_filter`,{headers:hd});
+  const cl=cr.ok?await cr.json():[];
+  if(!cl.length||cl.some(c=>!c.brand_filter||!c.brand_filter.length)) return asins;
+  const want=new Set(cl.flatMap(c=>c.brand_filter));
+  const mr=await fetch(`${U}/rest/v1/sqp_asin_meta?spid=eq.${SPID}&brand=not.is.null&select=asin,brand&limit=10000`,{headers:{...hd,Range:'0-9999'}});
+  const meta=mr.ok?await mr.json():[];
+  if(!meta.length){ console.log('WARNUNG: Marken-Filter gesetzt, aber keine Marken in sqp_asin_meta — importiere ALLE ASINs.'); return asins; }
+  const byAsin=new Map(meta.map(m=>[m.asin,m.brand]));
+  const keep=asins.filter(a=>want.has(byAsin.get(a)));
+  if(!keep.length){ console.log('WARNUNG: Marken-Filter matcht 0 ASINs — importiere ALLE ASINs.'); return asins; }
+  console.log(`Marken-Filter aktiv [${[...want].join(', ')}]: ${keep.length} von ${asins.length} ASINs.`);
+  return keep;
 }
 const num=x=>(x&&typeof x==='object'&&'amount'in x)?x.amount:x;
 function mapRows(data,asin){ return (data.dataByAsin||[]).map(r=>({

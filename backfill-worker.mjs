@@ -27,14 +27,15 @@ for (const j of list) {
   console.log(`\n=== Job ${j.id}: ${j.spid} (${j.marketplace_id}) ===`);
   await patch(j.id, { status: 'running', started_at: new Date().toISOString() });
   const env = { ...process.env, SQP_SPID: j.spid, SQP_MKT: j.marketplace_id, SQP_CREATE_GAP: '15000' };
+  // Meta ZUERST (Titel/SKU/Status/Marke) — der Marken-Filter braucht die Brand-Zuordnung vor dem SQP-Import
+  console.log('--- Produkt-Meta (Titel/SKU/Marke) ---');
+  spawnSync('node', ['asin-meta.mjs'], { stdio: 'inherit', env: process.env });
   const m = spawnSync('node', ['sqp-backfill.mjs', start, end, '3'], { stdio: 'inherit', env });
   const w = spawnSync('node', ['sqp-backfill-week.mjs', '13', '3'], { stdio: 'inherit', env });
   // PPC-Daten im selben Rutsch (Ads-API, eigene Quota): 30T-Snapshot + Monats-Historie
   console.log('--- PPC-Daten (Ads) ---');
   spawnSync('node', ['ads-refresh.mjs'], { stdio: 'inherit', env: process.env });
   spawnSync('node', ['ads-periodic.mjs', '4'], { stdio: 'inherit', env: process.env });
-  // Produkt-Titel + SKUs (für Anzeige & Kampagnen-Anlage)
-  spawnSync('node', ['asin-meta.mjs'], { stdio: 'inherit', env: process.env });
   if (m.status === 0 && w.status === 0) {
     await patch(j.id, { status: 'done', finished_at: new Date().toISOString(), note: null });
     console.log(`Job ${j.id}: FERTIG`);

@@ -34,8 +34,26 @@ async function pollDoc(api,id){ for(let i=0;i<60;i++){await sleep(5000);const g=
 async function download(api,docId){ const dr=await api(`/reports/2021-06-30/documents/${docId}`);const drj=await dr.json();const raw=await fetch(drj.url);let buf=Buffer.from(await raw.arrayBuffer());if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);return JSON.parse(buf.toString('utf8')); }
 async function listAsins(api,mkt){ const c=await api(`/reports/2021-06-30/reports`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reportType:'GET_MERCHANT_LISTINGS_ALL_DATA',marketplaceIds:[mkt]})});
   const docId=await pollDoc(api,(await c.json()).reportId); const dr=await api(`/reports/2021-06-30/documents/${docId}`);const drj=await dr.json();const raw=await fetch(drj.url);let buf=Buffer.from(await raw.arrayBuffer());if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);
-  const lines=buf.toString('latin1').split('\n').filter(Boolean);const hdr=lines[0].split('\t');const iA=hdr.findIndex(h=>/asin1/i.test(h)),iS=hdr.findIndex(h=>/status/i.test(h));
-  return [...new Set(lines.slice(1).map(l=>l.split('\t')).filter(r=>(r[iS]||'').trim()==='Active').map(r=>r[iA]).filter(Boolean))]; }
+  const lines=buf.toString('latin1').split('\n').filter(Boolean);const hdr=lines[0].split('\t');const iA=hdr.findIndex(h=>/asin[\s_]*1/i.test(h)),iS=hdr.findIndex(h=>/status/i.test(h));
+  const ACT=new Set(['active','aktiv','actif','activo','attivo']); // Report ist lokalisiert (DE: "Aktiv")
+  let asins=[...new Set(lines.slice(1).map(l=>l.split('\t')).filter(r=>ACT.has((r[iS]||'').trim().toLowerCase())).map(r=>r[iA]).filter(Boolean))];
+  if(!asins.length) asins=[...new Set(lines.slice(1).flatMap(l=>l.split('\t')).filter(a=>/^B0[A-Z0-9]{8}$/.test((a||'').trim())))];
+  return asins; }
+// Marken-Filter (Union der brand_filter aller aktiven Kunden dieses Sellers); Fallback = alle
+async function applyBrandFilter(spid,asins){
+  const cr=await fetch(`${U}/rest/v1/sqp_clients?spid=eq.${spid}&active=eq.true&select=brand_filter`,{headers:sbHead});
+  const cl=cr.ok?await cr.json():[];
+  if(!cl.length||cl.some(c=>!c.brand_filter||!c.brand_filter.length)) return asins;
+  const want=new Set(cl.flatMap(c=>c.brand_filter));
+  const mr=await fetch(`${U}/rest/v1/sqp_asin_meta?spid=eq.${spid}&brand=not.is.null&select=asin,brand&limit=10000`,{headers:{...sbHead,Range:'0-9999'}});
+  const meta=mr.ok?await mr.json():[];
+  if(!meta.length) return asins;
+  const byAsin=new Map(meta.map(m=>[m.asin,m.brand]));
+  const keep=asins.filter(a=>want.has(byAsin.get(a)));
+  if(!keep.length) return asins;
+  console.log(`  Marken-Filter aktiv [${[...want].join(', ')}]: ${keep.length} von ${asins.length} ASINs.`);
+  return keep;
+}
 const num=x=>(x&&typeof x==='object'&&'amount'in x)?x.amount:x;
 function mapRows(data,spid,mkt,asin,period){ return (data.dataByAsin||[]).map(r=>({selling_partner_id:spid,marketplace_id:mkt,asin,report_period:period,start_date:r.startDate,end_date:r.endDate,
   search_query:r.searchQueryData?.searchQuery,search_query_score:r.searchQueryData?.searchQueryScore,search_query_volume:r.searchQueryData?.searchQueryVolume,
@@ -52,7 +70,7 @@ async function refreshClient(client){
   const {spid,marketplace,name}=client; const mkt=MKT_BY_CC[marketplace]||MKT_BY_CC.DE;
   const at=await accessToken(spid); if(!at){console.log(`  ${name}: kein SP-API-Token`);return;}
   const H={'x-amz-access-token':at,'Content-Type':'application/json'}; const api=makeApi(H);
-  const asins=await listAsins(api,mkt); console.log(`  ${name}: ${asins.length} ASINs`);
+  const asins=await applyBrandFilter(spid, await listAsins(api,mkt)); console.log(`  ${name}: ${asins.length} ASINs`);
   // Aufgaben: MONTH (prev+cur), WEEK (letzte N) — alle force (überschreiben)
   const jobs=[]; for(const m of months()) for(const a of asins) jobs.push({a,period:'MONTH',start:m,end:monthEnd(m)});
   for(const w of weeks(NWEEKS)) for(const a of asins) jobs.push({a,period:'WEEK',start:w,end:satOf(w)});
