@@ -48,14 +48,21 @@ async function main() {
     const iA = hdr.findIndex(h => /asin[\s_]*1/i.test(h));
     const iT = hdr.findIndex(h => /item-?name|artikelbezeichnung/i.test(h));
     const iK = hdr.findIndex(h => /seller-?sku|ndler-?sku/i.test(h));
-    const map = new Map(); // asin -> {sku,title} (erste Nennung gewinnt)
+    const iS = hdr.findIndex(h => /^status$|angebotsstatus|listing-?status/i.test((h || '').trim()));
+    const ACT = new Set(['active', 'aktiv', 'actif', 'activo', 'attivo']);
+    const map = new Map(); // asin -> {sku,title,status} (aktivste Nennung gewinnt)
     for (const l of lines.slice(1)) {
       const r = l.split('\t');
       const asin = (iA >= 0 ? r[iA] : (r.find(x => /^B0[A-Z0-9]{8}$/.test((x || '').trim())) || '')).trim();
-      if (!/^B0[A-Z0-9]{8}$/.test(asin) || map.has(asin)) continue;
-      map.set(asin, { sku: iK >= 0 ? (r[iK] || '').trim() : null, title: iT >= 0 ? (r[iT] || '').trim().slice(0, 300) : null });
+      if (!/^B0[A-Z0-9]{8}$/.test(asin)) continue;
+      const raw = iS >= 0 ? (r[iS] || '').trim().toLowerCase() : '';
+      const status = !raw ? null : (ACT.has(raw) ? 'active' : 'inactive');
+      const prev = map.get(asin);
+      if (prev && prev.status === 'active') continue; // aktive Nennung nicht überschreiben
+      if (prev && !prev.status && status !== 'active') continue;
+      map.set(asin, { sku: iK >= 0 ? (r[iK] || '').trim() : null, title: iT >= 0 ? (r[iT] || '').trim().slice(0, 300) : null, status });
     }
-    const rows = [...map.entries()].map(([asin, m]) => ({ spid: cl.spid, asin, sku: m.sku || null, title: m.title || null }));
+    const rows = [...map.entries()].map(([asin, m]) => ({ spid: cl.spid, asin, sku: m.sku || null, title: m.title || null, status: m.status }));
     let ok = 0;
     for (let i = 0; i < rows.length; i += 500) {
       const up = await fetch(`${U}/rest/v1/sqp_asin_meta?on_conflict=spid,asin`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows.slice(i, i + 500)) });
