@@ -33,6 +33,8 @@ for (const j of list) {
   console.log('--- PPC-Daten (Ads) ---');
   spawnSync('node', ['ads-refresh.mjs'], { stdio: 'inherit', env: process.env });
   spawnSync('node', ['ads-periodic.mjs', '4'], { stdio: 'inherit', env: process.env });
+  // Produkt-Titel + SKUs (für Anzeige & Kampagnen-Anlage)
+  spawnSync('node', ['asin-meta.mjs'], { stdio: 'inherit', env: process.env });
   if (m.status === 0 && w.status === 0) {
     await patch(j.id, { status: 'done', finished_at: new Date().toISOString(), note: null });
     console.log(`Job ${j.id}: FERTIG`);
