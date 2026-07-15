@@ -75,7 +75,7 @@ function mapRows(data,asin){ return (data.dataByAsin||[]).map(r=>({
   total_cart_add_count:r.cartAddData?.totalCartAddCount,asin_cart_add_count:r.cartAddData?.asinCartAddCount,asin_cart_add_share:r.cartAddData?.asinCartAddShare,
   total_purchase_count:r.purchaseData?.totalPurchaseCount,asin_purchase_count:r.purchaseData?.asinPurchaseCount,asin_purchase_share:r.purchaseData?.asinPurchaseShare,
   asin_median_purchase_price:num(r.purchaseData?.asinMedianPurchasePrice),
-})).filter(x=>x.search_query); }
+})).filter(x=>x.search_query&&(+x.search_query_volume||0)>=50); } // Mini-Volumen raus
 async function hasData(asin,month){
   const r=await fetch(`${U}/rest/v1/sqp_asin_rows?selling_partner_id=eq.${SPID}&marketplace_id=eq.${MKT}&asin=eq.${asin}&report_period=eq.MONTH&start_date=eq.${month}&select=id`,{headers:{apikey:KEY,Authorization:'Bearer '+KEY,Prefer:'count=exact',Range:'0-0'}});
   const cr=r.headers.get('content-range')||'0-0/0'; return +cr.split('/')[1]>0;

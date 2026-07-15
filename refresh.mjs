@@ -43,7 +43,7 @@ function mapRows(data,spid,mkt,asin,period){ return (data.dataByAsin||[]).map(r=
   total_click_count:r.clickData?.totalClickCount,asin_click_count:r.clickData?.asinClickCount,asin_click_share:r.clickData?.asinClickShare,
   total_cart_add_count:r.cartAddData?.totalCartAddCount,asin_cart_add_count:r.cartAddData?.asinCartAddCount,asin_cart_add_share:r.cartAddData?.asinCartAddShare,
   total_purchase_count:r.purchaseData?.totalPurchaseCount,asin_purchase_count:r.purchaseData?.asinPurchaseCount,asin_purchase_share:r.purchaseData?.asinPurchaseShare,
-  asin_median_purchase_price:num(r.purchaseData?.asinMedianPurchasePrice)})).filter(x=>x.search_query); }
+  asin_median_purchase_price:num(r.purchaseData?.asinMedianPurchasePrice)})).filter(x=>x.search_query&&(+x.search_query_volume||0)>=(period==="WEEK"?10:50)); } // Mini-Volumen raus
 async function upsert(rows,spid,mkt,asin,period,start){ const q=`selling_partner_id=eq.${spid}&marketplace_id=eq.${mkt}&asin=eq.${asin}&report_period=eq.${period}&start_date=eq.${start}`;
   await fetch(`${U}/rest/v1/sqp_asin_rows?${q}`,{method:'DELETE',headers:sbHead}); if(!rows.length)return 0;
   const ins=await fetch(`${U}/rest/v1/sqp_asin_rows`,{method:'POST',headers:{...sbHead,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(rows)}); return ins.ok?rows.length:0; }
