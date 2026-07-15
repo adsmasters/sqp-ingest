@@ -27,6 +27,13 @@ async function token() {
   AT = (await t.json()).access_token;
 }
 const hdr = (profileId, ct) => ({ 'Amazon-Advertising-API-ClientId': CID, 'Amazon-Advertising-API-Scope': String(profileId), Authorization: 'Bearer ' + AT, ...(ct ? { 'Content-Type': ct } : {}) });
+// fetch mit Retry gegen transiente Netzfehler (der Lauf dauert lange — Verbindungen flappen)
+async function rfetch(url, opts, tries = 4) {
+  for (let i = 0; i < tries; i++) {
+    try { return await fetch(url, opts); }
+    catch (e) { if (i === tries - 1) throw e; await sleep(8000 * (i + 1)); }
+  }
+}
 const sum = (rows, f) => rows.reduce((s, r) => s + (+r[f] || 0), 0);
 const agg = (rows, sales, purch) => ({ impressions: sum(rows, 'impressions'), clicks: sum(rows, 'clicks'), spend: sum(rows, 'cost'), sales: sum(rows, sales), orders: sum(rows, purch) });
 
@@ -36,10 +43,14 @@ async function createReports(profileId) {
   const ids = {};
   for (const [k, d] of Object.entries(DEFS)) {
     for (let a = 0; a < 8; a++) {
-      const r = await fetch(`${ADS}/reporting/reports`, { method: 'POST', headers: hdr(profileId, 'application/vnd.createasyncreportrequest.v3+json'), body: JSON.stringify({ name: `audit ${k}`, startDate: start, endDate: end, configuration: { ...d, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } }) });
+      const r = await rfetch(`${ADS}/reporting/reports`, { method: 'POST', headers: hdr(profileId, 'application/vnd.createasyncreportrequest.v3+json'), body: JSON.stringify({ name: `audit ${k}`, startDate: start, endDate: end, configuration: { ...d, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } }) });
       if (r.status === 429) { await sleep(20000); continue; }
       const j = await r.json().catch(() => ({}));
       if (r.ok && j.reportId) ids[k] = j.reportId;
+      else if (r.status === 425) { // Duplicate — Amazon nennt die existierende Report-ID, die nehmen wir
+        const m = JSON.stringify(j).match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/i);
+        if (m) ids[k] = m[0]; else console.log(`    ${k}: 425 ohne Report-ID`);
+      }
       else console.log(`    ${k}: HTTP ${r.status} ${JSON.stringify(j).slice(0, 120)}`);
       break;
     }
@@ -53,10 +64,10 @@ async function waitAndDownload(profileId, ids) {
     let allDone = true;
     for (const [k, id] of Object.entries(ids)) {
       if (data[k]) continue;
-      const r = await fetch(`${ADS}/reporting/reports/${id}`, { headers: hdr(profileId) });
+      const r = await rfetch(`${ADS}/reporting/reports/${id}`, { headers: hdr(profileId) });
       const j = r.ok ? await r.json() : {};
       if (j.status === 'COMPLETED' && j.url) {
-        try { data[k] = JSON.parse(zlib.gunzipSync(Buffer.from(await (await fetch(j.url)).arrayBuffer())).toString()); }
+        try { data[k] = JSON.parse(zlib.gunzipSync(Buffer.from(await (await rfetch(j.url)).arrayBuffer())).toString()); }
         catch (e) { data[k] = []; }
       } else if (j.status === 'FAILURE') data[k] = [];
       else allDone = false;
@@ -72,7 +83,7 @@ async function spEntities(profileId) {
   const map = new Map(); const vnd = 'application/vnd.spCampaign.v3+json'; let nt = null;
   for (let i = 0; i < 10; i++) {
     const body = { maxResults: 500, stateFilter: { include: ['ENABLED', 'PAUSED'] } }; if (nt) body.nextToken = nt;
-    const r = await fetch(`${ADS}/sp/campaigns/list`, { method: 'POST', headers: { ...hdr(profileId, vnd), Accept: vnd }, body: JSON.stringify(body) });
+    const r = await rfetch(`${ADS}/sp/campaigns/list`, { method: 'POST', headers: { ...hdr(profileId, vnd), Accept: vnd }, body: JSON.stringify(body) });
     if (!r.ok) break; const j = await r.json();
     for (const c of (j.campaigns || [])) map.set(String(c.campaignId), c);
     nt = j.nextToken; if (!nt) break;
@@ -151,6 +162,7 @@ async function main() {
     if (seen.has(cl.ads_profile_id)) continue; seen.add(cl.ads_profile_id);
     console.log(`\n=== ${cl.name} (${cl.spid}) ===`);
     try {
+      await token(); // frisches Token je Kunde (Laeufe dauern lange, Access-Token ~60 Min)
       const ids = await createReports(cl.ads_profile_id);
       if (!Object.keys(ids).length) { console.log('  keine Reports erstellt — uebersprungen'); continue; }
       console.log(`  ${Object.keys(ids).length}/6 Reports angefordert, warte auf Amazon…`);
@@ -158,7 +170,7 @@ async function main() {
       const entities = await spEntities(cl.ads_profile_id);
       const payload = aggregate(data, entities);
       payload.failed = Object.keys(DEFS).filter(k => !ids[k]);
-      const up = await fetch(`${U}/rest/v1/ads_audit_cache?on_conflict=spid,days`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ spid: cl.spid, days: DAYS, payload, updated_at: new Date().toISOString() }) });
+      const up = await rfetch(`${U}/rest/v1/ads_audit_cache?on_conflict=spid,days`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ spid: cl.spid, days: DAYS, payload, updated_at: new Date().toISOString() }) });
       console.log(`  Cache: ${up.status} · Spend €${payload.totals.spend.toFixed(0)} · Sales €${payload.totals.sales.toFixed(0)} · Befunde ${payload.bidAdj.length}`);
       await token(); // Token-Frische fuer den naechsten Kunden
     } catch (e) { console.log('  FEHLER:', e.message); }
