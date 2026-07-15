@@ -15,6 +15,7 @@ const DEFS = {
   sp_campaigns: { adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spCampaigns', groupBy: ['campaign'], columns: ['campaignId', 'campaignName', 'campaignStatus', 'campaignBudgetAmount', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'] },
   sp_placements: { adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spCampaigns', groupBy: ['campaign', 'campaignPlacement'], columns: ['campaignId', 'campaignName', 'placementClassification', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'] },
   sp_targeting: { adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spTargeting', groupBy: ['targeting'], columns: ['campaignId', 'campaignName', 'adGroupName', 'targeting', 'keywordType', 'matchType', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'] },
+  sp_search_terms: { adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spSearchTerm', groupBy: ['searchTerm'], columns: ['searchTerm', 'keyword', 'matchType', 'campaignName', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'] },
   sb_campaigns: { adProduct: 'SPONSORED_BRANDS', reportTypeId: 'sbCampaigns', groupBy: ['campaign'], columns: ['campaignId', 'campaignName', 'campaignStatus', 'impressions', 'clicks', 'cost', 'purchases', 'sales'] },
   sb_search_terms: { adProduct: 'SPONSORED_BRANDS', reportTypeId: 'sbSearchTerm', groupBy: ['searchTerm'], columns: ['searchTerm', 'keywordText', 'matchType', 'campaignName', 'impressions', 'clicks', 'cost', 'purchases', 'sales'] },
   sd_campaigns: { adProduct: 'SPONSORED_DISPLAY', reportTypeId: 'sdCampaigns', groupBy: ['campaign'], columns: ['campaignId', 'campaignName', 'impressions', 'clicks', 'cost', 'purchases', 'sales'] },
@@ -123,15 +124,20 @@ function aggregate(data, entities) {
     }
   }
   bidAdj.sort((a, b) => (a.verdict > b.verdict ? 1 : a.verdict < b.verdict ? -1 : b.spend - a.spend));
-  const tg = (data.sp_targeting || []).filter(r => (+r.clicks || 0) > 0 || (+r.sales7d || 0) > 0);
-  const topTargets = tg.sort((a, b) => (+b.sales7d || 0) - (+a.sales7d || 0)).slice(0, 25)
-    .map(r => ({ targeting: r.targeting, type: r.keywordType || r.matchType || '', matchType: r.matchType || '', campaign: r.campaignName, adGroup: r.adGroupName, impressions: +r.impressions || 0, clicks: +r.clicks || 0, spend: +(+r.cost || 0).toFixed(2), sales: +(+r.sales7d || 0).toFixed(2), orders: +r.purchases7d || 0 }));
-  const sbTerms = (data.sb_search_terms || []).filter(r => (+r.clicks || 0) > 0)
-    .sort((a, b) => (+b.sales || 0) - (+a.sales || 0)).slice(0, 25)
-    .map(r => ({ searchTerm: r.searchTerm, keyword: r.keywordText, matchType: r.matchType, campaign: r.campaignName, impressions: +r.impressions || 0, clicks: +r.clicks || 0, spend: +(+r.cost || 0).toFixed(2), sales: +(+r.sales || 0).toFixed(2), orders: +r.purchases || 0 }));
+  // kompakte Zeilenlisten — UI aggregiert selbst (Account-/Kampagnenebene, Wasted-Schwellwerte)
+  const r2 = x => +(+x || 0).toFixed(2);
+  const pack = (rows, term, sales, purch, cap) => ({
+    cols: ['term', 'campaign', 'match', 'impressions', 'clicks', 'spend', 'sales', 'orders'],
+    rows: rows.sort((a, b) => (+b[sales] || 0) - (+a[sales] || 0) || (+b.cost || 0) - (+a.cost || 0)).slice(0, cap)
+      .map(r => [r[term], r.campaignName || '', r.matchType || r.keywordType || '', +r.impressions || 0, +r.clicks || 0, r2(r.cost), r2(r[sales]), +r[purch] || 0]),
+  });
+  const active = r => (+r.clicks || 0) > 0 || (+r.sales7d || 0) > 0 || (+r.sales || 0) > 0;
+  const spTargets = pack((data.sp_targeting || []).filter(active), 'targeting', 'sales7d', 'purchases7d', 8000);
+  const spTerms = pack((data.sp_search_terms || []).filter(r => (+r.clicks || 0) > 0), 'searchTerm', 'sales7d', 'purchases7d', 8000);
+  const sbTermRows = pack((data.sb_search_terms || []).filter(r => (+r.clicks || 0) > 0), 'searchTerm', 'sales', 'purchases', 8000);
   const sdCamps = sdC.sort((a, b) => (+b.cost || 0) - (+a.cost || 0)).slice(0, 25)
     .map(r => ({ campaign: r.campaignName, impressions: +r.impressions || 0, clicks: +r.clicks || 0, spend: +(+r.cost || 0).toFixed(2), sales: +(+r.sales || 0).toFixed(2), orders: +r.purchases || 0 }));
-  return { ready: true, days: DAYS, failed: [], totals, formats, spTypes, placements, bidAdj: bidAdj.slice(0, 40), topTargets, sbTerms, sdCampaigns: sdCamps, entities: entities.size, spCampaignCount: spC.length };
+  return { ready: true, days: DAYS, failed: [], totals, formats, spTypes, placements, bidAdj: bidAdj.slice(0, 40), spTargets, spTerms, sbTerms: sbTermRows, sdCampaigns: sdCamps, entities: entities.size, spCampaignCount: spC.length };
 }
 
 async function main() {
