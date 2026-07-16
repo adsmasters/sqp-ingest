@@ -170,7 +170,7 @@ async function main() {
       const entities = await spEntities(cl.ads_profile_id);
       const payload = aggregate(data, entities);
       payload.failed = Object.keys(DEFS).filter(k => !ids[k]);
-      const up = await rfetch(`${U}/rest/v1/ads_audit_cache?on_conflict=spid,days`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ spid: cl.spid, days: DAYS, payload, updated_at: new Date().toISOString() }) });
+      const up = await rfetch(`${U}/rest/v1/ads_audit_cache?on_conflict=profile_id,days`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ profile_id: String(cl.ads_profile_id), days: DAYS, payload, updated_at: new Date().toISOString() }) });
       console.log(`  Cache: ${up.status} · Spend €${payload.totals.spend.toFixed(0)} · Sales €${payload.totals.sales.toFixed(0)} · Befunde ${payload.bidAdj.length}`);
       await token(); // Token-Frische fuer den naechsten Kunden
     } catch (e) { console.log('  FEHLER:', e.message); }
