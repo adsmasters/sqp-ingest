@@ -155,9 +155,16 @@ async function main() {
   await token();
   const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&ads_profile_id=not.is.null&select=name,spid,ads_profile_id`, { headers: sbHead });
   const clients = await cr.json();
+  // Zusaetzlich: Konten frisch halten, die in den letzten 14 Tagen auditiert wurden
+  // (einmal warten, danach oeffnet das Audit fuer dieses Konto immer sofort)
+  const since = new Date(Date.now() - 14 * 864e5).toISOString();
+  const ar = await rfetch(`${U}/rest/v1/ads_audit_cache?days=eq.${DAYS}&updated_at=gte.${encodeURIComponent(since)}&select=profile_id`, { headers: sbHead });
+  const cachedIds = ar.ok ? (await ar.json()).map(x => x.profile_id) : [];
+  const clientIds = new Set(clients.map(c => String(c.ads_profile_id)));
+  for (const pid of cachedIds) if (!clientIds.has(String(pid))) clients.push({ name: `Profil ${pid} (zuletzt auditiert)`, spid: null, ads_profile_id: pid });
   // ein Job je Ads-Profil (Kunden koennen sich ein Seller-Konto teilen, Profile sind eindeutig)
   const seen = new Set();
-  console.log(`Audit-Vorladung: ${clients.length} Kunde(n), ${DAYS} Tage`);
+  console.log(`Audit-Vorladung: ${clients.length} Konto/Konten (inkl. zuletzt auditierte), ${DAYS} Tage`);
   for (const cl of clients) {
     if (seen.has(cl.ads_profile_id)) continue; seen.add(cl.ads_profile_id);
     console.log(`\n=== ${cl.name} (${cl.spid}) ===`);
