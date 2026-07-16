@@ -112,7 +112,7 @@ function aggregate(data, entities) {
     plMap[p].impressions += +r.impressions || 0; plMap[p].clicks += +r.clicks || 0; plMap[p].spend += +r.cost || 0; plMap[p].sales += +r.sales7d || 0; plMap[p].orders += +r.purchases7d || 0;
   }
   const placements = Object.entries(plMap).map(([placement, v]) => ({ placement, ...v })).sort((a, b) => b.spend - a.spend);
-  const PLKEY = { 'Top of Search on-Amazon': 'PLACEMENT_TOP', 'Detail Page on-Amazon': 'PLACEMENT_PRODUCT_PAGE', 'Other on-Amazon': 'PLACEMENT_REST_OF_SEARCH', 'Site Amazon Business': 'PLACEMENT_SITE_AMAZON_BUSINESS' };
+  const PLKEY = { 'Top of Search on-Amazon': 'PLACEMENT_TOP', 'Detail Page on-Amazon': 'PLACEMENT_PRODUCT_PAGE', 'Other on-Amazon': 'PLACEMENT_REST_OF_SEARCH', 'Site Amazon Business': 'SITE_AMAZON_BUSINESS' };
   const byCamp = {};
   for (const r of (data.sp_placements || [])) { (byCamp[String(r.campaignId)] = byCamp[String(r.campaignId)] || []).push(r); }
   const bidAdj = [];
