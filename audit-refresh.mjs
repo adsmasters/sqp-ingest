@@ -131,7 +131,7 @@ function aggregate(data, entities) {
       let verdict = null;
       if (roas >= cRoas * 1.2 && adj <= 0 && sales > 0) verdict = 'chance';
       else if (adj > 0 && roas < cRoas * 0.8) verdict = 'problem';
-      if (verdict) bidAdj.push({ campaign: r.campaignName, placement: r.placementClassification, adjustment: adj, campRoas: +cRoas.toFixed(2), placRoas: +roas.toFixed(2), clicks, spend: +spend.toFixed(2), sales: +sales.toFixed(2), verdict });
+      if (verdict) bidAdj.push({ campaignId: cid, plKey, campaign: r.campaignName, placement: r.placementClassification, adjustment: adj, campRoas: +cRoas.toFixed(2), placRoas: +roas.toFixed(2), clicks, spend: +spend.toFixed(2), sales: +sales.toFixed(2), verdict });
     }
   }
   bidAdj.sort((a, b) => (a.verdict > b.verdict ? 1 : a.verdict < b.verdict ? -1 : b.spend - a.spend));
