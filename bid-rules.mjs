@@ -123,15 +123,41 @@ async function runRule(rule) {
   console.log(`  ${summary.changes} Änderungen (↑${summary.up} ↓${summary.down} ⏸${summary.paused}) — ${ok} geschrieben, ${fail} Fehler`);
 }
 
+// Zeitfenster in DEUTSCHER Zeit: Regel laeuft am gewaehlten Wochentag im gewaehlten 6h-Fenster.
+// Der Workflow feuert 1x je Fenster; last_run-Guard verhindert Doppellaeufe im selben Fenster.
+function berlinNow() {
+  const p = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Berlin', weekday: 'short', hour: '2-digit', hour12: false }).formatToParts(new Date());
+  const wd = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[p.find(x => x.type === 'weekday').value];
+  const hour = +p.find(x => x.type === 'hour').value % 24;
+  return { wd, hour };
+}
+const WINDOWS = { '0-6': [0, 6], '6-12': [6, 12], '12-18': [12, 18], '18-24': [18, 24] };
+function isDue(rule, now) {
+  // Legacy-Zeitplaene weiter unterstuetzen: daily = jeden Tag Fenster 0-6, weekly = Montag 0-6
+  let days, window;
+  if (rule.schedule === 'auto' && rule.schedule_cfg) { days = rule.schedule_cfg.days || []; window = rule.schedule_cfg.window; }
+  else if (rule.schedule === 'daily') { days = [0, 1, 2, 3, 4, 5, 6]; window = '0-6'; }
+  else if (rule.schedule === 'weekly') { days = [1]; window = '0-6'; }
+  else return false;
+  const w = WINDOWS[window]; if (!w) return false;
+  if (!days.includes(now.wd)) return false;
+  if (now.hour < w[0] || now.hour >= w[1]) return false;
+  // Doppellauf-Schutz: schon in diesem Fenster gelaufen?
+  if (rule.last_run) {
+    const sinceH = (Date.now() - new Date(rule.last_run).getTime()) / 36e5;
+    if (sinceH < 6 ) return false;
+  }
+  return true;
+}
 async function main() {
   await token();
-  const rr = await rfetch(`${U}/rest/v1/bid_rules?active=eq.true&schedule=in.(daily,weekly)`, { headers: sbHead });
+  const rr = await rfetch(`${U}/rest/v1/bid_rules?active=eq.true&schedule=in.(auto,daily,weekly)`, { headers: sbHead });
   const rules = await rr.json();
-  const isMonday = new Date().getUTCDay() === 1;
-  const due = rules.filter(r => r.schedule === 'daily' || (r.schedule === 'weekly' && isMonday));
-  console.log(`Gebots-Regeln: ${rules.length} aktiv, ${due.length} fällig (${isMonday ? 'Montag' : 'kein Montag'})`);
+  const now = berlinNow();
+  const due = rules.filter(r => isDue(r, now));
+  console.log(`Gebots-Regeln: ${rules.length} aktiv, ${due.length} fällig (Berlin: Wochentag ${now.wd}, ${now.hour} Uhr)`);
   for (const rule of due) {
-    console.log(`\n=== ${rule.name} (Profil ${rule.profile_id}, ${rule.schedule}) ===`);
+    console.log(`\n=== ${rule.name} (Profil ${rule.profile_id}) ===`);
     try { await runRule(rule); await token(); } catch (e) { console.log('  FEHLER:', e.message); }
   }
   console.log('\nFERTIG.');

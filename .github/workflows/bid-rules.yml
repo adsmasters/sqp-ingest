@@ -1,0 +1,26 @@
+name: Gebots-Regeln (Zeitfenster)
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 1 Lauf je 6h-Fenster in DEUTSCHER Zeit (UTC-Crons decken Sommer- wie Winterzeit ab):
+    - cron: '30 1 * * *'    # Fenster 00-06 Uhr (Berlin 02:30/03:30)
+    - cron: '30 7 * * *'    # Fenster 06-12 Uhr (Berlin 08:30/09:30)
+    - cron: '30 13 * * *'   # Fenster 12-18 Uhr (Berlin 14:30/15:30)
+    - cron: '30 17 * * *'   # Fenster 18-24 Uhr (Berlin 18:30/19:30)
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Faellige Gebots-Regeln ausfuehren
+        run: node bid-rules.mjs
+        env:
+          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
+          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
+          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
