@@ -12,7 +12,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const DAYS = +(process.argv[2] || 30);
 
 const DEFS = {
-  sp_campaigns: { adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spCampaigns', groupBy: ['campaign'], columns: ['campaignId', 'campaignName', 'campaignStatus', 'campaignBudgetAmount', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'] },
+  sp_campaigns: { adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spCampaigns', groupBy: ['campaign'], columns: ['campaignId', 'campaignName', 'campaignStatus', 'campaignBudgetAmount', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d', 'topOfSearchImpressionShare'] },
   sp_placements: { adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spCampaigns', groupBy: ['campaign', 'campaignPlacement'], columns: ['campaignId', 'campaignName', 'placementClassification', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'] },
   sp_targeting: { adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spTargeting', groupBy: ['targeting'], columns: ['campaignId', 'campaignName', 'adGroupName', 'targeting', 'keywordType', 'matchType', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'] },
   sp_search_terms: { adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spSearchTerm', groupBy: ['searchTerm'], columns: ['searchTerm', 'keyword', 'matchType', 'campaignName', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'] },
@@ -148,7 +148,12 @@ function aggregate(data, entities) {
   const sbTermRows = pack((data.sb_search_terms || []).filter(r => (+r.clicks || 0) > 0), 'searchTerm', 'sales', 'purchases', 8000);
   const sdCamps = sdC.sort((a, b) => (+b.cost || 0) - (+a.cost || 0)).slice(0, 25)
     .map(r => ({ campaign: r.campaignName, impressions: +r.impressions || 0, clicks: +r.clicks || 0, spend: +(+r.cost || 0).toFixed(2), sales: +(+r.sales || 0).toFixed(2), orders: +r.purchases || 0 }));
-  return { ready: true, days: DAYS, failed: [], totals, formats, spTypes, placements, bidAdj: bidAdj.slice(0, 40), spTargets, spTerms, sbTerms: sbTermRows, sdCampaigns: sdCamps, entities: entities.size, spCampaignCount: spC.length };
+  // H: Top-of-Search Impression Share je SP-Kampagne
+  const isNorm = v => { const n = +v; return n <= 1 ? +(n * 100).toFixed(1) : +n.toFixed(1); };
+  const tosIs = spC.filter(r => r.topOfSearchImpressionShare != null && (+r.cost || 0) > 0)
+    .map(r => ({ campaign: r.campaignName, campaignId: String(r.campaignId), is: isNorm(r.topOfSearchImpressionShare), spend: +(+r.cost || 0).toFixed(2), sales: +(+r.sales7d || 0).toFixed(2), clicks: +r.clicks || 0 }))
+    .sort((a, b) => b.spend - a.spend).slice(0, 200);
+  return { ready: true, days: DAYS, failed: [], totals, formats, spTypes, placements, bidAdj: bidAdj.slice(0, 40), tosIs, spTargets, spTerms, sbTerms: sbTermRows, sdCampaigns: sdCamps, entities: entities.size, spCampaignCount: spC.length };
 }
 
 async function main() {
