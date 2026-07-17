@@ -33,3 +33,11 @@ jobs:
           ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - name: Gesamt-Umsaetze je ASIN (Sales & Traffic, 30 Tage)
+        if: always()          # Basis fuer echten TACoS
+        run: node sales-traffic.mjs 30
+        env:
+          SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
+          SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
