@@ -30,10 +30,14 @@ async function accessToken(spid){
 function makeApi(H){ return async function api(path,opts={},retries=10){
   for(let i=0;i<retries;i++){ const r=await fetch(`${SPAPI}${path}`,{...opts,headers:{...H,...(opts.headers||{})}});
     if(r.status===429){await sleep(25000+Math.random()*10000);continue;} return r; } return null; }; }
-async function pollDoc(api,id){ for(let i=0;i<60;i++){await sleep(5000);const g=await api(`/reports/2021-06-30/reports/${id}`);if(!g)return null;const gj=await g.json();if(gj.processingStatus==='DONE')return gj.reportDocumentId;if(['FATAL','CANCELLED'].includes(gj.processingStatus))return null;} return null; }
+async function pollDoc(api,id){ for(let i=0;i<120;i++){await sleep(5000);const g=await api(`/reports/2021-06-30/reports/${id}`);if(!g)return null;const gj=await g.json();if(gj.processingStatus==='DONE')return gj.reportDocumentId;if(['FATAL','CANCELLED'].includes(gj.processingStatus))return null;} return null; }
 async function download(api,docId){ const dr=await api(`/reports/2021-06-30/documents/${docId}`);const drj=await dr.json();const raw=await fetch(drj.url);let buf=Buffer.from(await raw.arrayBuffer());if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);return JSON.parse(buf.toString('utf8')); }
 async function listAsins(api,mkt){ const c=await api(`/reports/2021-06-30/reports`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reportType:'GET_MERCHANT_LISTINGS_ALL_DATA',marketplaceIds:[mkt]})});
-  const docId=await pollDoc(api,(await c.json()).reportId); const dr=await api(`/reports/2021-06-30/documents/${docId}`);const drj=await dr.json();const raw=await fetch(drj.url);let buf=Buffer.from(await raw.arrayBuffer());if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);
+  const docId=await pollDoc(api,(await c.json()).reportId);
+  if(!docId) throw new Error('Listings-Report nicht fertig geworden (grosser Katalog?) — Kunde wird uebersprungen');
+  const dr=await api(`/reports/2021-06-30/documents/${docId}`);const drj=await dr.json();
+  if(!drj||!drj.url) throw new Error('Listings-Report-Dokument ohne Download-URL — Kunde wird uebersprungen');
+  const raw=await fetch(drj.url);let buf=Buffer.from(await raw.arrayBuffer());if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);
   const lines=buf.toString('latin1').split('\n').filter(Boolean);const hdr=lines[0].split('\t');const iA=hdr.findIndex(h=>/asin[\s_]*1/i.test(h)),iS=hdr.findIndex(h=>/status/i.test(h));
   const ACT=new Set(['active','aktiv','actif','activo','attivo']); // Report ist lokalisiert (DE: "Aktiv")
   let asins=[...new Set(lines.slice(1).map(l=>l.split('\t')).filter(r=>ACT.has((r[iS]||'').trim().toLowerCase())).map(r=>r[iA]).filter(Boolean))];
@@ -93,7 +97,11 @@ async function main(){
   const r=await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&select=name,spid,marketplace,ads_profile_id`,{headers:sbHead});
   const clients=(await r.json()).filter(c=>c.spid);
   console.log(`SQP-Refresh: ${clients.length} Kunde(n), ${NWEEKS} Wochen + akt./vor. Monat.`);
-  for(const c of clients){ console.log(`Kunde: ${c.name} (${c.spid})`); await refreshClient(c); }
+  for(const c of clients){
+    console.log(`Kunde: ${c.name} (${c.spid})`);
+    // Ein Kunde darf den Lauf nicht abreissen — Fehler loggen und weiter
+    try{ await refreshClient(c); }catch(e){ console.log(`  ÜBERSPRUNGEN ${c.name}: ${e.message}`); }
+  }
   console.log('ALLES FERTIG.');
 }
 main().catch(e=>{console.error('FEHLER',e);process.exit(1);});
