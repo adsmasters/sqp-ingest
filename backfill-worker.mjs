@@ -45,8 +45,12 @@ console.log('--- Produkt-Meta (Titel/SKU/Marke), einmal fuer alle Kunden ---');
 spawnSync('node', ['asin-meta.mjs'], { stdio: 'inherit', env: process.env });
 
 const now = new Date();
-const start = iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 12, 1)));
 const end = iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1)));
+// Schnell-Modus (Standard): 3 Monate + 6 Wochen — Onboarding ist in Stunden statt Naechten fertig.
+// Volle Historie (12 Monate + 13 Wochen) nur, wenn der Job explizit angefordert wurde (note enthaelt "voll").
+const rangeFor = j => /voll|full/i.test(j.note || '')
+  ? { start: iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 12, 1))), weeks: '13', label: 'VOLL (12M+13W)' }
+  : { start: iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 3, 1))), weeks: '6', label: 'schnell (3M+6W)' };
 
 // SQP-Fenster: alles bis auf eine Reserve fuer den Ads-Block am Ende
 const sqpDeadlineMs = Math.max(20, leftMin() - 25) * 60000;
@@ -61,17 +65,20 @@ async function runLane(jobs) {
   for (const j of jobs) {
     const remaining = sqpDeadlineMs - (Date.now() - t0);
     if (remaining < 5 * 60000) { console.log(`[${j.spid}] Fenster zu — Job ${j.id} bleibt eingereiht.`); return; }
-    console.log(`[${j.spid}] Job ${j.id} startet (${j.marketplace_id})`);
+    const range = rangeFor(j);
+    console.log(`[${j.spid}] Job ${j.id} startet (${j.marketplace_id}) — ${range.label}`);
     await patch(j.id, { status: 'running', started_at: new Date().toISOString() });
     const env = { ...process.env, SQP_SPID: j.spid, SQP_MKT: j.marketplace_id, SQP_CREATE_GAP: '15000' };
-    const m = await run(['sqp-backfill.mjs', start, end, '3'], env, j.spid, sqpDeadlineMs - (Date.now() - t0));
-    const w = m === 0 ? await run(['sqp-backfill-week.mjs', '13', '3'], env, j.spid, sqpDeadlineMs - (Date.now() - t0)) : 'skipped';
+    const m = await run(['sqp-backfill.mjs', range.start, end, '3'], env, j.spid, sqpDeadlineMs - (Date.now() - t0));
+    const w = m === 0 ? await run(['sqp-backfill-week.mjs', range.weeks, '3'], env, j.spid, sqpDeadlineMs - (Date.now() - t0)) : 'skipped';
     if (m === 0 && w === 0) {
-      await patch(j.id, { status: 'done', finished_at: new Date().toISOString(), note: null });
-      console.log(`[${j.spid}] Job ${j.id}: FERTIG`);
+      await patch(j.id, { status: 'done', finished_at: new Date().toISOString(), note: /voll|full/i.test(j.note || '') ? 'volle Historie geladen' : null });
+      console.log(`[${j.spid}] Job ${j.id}: FERTIG (${range.label})`);
     } else {
-      await patch(j.id, { status: 'queued', note: 'Teillauf, wird beim nächsten Lauf fortgesetzt' });
-      console.log(`[${j.spid}] Job ${j.id}: Teillauf (${m}/${w}), erneut eingereiht`);
+      // Teillauf: "voll"-Marker im note erhalten, sonst wuerde die Fortsetzung im Schnell-Modus laufen
+      const keepFull = /voll|full/i.test(j.note || '') ? ' [voll]' : '';
+      await patch(j.id, { status: 'queued', note: 'Teillauf, wird beim nächsten Lauf fortgesetzt' + keepFull });
+      console.log(`[${j.spid}] Job ${j.id}: Teillauf (${m}/${w}), erneut eingereiht${keepFull}`);
     }
   }
 }
