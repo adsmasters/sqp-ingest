@@ -131,12 +131,13 @@ for(const client of clients){
     await sleep(10000); // Reports-API-Quota schonen
   }
 
-  // 2) Laufender Monat (Teilmonat, wird ersetzt)
+  // 2) Laufender Monat (Teilmonat, wird ersetzt). Retail Analytics hat 48–72h
+  // Datenlatenz — deshalb nur bis heute−4 Tage anfordern, sonst FATAL.
   const now=new Date();
   const curStart=iso(new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),1)));
-  const yesterday=iso(new Date(Date.now()-86400_000));
-  if(yesterday>=curStart){
-    const rows=await fetchVendorSales(api,mkt,'DAY',curStart,yesterday);
+  const lastAvail=iso(new Date(Date.now()-4*86400_000));
+  if(lastAvail>=curStart){
+    const rows=await fetchVendorSales(api,mkt,'DAY',curStart,lastAvail);
     if(rows&&rows.length){
       const agg=aggregate(rows);
       const maxEnd=Object.values(agg).reduce((s,v)=>v.maxEnd&&v.maxEnd>s?v.maxEnd:s,curStart);
