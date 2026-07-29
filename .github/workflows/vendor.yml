@@ -37,3 +37,13 @@ jobs:
           CLIENT: ${{ github.event.inputs.client }}
           MONTHS: ${{ github.event.inputs.months }}
           SINCE: ${{ github.event.inputs.since }}
+      - name: Vendor-Ads importieren (TACoS pro ASIN)
+        if: always()
+        run: node vendor-ads.mjs
+        env:
+          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
+          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
+          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SINCE: ${{ github.event.inputs.since }}
