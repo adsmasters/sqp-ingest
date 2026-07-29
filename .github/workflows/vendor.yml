@@ -1,0 +1,34 @@
+name: Vendor Sales Import
+on:
+  schedule:
+    - cron: '30 4 * * *'   # täglich 04:30 UTC
+  workflow_dispatch:
+    inputs:
+      client:
+        description: 'Nur diesen Kunden (Namensteil, z. B. Mavi)'
+        required: false
+        default: ''
+      months:
+        description: 'Komplette Monate rückwirkend'
+        required: false
+        default: '12'
+concurrency:
+  group: sqp-quota         # nie parallel zu SQP-Jobs (Amazon-Quota)
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Vendor-Sales importieren
+        run: node vendor-sales.mjs
+        env:
+          SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
+          SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          CLIENT: ${{ github.event.inputs.client }}
+          MONTHS: ${{ github.event.inputs.months }}
