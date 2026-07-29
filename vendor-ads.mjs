@@ -55,7 +55,14 @@ async function hasMonth(clientId, m) {
 }
 
 async function listProfiles() {
-  try { const r = await fetch(`${ADS}/v2/profiles`, { headers: H(null) }); const j = await r.json(); return Array.isArray(j) ? j : []; } catch { return []; }
+  try {
+    const r = await fetch(`${ADS}/v2/profiles`, { headers: H(null) });
+    const txt = await r.text();
+    let j = null; try { j = JSON.parse(txt); } catch {}
+    if (!Array.isArray(j)) { console.log(`Profil-Liste: HTTP ${r.status} — ${txt.slice(0, 200)}`); return []; }
+    if (!j.length) console.log('Profil-Liste: HTTP 200, aber leer.');
+    return j;
+  } catch (e) { console.log('Profil-Liste: FEHLER ' + e.message); return []; }
 }
 
 async function syncProfiles() {
