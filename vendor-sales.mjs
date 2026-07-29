@@ -137,19 +137,30 @@ for(const client of clients){
   }
 
   // 2) Laufender Monat (Teilmonat, wird ersetzt). Retail Analytics hat 48–72h
-  // Datenlatenz — deshalb nur bis heute−4 Tage anfordern, sonst FATAL.
+  // Datenlatenz (→ nur bis heute−4 Tage) und DAY-Reports max. ~14 Tage Spanne
+  // (→ in 14-Tage-Häppchen ziehen und zusammensetzen).
   const now=new Date();
   const curStart=iso(new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),1)));
   const lastAvail=iso(new Date(Date.now()-4*86400_000));
   if(lastAvail>=curStart){
-    const rows=await fetchVendorSales(api,mkt,'DAY',curStart,lastAvail);
-    if(rows&&rows.length){
+    let rows=[], ok=true, s=curStart;
+    while(s<=lastAvail){
+      const sd=new Date(s+'T00:00:00Z');
+      const e=new Date(sd); e.setUTCDate(sd.getUTCDate()+13);
+      const chunkEnd=iso(e)<lastAvail?iso(e):lastAvail;
+      const part=await fetchVendorSales(api,mkt,'DAY',s,chunkEnd);
+      if(part===null){ ok=false; break; }
+      rows.push(...part);
+      const nx=new Date(chunkEnd+'T00:00:00Z'); nx.setUTCDate(nx.getUTCDate()+1); s=iso(nx);
+      await sleep(3000);
+    }
+    if(ok&&rows.length){
       const agg=aggregate(rows);
-      const maxEnd=Object.values(agg).reduce((s,v)=>v.maxEnd&&v.maxEnd>s?v.maxEnd:s,curStart);
+      const maxEnd=Object.values(agg).reduce((s2,v)=>v.maxEnd&&v.maxEnd>s2?v.maxEnd:s2,curStart);
       const names=await titleMap(api,client.id,mkt,Object.keys(agg));
       const n=await writeReport(client,curStart,maxEnd,cur(rows),agg,names);
       console.log(`  ${curStart} (laufend, bis ${maxEnd}): ${n} ASINs.`);
-    } else console.log(`  Laufender Monat: ${rows===null?'Report fehlgeschlagen':'keine Daten'}.`);
+    } else console.log(`  Laufender Monat: ${ok?'keine Daten':'Report fehlgeschlagen'}.`);
   }
 }
 console.log('\nFertig.');
