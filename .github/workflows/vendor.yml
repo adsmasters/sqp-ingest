@@ -12,6 +12,10 @@ on:
         description: 'Komplette Monate rückwirkend'
         required: false
         default: '12'
+      since:
+        description: 'Rückwirkend bis inkl. Monat (YYYY-MM, hat Vorrang vor months)'
+        required: false
+        default: ''
 concurrency:
   group: sqp-quota         # nie parallel zu SQP-Jobs (Amazon-Quota)
 jobs:
@@ -32,3 +36,4 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           CLIENT: ${{ github.event.inputs.client }}
           MONTHS: ${{ github.event.inputs.months }}
+          SINCE: ${{ github.event.inputs.since }}

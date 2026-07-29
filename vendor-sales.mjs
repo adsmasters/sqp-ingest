@@ -5,12 +5,14 @@
 // Titel/Marke je ASIN aus bestehenden vra_data-Zeilen, sonst Catalog Items API.
 // Ersetzt den manuellen Excel-Upload aus Vendor Central Retail Analytics (Sichtweite: Hersteller).
 // ENV: SPAPI_CLIENT_ID, SPAPI_CLIENT_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY
-// Optional: MONTHS (Default 12), CLIENT (Name-Filter, z. B. "Mavi")
+// Optional: SINCE (YYYY-MM, ziehe rückwirkend bis inkl. diesen Monat),
+//           MONTHS (Anzahl, Default 12; SINCE hat Vorrang), CLIENT (Name-Filter)
 import zlib from 'node:zlib';
 const CID=process.env.SPAPI_CLIENT_ID, SEC=process.env.SPAPI_CLIENT_SECRET;
 const U=process.env.SUPABASE_URL, KEY=process.env.SUPABASE_SERVICE_KEY;
 const SPAPI='https://sellingpartnerapi-eu.amazon.com';
 const NMONTHS=+(process.env.MONTHS||12);
+const SINCE=/^\d{4}-\d{2}$/.test(process.env.SINCE||'')?process.env.SINCE:null;
 const ONLY=(process.env.CLIENT||'').trim().toLowerCase();
 const MKT_BY_CC={DE:'A1PA6795UKMFR9',FR:'A13V1IB3VIYZZH',IT:'APJ6JRA9NG5V4',ES:'A1RKKUPIHCS9HS',UK:'A1F83G8C2ARO7P',NL:'A1805IZSGTT6HS',SE:'A2NODRKZP88ZB9',PL:'A1C3SOZRARQ6R3',BE:'AMEN7PMS3EDWL'};
 const sbHead={apikey:KEY,Authorization:'Bearer '+KEY};
@@ -100,8 +102,11 @@ async function writeReport(client,periodStart,periodEnd,currency,agg,names){
 }
 
 const monthEnd=m=>{const d=new Date(m+'T00:00:00Z');return iso(new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth()+1,0)));};
+// Komplette Monate rückwirkend: bis SINCE (YYYY-MM) oder NMONTHS Stück
 function lastMonths(n){ const now=new Date(); const out=[];
-  for(let i=1;i<=n;i++){ out.push(iso(new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()-i,1)))); } return out.reverse(); }
+  for(let i=1;i<=600;i++){ const m=iso(new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()-i,1)));
+    if(SINCE){ if(m.slice(0,7)<SINCE) break; } else if(i>n) break;
+    out.push(m); } return out.reverse(); }
 
 const cr=await fetch(`${U}/rest/v1/vra_clients?spid=not.is.null&auto_sync=eq.true&select=id,name,marketplace,spid`,{headers:sbHead});
 let clients=await cr.json();
