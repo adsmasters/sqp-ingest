@@ -58,15 +58,25 @@ async function listProfiles() {
   try { const r = await fetch(`${ADS}/v2/profiles`, { headers: H(null) }); const j = await r.json(); return Array.isArray(j) ? j : []; } catch { return []; }
 }
 
+async function syncProfiles() {
+  // Profil-Liste nach vra_ads_profiles spiegeln — fürs Dropdown im Kunden-Modal
+  const profs = await listProfiles();
+  if (!profs.length) return profs;
+  const rows = profs.map(p => ({ profile_id: String(p.profileId), name: (p.accountInfo || {}).name || null, country: p.countryCode || null, currency: p.currencyCode || null, updated_at: new Date().toISOString() }));
+  const r = await fetch(`${U}/rest/v1/vra_ads_profiles?on_conflict=profile_id`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows) });
+  console.log(r.ok ? `${rows.length} Ads-Profile nach vra_ads_profiles gespiegelt.` : `vra_ads_profiles: ${r.status} ${(await r.text()).slice(0, 120)}`);
+  return profs;
+}
+
 async function main() {
   await auth();
   const cr = await fetch(`${U}/rest/v1/vra_clients?select=id,name,ads_profile_id`, { headers: sbHead });
   const all = await cr.json();
   const clients = all.filter(c => c.ads_profile_id);
   const unmapped = all.filter(c => !c.ads_profile_id);
+  const profs = await syncProfiles();
   if (unmapped.length) {
     console.log(`Ohne Ads-Profil: ${unmapped.map(c => c.name).join(', ')}`);
-    const profs = await listProfiles();
     if (profs.length) { console.log('Verfügbare Ads-Profile (ID — Name — Land):'); for (const p of profs) console.log(`  ${p.profileId} — ${(p.accountInfo || {}).name || '?'} — ${p.countryCode}`); }
   }
   const ms = months();
