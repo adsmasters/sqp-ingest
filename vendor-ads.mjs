@@ -211,7 +211,7 @@ async function main() {
       let filled = 0;
       for (let i = 0; i < asins.length; i += 100) {
         const batch = asins.slice(i, i + 100);
-        const res = await fetch(`${ADS}/product/metadata`, { method: 'POST', headers: { ...H(cl.ads_profile_id), 'Content-Type': 'application/vnd.productmetadatarequest.v1+json' }, body: JSON.stringify({ asins: batch, pageIndex: 0, pageSize: 100 }) });
+        const res = await fetch(`${ADS}/product/metadata`, { method: 'POST', headers: { ...H(cl.ads_profile_id), 'Content-Type': 'application/vnd.productmetadatarequest.v1+json' }, body: JSON.stringify({ asins: batch, checkItemDetails: true, pageIndex: 0, pageSize: 100 }) });
         if (!res.ok) { console.log(`${cl.name} Titel: HTTP ${res.status} — ${(await res.text()).slice(0, 200)}`); break; }
         const txt = await res.text();
         let j = {}; try { j = JSON.parse(txt); } catch {}
