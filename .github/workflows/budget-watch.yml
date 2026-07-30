@@ -1,0 +1,36 @@
+name: Budget-Watch (Portfolios)
+on:
+  schedule:
+    - cron: '0 6 * * *'   # täglich 06:00 UTC (08:00 dt.)
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: 'Wochen-Digest erzwingen (1 = ja)'
+        required: false
+        default: ''
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Budgets prüfen
+        run: node budget-watch.mjs
+        env:
+          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
+          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
+          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SLACK_WEBHOOK_BUDGET: ${{ secrets.SLACK_WEBHOOK_BUDGET }}
+          DIGEST: ${{ github.event.inputs.digest }}
+      - name: Slack-Alert bei Fehlschlag
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && { echo "Kein SLACK_WEBHOOK_URL-Secret — Alert übersprungen."; exit 0; }
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ *${{ github.workflow }}* fehlgeschlagen — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"
