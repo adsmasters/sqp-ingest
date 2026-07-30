@@ -12,8 +12,10 @@ const sbHead = { apikey: KEY, Authorization: 'Bearer ' + KEY };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const iso = d => d.toISOString().slice(0, 10);
 
-let AT;
-async function auth() { const t = await fetch('https://api.amazon.co.uk/auth/o2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: RT, client_id: CID, client_secret: SEC }) }); AT = (await t.json()).access_token; }
+let AT, AT_TIME = 0;
+async function auth() { const t = await fetch('https://api.amazon.co.uk/auth/o2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: RT, client_id: CID, client_secret: SEC }) }); AT = (await t.json()).access_token; AT_TIME = Date.now(); }
+// LwA-Token hält nur 60 Min — bei langen Läufen rechtzeitig erneuern
+async function ensureAuth() { if (Date.now() - AT_TIME > 45 * 60 * 1000) await auth(); }
 const H = profile => ({ 'Amazon-Advertising-API-ClientId': CID, ...(profile ? { 'Amazon-Advertising-API-Scope': String(profile) } : {}), Authorization: 'Bearer ' + AT, 'Content-Type': 'application/json' });
 
 function months() {
@@ -50,6 +52,7 @@ const REPORT_TYPES = [
 // {reportId} oder null (Monat außerhalb der Datenaufbewahrung); probiert die
 // Spalten-Varianten des Report-Typs durch.
 async function createReport(profile, rt, startDate, endDate) {
+  await ensureAuth();
   for (const columns of rt.tries) {
     let badColumns = false;
     for (let a = 0; a < 8; a++) {
@@ -180,6 +183,7 @@ async function main() {
   // Phase 2: Alle angeforderten Reports gesammelt abholen (Laufzeit = langsamster Report).
   const deadline = Date.now() + 150 * 60 * 1000;
   while (jobs.some(j => j.state === 'wartet') && Date.now() < deadline) {
+    await ensureAuth();
     for (const job of jobs.filter(j => j.state === 'wartet')) {
       try {
         const g = await fetch(`${ADS}/reporting/reports/${job.reportId}`, { headers: H(job.cl.ads_profile_id) });
