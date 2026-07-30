@@ -213,8 +213,11 @@ async function main() {
         const batch = asins.slice(i, i + 100);
         const res = await fetch(`${ADS}/product/metadata`, { method: 'POST', headers: { ...H(cl.ads_profile_id), 'Content-Type': 'application/vnd.productmetadatarequest.v1+json' }, body: JSON.stringify({ asins: batch, pageIndex: 0, pageSize: 100 }) });
         if (!res.ok) { console.log(`${cl.name} Titel: HTTP ${res.status} — ${(await res.text()).slice(0, 200)}`); break; }
-        const j = await res.json();
-        for (const it of (j.ProductMetadataList || j.products || [])) {
+        const txt = await res.text();
+        let j = {}; try { j = JSON.parse(txt); } catch {}
+        const list = j.ProductMetadataList || j.products || (Array.isArray(j) ? j : null);
+        if (!list || !list.length) { console.log(`${cl.name} Titel: keine Treffer — Antwort: ${txt.slice(0, 300)}`); break; }
+        for (const it of list) {
           const title = it.title || it.itemName; if (!it.asin || !title) continue;
           const p = await fetch(`${U}/rest/v1/vra_data?client_id=eq.${cl.id}&asin=eq.${it.asin}&title=is.null`, { method: 'PATCH', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify({ title, brand: it.brand || null }) });
           if (p.ok) filled++;
