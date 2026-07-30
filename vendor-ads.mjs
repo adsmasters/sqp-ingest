@@ -217,6 +217,7 @@ async function main() {
         let j = {}; try { j = JSON.parse(txt); } catch {}
         const list = j.ProductMetadataList || j.products || (Array.isArray(j) ? j : null);
         if (!list || !list.length) { console.log(`${cl.name} Titel: keine Treffer — Antwort: ${txt.slice(0, 300)}`); break; }
+        if (i === 0) console.log(`${cl.name} Titel-Beispiel: ${JSON.stringify(list[0]).slice(0, 300)}`);
         for (const it of list) {
           const title = it.title || it.itemName; if (!it.asin || !title) continue;
           const p = await fetch(`${U}/rest/v1/vra_data?client_id=eq.${cl.id}&asin=eq.${it.asin}&title=is.null`, { method: 'PATCH', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify({ title, brand: it.brand || null }) });
