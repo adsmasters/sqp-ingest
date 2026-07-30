@@ -25,10 +25,16 @@ async function slack(text) {
 const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 
 async function portfolios(profile) {
-  const r = await fetch(`${ADS}/v2/portfolios`, { headers: H(profile) });
-  if (!r.ok) { console.log(`Portfolios: HTTP ${r.status} — ${(await r.text()).slice(0, 200)}`); return []; }
-  const j = await r.json();
-  return Array.isArray(j) ? j : [];
+  // v3-API (v2 liefert 404): POST /portfolios/list, paginiert über nextToken
+  let out = [], nextToken = null;
+  do {
+    const r = await fetch(`${ADS}/portfolios/list`, { method: 'POST', headers: { ...H(profile), 'Content-Type': 'application/vnd.spPortfolio.v3+json', Accept: 'application/vnd.spPortfolio.v3+json' }, body: JSON.stringify(nextToken ? { nextToken } : {}) });
+    if (!r.ok) { console.log(`Portfolios: HTTP ${r.status} — ${(await r.text()).slice(0, 200)}`); return out; }
+    const j = await r.json();
+    out = out.concat(j.portfolios || []);
+    nextToken = j.nextToken || null;
+  } while (nextToken);
+  return out;
 }
 
 async function budgetUsage(profile, ids) {
@@ -66,7 +72,7 @@ async function main() {
   for (const profile of Object.keys(byProfile)) {
     const clientName = names[profile] || profile;
     console.log(`== ${clientName} (Profil ${profile})`);
-    const ports = (await portfolios(profile)).filter(p => p.state !== 'archived');
+    const ports = (await portfolios(profile)).filter(p => (p.state || '').toLowerCase() !== 'archived');
     const withBudget = ports.filter(p => p.budget && +p.budget.amount > 0);
     console.log(`${ports.length} Portfolios, davon ${withBudget.length} mit Budget.`);
     const usage = await budgetUsage(profile, withBudget.map(p => p.portfolioId));
