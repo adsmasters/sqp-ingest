@@ -199,6 +199,31 @@ async function main() {
   // Zeitüberschreitung: übrig gebliebene Reports abschreiben, Monate mit Teildaten trotzdem schreiben
   for (const job of jobs.filter(j => j.state === 'wartet')) { job.state = 'fehler'; console.log(`${job.cl.name} ${job.m.start} ${job.rt.key}: Timeout`); }
   for (const job of jobs) await writeMonthIfReady(job.cl, job.m);
+
+  // Titel-Nachfüllung: SP-API-Catalog ist bei Vendor-Freigaben oft gesperrt (403) —
+  // die Ads-API liefert Titel über den Product-Metadata-Endpoint mit unseren Rechten.
+  for (const cl of clients) {
+    try {
+      await ensureAuth();
+      const r = await fetch(`${U}/rest/v1/vra_data?client_id=eq.${cl.id}&title=is.null&select=asin`, { headers: sbHead });
+      const asins = [...new Set((await r.json()).map(x => x.asin))];
+      if (!asins.length) continue;
+      let filled = 0;
+      for (let i = 0; i < asins.length; i += 100) {
+        const batch = asins.slice(i, i + 100);
+        const res = await fetch(`${ADS}/product/metadata`, { method: 'POST', headers: { ...H(cl.ads_profile_id), 'Content-Type': 'application/vnd.productmetadatarequest.v1+json' }, body: JSON.stringify({ asins: batch, pageIndex: 0, pageSize: 100 }) });
+        if (!res.ok) { console.log(`${cl.name} Titel: HTTP ${res.status} — ${(await res.text()).slice(0, 200)}`); break; }
+        const j = await res.json();
+        for (const it of (j.ProductMetadataList || j.products || [])) {
+          const title = it.title || it.itemName; if (!it.asin || !title) continue;
+          const p = await fetch(`${U}/rest/v1/vra_data?client_id=eq.${cl.id}&asin=eq.${it.asin}&title=is.null`, { method: 'PATCH', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify({ title, brand: it.brand || null }) });
+          if (p.ok) filled++;
+        }
+        await sleep(1000);
+      }
+      console.log(`${cl.name} Titel: ${filled}/${asins.length} nachgefüllt (Ads-API).`);
+    } catch (e) { console.log(`${cl.name} Titel: FEHLER ${e.message}`); }
+  }
   console.log('FERTIG.');
 }
 main().catch(e => { console.error('FEHLER', e.message); process.exit(1); });
