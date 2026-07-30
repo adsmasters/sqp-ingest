@@ -26,9 +26,14 @@ function months() {
                       : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - nm, 1));
   for (let d = first; ; d = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1))) {
     const e = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0));
-    if (e >= new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))) break; // nur komplette Monate
+    if (e >= new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))) break; // komplette Monate
     out.push({ start: iso(d), end: iso(e) });
   }
+  // Laufender Monat als Teilmonat (bis gestern) — wird als letzter Eintrag bei
+  // jedem Lauf ersetzt, damit TACoS auch für den aktuellen Monat Daten hat.
+  const curStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const yest = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1));
+  if (yest >= curStart) out.push({ start: iso(curStart), end: iso(yest) });
   return out;
 }
 
@@ -80,13 +85,15 @@ async function downloadReport(url) {
   return JSON.parse(buf.toString('utf8'));
 }
 
-// Monat überspringen nur, wenn er schon mit DEMSELBEN Profil importiert wurde —
-// bei Profilwechsel (z. B. Seller- statt Vendor-Werbekonto erwischt) wird neu importiert.
-async function monthState(clientId, m, profile) {
-  const r = await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${clientId}&period_start=eq.${m}&select=profile_id&limit=1`, { headers: sbHead });
+// Monat überspringen nur, wenn er schon mit DEMSELBEN Profil und VOLLSTÄNDIG
+// importiert wurde — bei Profilwechsel oder wenn nur ein Teilmonat gespeichert
+// ist (z. B. Juli während des Monats importiert), wird neu importiert.
+async function monthState(clientId, m, profile, monthEnd) {
+  const r = await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${clientId}&period_start=eq.${m}&select=profile_id,period_end&limit=1`, { headers: sbHead });
   const rows = await r.json();
   if (!Array.isArray(rows) || !rows.length) return 'fehlt';
-  return rows[0].profile_id === String(profile) ? 'aktuell' : 'profilwechsel';
+  if (rows[0].profile_id !== String(profile)) return 'profilwechsel';
+  return rows[0].period_end < monthEnd ? 'teilmonat' : 'aktuell';
 }
 
 async function listProfiles() {
@@ -129,9 +136,10 @@ async function main() {
   const jobs = []; // je (Kunde × Monat × Report-Typ)
   for (const cl of clients) {
     for (const m of ms) {
-      const st = await monthState(cl.id, m.start, cl.ads_profile_id);
+      const st = await monthState(cl.id, m.start, cl.ads_profile_id, m.end);
       if (m !== last && st === 'aktuell') { console.log(`${cl.name} ${m.start}: schon da`); continue; }
       if (st === 'profilwechsel') console.log(`${cl.name} ${m.start}: Profil geändert -> wird neu importiert`);
+      if (st === 'teilmonat') console.log(`${cl.name} ${m.start}: bisher Teilmonat -> wird vervollständigt`);
       for (const rt of REPORT_TYPES) jobs.push({ cl, m, rt, state: 'neu' });
     }
   }
