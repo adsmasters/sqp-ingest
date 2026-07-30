@@ -44,3 +44,10 @@ jobs:
           ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - name: Slack-Alert bei Fehlschlag
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && { echo "Kein SLACK_WEBHOOK_URL-Secret — Alert übersprungen."; exit 0; }
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ *${{ github.workflow }}* fehlgeschlagen — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"
