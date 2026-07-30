@@ -49,9 +49,13 @@ async function pull(profile, startDate, endDate) {
   const raw = await fetch(url); let buf = Buffer.from(await raw.arrayBuffer()); buf = zlib.gunzipSync(buf); return JSON.parse(buf.toString('utf8'));
 }
 
-async function hasMonth(clientId, m) {
-  const r = await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${clientId}&period_start=eq.${m}&select=id`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });
-  return +((r.headers.get('content-range') || '0/0').split('/')[1]) > 0;
+// Monat überspringen nur, wenn er schon mit DEMSELBEN Profil importiert wurde —
+// bei Profilwechsel (z. B. Seller- statt Vendor-Werbekonto erwischt) wird neu importiert.
+async function monthState(clientId, m, profile) {
+  const r = await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${clientId}&period_start=eq.${m}&select=profile_id&limit=1`, { headers: sbHead });
+  const rows = await r.json();
+  if (!Array.isArray(rows) || !rows.length) return 'fehlt';
+  return rows[0].profile_id === String(profile) ? 'aktuell' : 'profilwechsel';
 }
 
 async function listProfiles() {
@@ -93,15 +97,17 @@ async function main() {
     const last = ms[ms.length - 1];
     for (const m of ms) {
       try {
-        // Vergangene Monate überspringen, wenn schon vorhanden (letzter Monat wird aktualisiert)
-        if (m !== last && await hasMonth(cl.id, m.start)) { console.log(`  ${m.start}: schon da`); continue; }
+        // Vergangene Monate überspringen, wenn schon mit diesem Profil importiert (letzter Monat wird aktualisiert)
+        const st = await monthState(cl.id, m.start, cl.ads_profile_id);
+        if (m !== last && st === 'aktuell') { console.log(`  ${m.start}: schon da`); continue; }
+        if (st === 'profilwechsel') console.log(`  ${m.start}: Profil geändert -> wird neu importiert`);
         const rows = await pull(cl.ads_profile_id, m.start, m.end);
         if (rows === null) { console.log(`  ${m.start}: außerhalb der Ads-Datenaufbewahrung`); continue; }
         const agg = new Map();
         for (const r of rows) {
           const asin = (r.advertisedAsin || '').toUpperCase(); if (!asin) continue;
           let e = agg.get(asin);
-          if (!e) { e = { client_id: cl.id, asin, period_start: m.start, period_end: m.end, impressions: 0, clicks: 0, cost: 0, ad_orders: 0, ad_sales: 0, ad_units: 0 }; agg.set(asin, e); }
+          if (!e) { e = { client_id: cl.id, profile_id: String(cl.ads_profile_id), asin, period_start: m.start, period_end: m.end, impressions: 0, clicks: 0, cost: 0, ad_orders: 0, ad_sales: 0, ad_units: 0 }; agg.set(asin, e); }
           e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0;
           e.ad_orders += +r.purchases7d || 0; e.ad_sales += +r.sales7d || 0; e.ad_units += +r.unitsSoldClicks7d || 0;
         }
