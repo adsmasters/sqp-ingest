@@ -30,11 +30,26 @@ function months() {
   return out;
 }
 
-async function pull(profile, startDate, endDate) {
-  const columns = ['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d', 'unitsSoldClicks7d'];
+// Report-Konfigurationen je Werbetyp. SB kennt keine Kosten pro ASIN (ein Banner
+// bewirbt mehrere Produkte) und wird deshalb als Konto-Summe importiert (_SB_TOTAL_).
+const REPORT_TYPES = [
+  { key: 'SP', adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spAdvertisedProduct', groupBy: ['advertiser'],
+    tries: [['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d', 'unitsSoldClicks7d']],
+    asin: r => r.advertisedAsin, m: r => ({ purchases: r.purchases7d, sales: r.sales7d, units: r.unitsSoldClicks7d }) },
+  { key: 'SD', adProduct: 'SPONSORED_DISPLAY', reportTypeId: 'sdAdvertisedProduct', groupBy: ['advertiser'],
+    tries: [['campaignId', 'adGroupId', 'promotedAsin', 'impressions', 'clicks', 'cost', 'purchases', 'sales', 'unitsSold'],
+            ['campaignId', 'adGroupId', 'promotedAsin', 'impressions', 'clicks', 'cost', 'purchasesClicks', 'salesClicks', 'unitsSoldClicks']],
+    asin: r => r.promotedAsin, m: r => ({ purchases: r.purchases ?? r.purchasesClicks, sales: r.sales ?? r.salesClicks, units: r.unitsSold ?? r.unitsSoldClicks }) },
+  { key: 'SB', adProduct: 'SPONSORED_BRANDS', reportTypeId: 'sbCampaigns', groupBy: ['campaign'],
+    tries: [['campaignId', 'impressions', 'clicks', 'cost', 'purchases', 'sales'],
+            ['campaignId', 'impressions', 'clicks', 'cost', 'purchasesClicks', 'salesClicks']],
+    asin: () => '_SB_TOTAL_', m: r => ({ purchases: r.purchases ?? r.purchasesClicks, sales: r.sales ?? r.salesClicks, units: 0 }) },
+];
+
+async function pull(profile, rt, columns, startDate, endDate) {
   let cj;
   for (let a = 0; a < 6; a++) {
-    const body = { name: `vendorAds ${startDate} ${a}`, startDate, endDate, configuration: { adProduct: 'SPONSORED_PRODUCTS', groupBy: ['advertiser'], columns, reportTypeId: 'spAdvertisedProduct', timeUnit: 'SUMMARY', format: 'GZIP_JSON' } };
+    const body = { name: `vendorAds ${rt.key} ${startDate} ${a}`, startDate, endDate, configuration: { adProduct: rt.adProduct, groupBy: rt.groupBy, columns, reportTypeId: rt.reportTypeId, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } };
     const c = await fetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) });
     if (c.status === 429) { await sleep(30000); continue; }
     const j = await c.json();
@@ -101,16 +116,30 @@ async function main() {
         const st = await monthState(cl.id, m.start, cl.ads_profile_id);
         if (m !== last && st === 'aktuell') { console.log(`  ${m.start}: schon da`); continue; }
         if (st === 'profilwechsel') console.log(`  ${m.start}: Profil geändert -> wird neu importiert`);
-        const rows = await pull(cl.ads_profile_id, m.start, m.end);
-        if (rows === null) { console.log(`  ${m.start}: außerhalb der Ads-Datenaufbewahrung`); continue; }
         const agg = new Map();
-        for (const r of rows) {
-          const asin = (r.advertisedAsin || '').toUpperCase(); if (!asin) continue;
-          let e = agg.get(asin);
-          if (!e) { e = { client_id: cl.id, profile_id: String(cl.ads_profile_id), asin, period_start: m.start, period_end: m.end, impressions: 0, clicks: 0, cost: 0, ad_orders: 0, ad_sales: 0, ad_units: 0 }; agg.set(asin, e); }
-          e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0;
-          e.ad_orders += +r.purchases7d || 0; e.ad_sales += +r.sales7d || 0; e.ad_units += +r.unitsSoldClicks7d || 0;
+        let anyData = false, outsideRetention = 0;
+        for (const rt of REPORT_TYPES) {
+          let rows = null, ok = false;
+          for (const cols of rt.tries) {
+            try { rows = await pull(cl.ads_profile_id, rt, cols, m.start, m.end); ok = true; break; }
+            catch (e) {
+              if (/column|invalid|unknown|not supported/i.test(e.message)) continue; // nächste Spalten-Variante
+              throw e;
+            }
+          }
+          if (!ok) { console.log(`  ${m.start} ${rt.key}: keine gültige Spalten-Variante`); continue; }
+          if (rows === null) { outsideRetention++; continue; }
+          anyData = true;
+          for (const r of rows) {
+            const asin = (rt.asin(r) || '').toUpperCase(); if (!asin) continue;
+            let e = agg.get(asin);
+            if (!e) { e = { client_id: cl.id, profile_id: String(cl.ads_profile_id), asin, period_start: m.start, period_end: m.end, impressions: 0, clicks: 0, cost: 0, ad_orders: 0, ad_sales: 0, ad_units: 0 }; agg.set(asin, e); }
+            const mm = rt.m(r);
+            e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0;
+            e.ad_orders += +mm.purchases || 0; e.ad_sales += +mm.sales || 0; e.ad_units += +mm.units || 0;
+          }
         }
+        if (!anyData && outsideRetention === REPORT_TYPES.length) { console.log(`  ${m.start}: außerhalb der Ads-Datenaufbewahrung`); continue; }
         await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${cl.id}&period_start=eq.${m.start}`, { method: 'DELETE', headers: sbHead });
         const vals = [...agg.values()];
         let ins = 0;
@@ -119,7 +148,7 @@ async function main() {
           const w = await fetch(`${U}/rest/v1/vra_ads`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) });
           if (w.ok) ins += chunk.length; else { console.log('  INSERT', w.status, (await w.text()).slice(0, 150)); break; }
         }
-        console.log(`  ${m.start}: ${rows.length} Report-Zeilen -> ${ins} ASINs`);
+        console.log(`  ${m.start}: ${ins} Zeilen (SP+SD pro ASIN, SB gesamt)`);
       } catch (e) { console.log(`  ${m.start}: FEHLER ${e.message} -> weiter`); }
     }
   }
