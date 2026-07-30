@@ -46,22 +46,35 @@ const REPORT_TYPES = [
     asin: () => '_SB_TOTAL_', m: r => ({ purchases: r.purchases ?? r.purchasesClicks, sales: r.sales ?? r.salesClicks, units: 0 }) },
 ];
 
-async function pull(profile, rt, columns, startDate, endDate) {
-  let cj;
-  for (let a = 0; a < 6; a++) {
-    const body = { name: `vendorAds ${rt.key} ${startDate} ${a}`, startDate, endDate, configuration: { adProduct: rt.adProduct, groupBy: rt.groupBy, columns, reportTypeId: rt.reportTypeId, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } };
-    const c = await fetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) });
-    if (c.status === 429) { await sleep(30000); continue; }
-    const j = await c.json();
-    if (c.status === 425) { const id = String(j.detail || '').split(':').pop().trim(); if (id) { cj = { reportId: id }; break; } await sleep(25000); continue; }
-    if (c.status === 400) { const m = String(j.detail || '').match(/data retention start date \((\d{4}-\d{2}-\d{2})\)/); if (m && m[1] > startDate) { if (m[1] > endDate) return null; startDate = m[1]; continue; } }
-    cj = j; if (!cj.reportId) throw new Error('create ' + c.status + ': ' + JSON.stringify(cj).slice(0, 160)); break;
+// Phase 1: Report nur ANFORDERN (Amazon generiert dann parallel). Liefert
+// {reportId} oder null (Monat außerhalb der Datenaufbewahrung); probiert die
+// Spalten-Varianten des Report-Typs durch.
+async function createReport(profile, rt, startDate, endDate) {
+  for (const columns of rt.tries) {
+    let badColumns = false;
+    for (let a = 0; a < 8; a++) {
+      const body = { name: `vendorAds ${rt.key} ${startDate}`, startDate, endDate, configuration: { adProduct: rt.adProduct, groupBy: rt.groupBy, columns, reportTypeId: rt.reportTypeId, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } };
+      const c = await fetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) });
+      if (c.status === 429) { await sleep(15000); continue; }
+      const j = await c.json();
+      if (c.status === 425) { const id = String(j.detail || '').split(':').pop().trim(); if (id) return { reportId: id }; await sleep(15000); continue; }
+      if (c.status === 400) {
+        const m = String(j.detail || '').match(/data retention start date \((\d{4}-\d{2}-\d{2})\)/);
+        if (m && m[1] > startDate) { if (m[1] > endDate) return null; startDate = m[1]; continue; }
+        if (/column|invalid|unknown|not supported/i.test(JSON.stringify(j))) { badColumns = true; break; }
+      }
+      if (!j.reportId) throw new Error(`${rt.key} create ${c.status}: ${JSON.stringify(j).slice(0, 160)}`);
+      return { reportId: j.reportId };
+    }
+    if (!badColumns) throw new Error(`${rt.key} create: zu viele Versuche`);
   }
-  if (!cj || !cj.reportId) throw new Error('create fehlgeschlagen');
-  let url = null;
-  for (let i = 0; i < 120; i++) { await sleep(8000); const g = await fetch(`${ADS}/reporting/reports/${cj.reportId}`, { headers: H(profile) }); const gj = await g.json(); if (gj.status === 'COMPLETED') { url = gj.url; break; } if (gj.status === 'FAILURE') throw new Error('report FAILURE'); }
-  if (!url) throw new Error('report timeout');
-  const raw = await fetch(url); let buf = Buffer.from(await raw.arrayBuffer()); buf = zlib.gunzipSync(buf); return JSON.parse(buf.toString('utf8'));
+  throw new Error(`${rt.key}: keine gültige Spalten-Variante`);
+}
+
+async function downloadReport(url) {
+  const raw = await fetch(url);
+  const buf = zlib.gunzipSync(Buffer.from(await raw.arrayBuffer()));
+  return JSON.parse(buf.toString('utf8'));
 }
 
 // Monat überspringen nur, wenn er schon mit DEMSELBEN Profil importiert wurde —
@@ -107,51 +120,81 @@ async function main() {
   }
   const ms = months();
   console.log(`Vendor-Ads: ${clients.length} Kunde(n), ${ms.length} Monat(e) [${ms.length ? ms[0].start + ' … ' + ms[ms.length - 1].end : '-'}]`);
+
+  // Phase 1: Arbeitsliste bauen und ALLE Reports anfordern — Amazon generiert parallel.
+  const last = ms[ms.length - 1];
+  const jobs = []; // je (Kunde × Monat × Report-Typ)
   for (const cl of clients) {
-    console.log(`Kunde: ${cl.name} (Profil ${cl.ads_profile_id})`);
-    const last = ms[ms.length - 1];
     for (const m of ms) {
-      try {
-        // Vergangene Monate überspringen, wenn schon mit diesem Profil importiert (letzter Monat wird aktualisiert)
-        const st = await monthState(cl.id, m.start, cl.ads_profile_id);
-        if (m !== last && st === 'aktuell') { console.log(`  ${m.start}: schon da`); continue; }
-        if (st === 'profilwechsel') console.log(`  ${m.start}: Profil geändert -> wird neu importiert`);
-        const agg = new Map();
-        let anyData = false, outsideRetention = 0;
-        for (const rt of REPORT_TYPES) {
-          let rows = null, ok = false;
-          for (const cols of rt.tries) {
-            try { rows = await pull(cl.ads_profile_id, rt, cols, m.start, m.end); ok = true; break; }
-            catch (e) {
-              if (/column|invalid|unknown|not supported/i.test(e.message)) continue; // nächste Spalten-Variante
-              throw e;
-            }
-          }
-          if (!ok) { console.log(`  ${m.start} ${rt.key}: keine gültige Spalten-Variante`); continue; }
-          if (rows === null) { outsideRetention++; continue; }
-          anyData = true;
-          for (const r of rows) {
-            const asin = (rt.asin(r) || '').toUpperCase(); if (!asin) continue;
-            let e = agg.get(asin);
-            if (!e) { e = { client_id: cl.id, profile_id: String(cl.ads_profile_id), asin, period_start: m.start, period_end: m.end, impressions: 0, clicks: 0, cost: 0, ad_orders: 0, ad_sales: 0, ad_units: 0 }; agg.set(asin, e); }
-            const mm = rt.m(r);
-            e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0;
-            e.ad_orders += +mm.purchases || 0; e.ad_sales += +mm.sales || 0; e.ad_units += +mm.units || 0;
-          }
-        }
-        if (!anyData && outsideRetention === REPORT_TYPES.length) { console.log(`  ${m.start}: außerhalb der Ads-Datenaufbewahrung`); continue; }
-        await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${cl.id}&period_start=eq.${m.start}`, { method: 'DELETE', headers: sbHead });
-        const vals = [...agg.values()];
-        let ins = 0;
-        for (let i = 0; i < vals.length; i += 500) {
-          const chunk = vals.slice(i, i + 500);
-          const w = await fetch(`${U}/rest/v1/vra_ads`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) });
-          if (w.ok) ins += chunk.length; else { console.log('  INSERT', w.status, (await w.text()).slice(0, 150)); break; }
-        }
-        console.log(`  ${m.start}: ${ins} Zeilen (SP+SD pro ASIN, SB gesamt)`);
-      } catch (e) { console.log(`  ${m.start}: FEHLER ${e.message} -> weiter`); }
+      const st = await monthState(cl.id, m.start, cl.ads_profile_id);
+      if (m !== last && st === 'aktuell') { console.log(`${cl.name} ${m.start}: schon da`); continue; }
+      if (st === 'profilwechsel') console.log(`${cl.name} ${m.start}: Profil geändert -> wird neu importiert`);
+      for (const rt of REPORT_TYPES) jobs.push({ cl, m, rt, state: 'neu' });
     }
   }
+  console.log(`${jobs.length} Report(s) werden angefordert…`);
+  for (const job of jobs) {
+    try {
+      const r = await createReport(job.cl.ads_profile_id, job.rt, job.m.start, job.m.end);
+      if (!r) { job.state = 'retention'; } else { job.reportId = r.reportId; job.state = 'wartet'; }
+    } catch (e) { job.state = 'fehler'; console.log(`${job.cl.name} ${job.m.start} ${job.rt.key}: ${e.message}`); }
+    await sleep(400); // Amazon-Rate-Limit schonen
+  }
+
+  // Ein Monat wird geschrieben, sobald alle seine Report-Typen abgeschlossen sind.
+  const written = new Set();
+  async function writeMonthIfReady(cl, m) {
+    const mk = cl.id + '|' + m.start;
+    if (written.has(mk)) return;
+    const mine = jobs.filter(j => j.cl === cl && j.m === m);
+    if (mine.some(j => j.state === 'neu' || j.state === 'wartet')) return;
+    written.add(mk);
+    const done = mine.filter(j => j.state === 'fertig');
+    if (!done.length) {
+      console.log(`${cl.name} ${m.start}: ${mine.every(j => j.state === 'retention') ? 'außerhalb der Ads-Datenaufbewahrung' : 'keine Daten (alle Reports fehlgeschlagen)'}`);
+      return;
+    }
+    const agg = new Map();
+    for (const job of done) {
+      for (const r of job.rows) {
+        const asin = (job.rt.asin(r) || '').toUpperCase(); if (!asin) continue;
+        let e = agg.get(asin);
+        if (!e) { e = { client_id: cl.id, profile_id: String(cl.ads_profile_id), asin, period_start: m.start, period_end: m.end, impressions: 0, clicks: 0, cost: 0, ad_orders: 0, ad_sales: 0, ad_units: 0 }; agg.set(asin, e); }
+        const mm = job.rt.m(r);
+        e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0;
+        e.ad_orders += +mm.purchases || 0; e.ad_sales += +mm.sales || 0; e.ad_units += +mm.units || 0;
+      }
+      job.rows = null; // Speicher freigeben
+    }
+    await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${cl.id}&period_start=eq.${m.start}`, { method: 'DELETE', headers: sbHead });
+    const vals = [...agg.values()];
+    let ins = 0;
+    for (let i = 0; i < vals.length; i += 500) {
+      const chunk = vals.slice(i, i + 500);
+      const w = await fetch(`${U}/rest/v1/vra_ads`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) });
+      if (w.ok) ins += chunk.length; else { console.log('  INSERT', w.status, (await w.text()).slice(0, 150)); break; }
+    }
+    console.log(`${cl.name} ${m.start}: ${ins} Zeilen (${done.map(j => j.rt.key).join('+')})`);
+  }
+
+  // Phase 2: Alle angeforderten Reports gesammelt abholen (Laufzeit = langsamster Report).
+  const deadline = Date.now() + 150 * 60 * 1000;
+  while (jobs.some(j => j.state === 'wartet') && Date.now() < deadline) {
+    for (const job of jobs.filter(j => j.state === 'wartet')) {
+      try {
+        const g = await fetch(`${ADS}/reporting/reports/${job.reportId}`, { headers: H(job.cl.ads_profile_id) });
+        if (g.status === 429) { await sleep(10000); continue; }
+        const gj = await g.json();
+        if (gj.status === 'COMPLETED') { job.rows = await downloadReport(gj.url); job.state = 'fertig'; await writeMonthIfReady(job.cl, job.m); }
+        else if (gj.status === 'FAILURE') { job.state = 'fehler'; console.log(`${job.cl.name} ${job.m.start} ${job.rt.key}: Report FAILURE`); await writeMonthIfReady(job.cl, job.m); }
+      } catch (e) { console.log(`${job.cl.name} ${job.m.start} ${job.rt.key}: ${e.message}`); }
+      await sleep(700);
+    }
+    if (jobs.some(j => j.state === 'wartet')) await sleep(15000);
+  }
+  // Zeitüberschreitung: übrig gebliebene Reports abschreiben, Monate mit Teildaten trotzdem schreiben
+  for (const job of jobs.filter(j => j.state === 'wartet')) { job.state = 'fehler'; console.log(`${job.cl.name} ${job.m.start} ${job.rt.key}: Timeout`); }
+  for (const job of jobs) await writeMonthIfReady(job.cl, job.m);
   console.log('FERTIG.');
 }
 main().catch(e => { console.error('FEHLER', e.message); process.exit(1); });
