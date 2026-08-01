@@ -33,6 +33,22 @@ async function pullListings(H, mkt) {
   if (drj.compressionAlgorithm === 'GZIP') buf = zlib.gunzipSync(buf);
   return buf.toString('utf8'); // Titel korrekt dekodieren (Report ist UTF-8)
 }
+// Upsert marketplace-aware; Fallback aufs alte Schema (spid,asin), solange die
+// Migration migration_asin_meta_marketplace.sql noch nicht gelaufen ist.
+async function upsertMeta(rows) {
+  let ok = 0, legacy = false;
+  for (let i = 0; i < rows.length; i += 500) {
+    const chunk = rows.slice(i, i + 500);
+    let up = legacy ? null : await fetch(`${U}/rest/v1/sqp_asin_meta?on_conflict=spid,asin,marketplace`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) });
+    if (!up || !up.ok) {
+      legacy = true; // Spalte/Constraint fehlt noch -> altes Verhalten
+      up = await fetch(`${U}/rest/v1/sqp_asin_meta?on_conflict=spid,asin`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk.map(({ marketplace, ...r }) => r)) });
+    }
+    if (up.ok) ok += chunk.length; else console.log('  UPSERT', up.status, (await up.text()).slice(0, 120));
+  }
+  if (legacy) console.log('  HINWEIS: sqp_asin_meta noch ohne marketplace-Spalte — Migration ausführen!');
+  return ok;
+}
 async function main() {
   const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&select=name,spid,marketplace`, { headers: sbHead });
   const clients = await cr.json();
@@ -62,12 +78,9 @@ async function main() {
       if (prev && !prev.status && status !== 'active') continue;
       map.set(asin, { sku: iK >= 0 ? (r[iK] || '').trim() : null, title: iT >= 0 ? (r[iT] || '').trim().slice(0, 300) : null, status });
     }
-    const rows = [...map.entries()].map(([asin, m]) => ({ spid: cl.spid, asin, sku: m.sku || null, title: m.title || null, status: m.status }));
-    let ok = 0;
-    for (let i = 0; i < rows.length; i += 500) {
-      const up = await fetch(`${U}/rest/v1/sqp_asin_meta?on_conflict=spid,asin`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows.slice(i, i + 500)) });
-      if (up.ok) ok += Math.min(500, rows.length - i); else console.log('  UPSERT', up.status, (await up.text()).slice(0, 120));
-    }
+    const mktCode = (cl.marketplace || 'DE').toUpperCase();
+    const rows = [...map.entries()].map(([asin, m]) => ({ spid: cl.spid, marketplace: mktCode, asin, sku: m.sku || null, title: m.title || null, status: m.status }));
+    const ok = await upsertMeta(rows);
     console.log(`  ${cl.name}: ${ok} ASINs mit Titel/SKU gespeichert`);
     // Marke je ASIN via Listings-Items-API ergaenzen (attributes.brand; Catalog-API-Rolle fehlt im Consent)
     const br = await fetch(`${U}/rest/v1/sqp_asin_meta?spid=eq.${cl.spid}&brand=is.null&select=asin&limit=10000`, { headers: { ...sbHead, Range: '0-9999' } });
@@ -86,10 +99,8 @@ async function main() {
         pageToken = j.pagination && j.pagination.nextToken; if (!pageToken) break;
         await sleep(250);
       }
-      const bu = Object.entries(brandByAsin).map(([asin, brand]) => ({ spid: cl.spid, asin, brand }));
-      for (let i = 0; i < bu.length; i += 500) {
-        await fetch(`${U}/rest/v1/sqp_asin_meta?on_conflict=spid,asin`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(bu.slice(i, i + 500)) });
-      }
+      const bu = Object.entries(brandByAsin).map(([asin, brand]) => ({ spid: cl.spid, marketplace: mktCode, asin, brand }));
+      await upsertMeta(bu);
       console.log(`  ${cl.name}: Marken ergänzt für ${bu.length}/${missing.size} ASINs`);
     }
   }
