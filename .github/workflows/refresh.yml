@@ -8,7 +8,7 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 345   # 27.07. starb am 3h-Timeout, bevor Ads-Steps liefen (GitHub-Limit: 360)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

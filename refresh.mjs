@@ -31,7 +31,9 @@ function makeApi(H){ return async function api(path,opts={},retries=10){
   for(let i=0;i<retries;i++){ const r=await fetch(`${SPAPI}${path}`,{...opts,headers:{...H,...(opts.headers||{})}});
     if(r.status===429){await sleep(25000+Math.random()*10000);continue;} return r; } return null; }; }
 async function pollDoc(api,id){ for(let i=0;i<120;i++){await sleep(5000);const g=await api(`/reports/2021-06-30/reports/${id}`);if(!g)return null;const gj=await g.json();if(gj.processingStatus==='DONE')return gj.reportDocumentId;if(['FATAL','CANCELLED'].includes(gj.processingStatus))return null;} return null; }
-async function download(api,docId){ const dr=await api(`/reports/2021-06-30/documents/${docId}`);const drj=await dr.json();const raw=await fetch(drj.url);let buf=Buffer.from(await raw.arrayBuffer());if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);return JSON.parse(buf.toString('utf8')); }
+async function download(api,docId){ const dr=await api(`/reports/2021-06-30/documents/${docId}`); if(!dr) throw new Error('Dokument-Abruf fehlgeschlagen (Rate-Limit?)');
+  const drj=await dr.json(); if(!drj||!drj.url) throw new Error('Report-Dokument ohne Download-URL'); // crashte sonst den ganzen Lauf (20.07.)
+  const raw=await fetch(drj.url);let buf=Buffer.from(await raw.arrayBuffer());if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);return JSON.parse(buf.toString('utf8')); }
 async function listAsins(api,mkt){ const c=await api(`/reports/2021-06-30/reports`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reportType:'GET_MERCHANT_LISTINGS_ALL_DATA',marketplaceIds:[mkt]})});
   const docId=await pollDoc(api,(await c.json()).reportId);
   if(!docId) throw new Error('Listings-Report nicht fertig geworden (grosser Katalog?) — Kunde wird uebersprungen');
@@ -84,11 +86,11 @@ async function refreshClient(client){
   const worker=async()=>{ while(i<jobs.length){ const j=jobs[i++];
     try{ const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[mkt],dataStartTime:j.start+'T00:00:00Z',dataEndTime:j.end+'T00:00:00Z',reportOptions:{reportPeriod:j.period,asin:j.a}};
       const c=await spacedCreate(body); const cj=c?await c.json():{}; done++;
-      if(!cj.reportId){console.log(`  [${done}/${total}] ${j.period} ${j.start} ${j.a}: create fail`);continue;}
-      const docId=await pollDoc(api,cj.reportId); if(!docId){console.log(`  [${done}/${total}] ${j.period} ${j.start} ${j.a}: FATAL`);continue;}
+      if(!cj.reportId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} ${j.a}: create fail`);continue;}
+      const docId=await pollDoc(api,cj.reportId); if(!docId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} ${j.a}: FATAL`);continue;}
       const n=await upsert(mapRows(await download(api,docId),spid,mkt,j.a,j.period,j.start),spid,mkt,j.a,j.period,j.start);
-      if(done%10===0||n===0) console.log(`  [${done}/${total}] ${j.period} ${j.start} ${j.a}: ${n}`);
-    }catch(e){done++;console.log(`  [${done}/${total}] EXC ${j.period} ${j.start} ${j.a}: ${e.message}`);} } };
+      if(done%10===0||n===0) console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} ${j.a}: ${n}`);
+    }catch(e){done++;console.log(`  ${name} [${done}/${total}] EXC ${j.period} ${j.start} ${j.a}: ${e.message}`);} } };
   await Promise.all(Array.from({length:CONC},worker));
   console.log(`  ${name}: fertig (${total} Reports).`);
 }
@@ -96,12 +98,16 @@ async function refreshClient(client){
 async function main(){
   const r=await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&select=name,spid,marketplace,ads_profile_id`,{headers:sbHead});
   const clients=(await r.json()).filter(c=>c.spid);
-  console.log(`SQP-Refresh: ${clients.length} Kunde(n), ${NWEEKS} Wochen + akt./vor. Monat.`);
-  for(const c of clients){
+  const CONC_CLIENTS=+(process.env.CONC_CLIENTS||3);
+  console.log(`SQP-Refresh: ${clients.length} Kunde(n), ${NWEEKS} Wochen + akt./vor. Monat, ${CONC_CLIENTS} Kunden parallel.`);
+  // Kunden PARALLEL: jeder Kunde hat ein eigenes Seller-Token und damit eigenes
+  // SP-API-Quota — sequenziell sprengte der Lauf das Workflow-Timeout (>3h).
+  let ci=0;
+  const clientWorker=async()=>{ while(ci<clients.length){ const c=clients[ci++];
     console.log(`Kunde: ${c.name} (${c.spid})`);
     // Ein Kunde darf den Lauf nicht abreissen — Fehler loggen und weiter
-    try{ await refreshClient(c); }catch(e){ console.log(`  ÜBERSPRUNGEN ${c.name}: ${e.message}`); }
-  }
+    try{ await refreshClient(c); }catch(e){ console.log(`  ÜBERSPRUNGEN ${c.name}: ${e.message}`); } } };
+  await Promise.all(Array.from({length:Math.min(CONC_CLIENTS,clients.length)||1},clientWorker));
   console.log('ALLES FERTIG.');
 }
 main().catch(e=>{console.error('FEHLER',e);process.exit(1);});
