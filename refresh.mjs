@@ -27,9 +27,19 @@ async function accessToken(spid){
   const t=await fetch('https://api.amazon.co.uk/auth/o2/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({grant_type:'refresh_token',refresh_token:rows[0].refresh_token,client_id:CID,client_secret:SEC})});
   return (await t.json()).access_token;
 }
-function makeApi(H){ return async function api(path,opts={},retries=10){
-  for(let i=0;i<retries;i++){ const r=await fetch(`${SPAPI}${path}`,{...opts,headers:{...H,...(opts.headers||{})}});
-    if(r.status===429){await sleep(25000+Math.random()*10000);continue;} return r; } return null; }; }
+// Token-Verwaltung wie in sqp-backfill.mjs: LWA-Token laeuft nach 60min ab —
+// ohne Erneuerung liefen ALLE Requests langer Laeufe ab Minute 60 in 403
+// ("create fail"-Massen am 20.07./27.07./01.08.).
+function makeApi(spid){ let H=null,t0=0;
+  const auth=async()=>{ const at=await accessToken(spid); if(at){ H={'x-amz-access-token':at,'Content-Type':'application/json'}; t0=Date.now(); } return !!at; };
+  const api=async function(path,opts={},retries=10){
+    for(let i=0;i<retries;i++){
+      if(!H||Date.now()-t0>50*60000){ if(!await auth()&&!H) return null; }
+      let r; try{ r=await fetch(`${SPAPI}${path}`,{...opts,headers:{...H,...(opts.headers||{})}}); }catch(e){ await sleep(8000); continue; }
+      if(r.status===429){await sleep(25000+Math.random()*10000);continue;}
+      if(r.status===403){ await auth(); continue; }
+      return r; } return null; };
+  api.init=auth; return api; }
 async function pollDoc(api,id){ for(let i=0;i<120;i++){await sleep(5000);const g=await api(`/reports/2021-06-30/reports/${id}`);if(!g)return null;const gj=await g.json();if(gj.processingStatus==='DONE')return gj.reportDocumentId;if(['FATAL','CANCELLED'].includes(gj.processingStatus))return null;} return null; }
 async function download(api,docId){ const dr=await api(`/reports/2021-06-30/documents/${docId}`); if(!dr) throw new Error('Dokument-Abruf fehlgeschlagen (Rate-Limit?)');
   const drj=await dr.json(); if(!drj||!drj.url) throw new Error('Report-Dokument ohne Download-URL'); // crashte sonst den ganzen Lauf (20.07.)
@@ -40,6 +50,7 @@ async function listAsins(api,mkt){ const c=await api(`/reports/2021-06-30/report
   const dr=await api(`/reports/2021-06-30/documents/${docId}`);const drj=await dr.json();
   if(!drj||!drj.url) throw new Error('Listings-Report-Dokument ohne Download-URL — Kunde wird uebersprungen');
   const raw=await fetch(drj.url);let buf=Buffer.from(await raw.arrayBuffer());if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);
+  if(buf.length>256*1024*1024) throw new Error(`Listings-Report unplausibel gross (${Math.round(buf.length/1048576)} MB) — Kunde wird uebersprungen`); // Pixxprint lieferte 525MB
   const lines=buf.toString('latin1').split('\n').filter(Boolean);const hdr=lines[0].split('\t');const iA=hdr.findIndex(h=>/asin[\s_]*1/i.test(h)),iS=hdr.findIndex(h=>/status/i.test(h));
   const ACT=new Set(['active','aktiv','actif','activo','attivo']); // Report ist lokalisiert (DE: "Aktiv")
   let asins=[...new Set(lines.slice(1).map(l=>l.split('\t')).filter(r=>ACT.has((r[iS]||'').trim().toLowerCase())).map(r=>r[iA]).filter(Boolean))];
@@ -74,9 +85,12 @@ async function upsert(rows,spid,mkt,asin,period,start){ const q=`selling_partner
 
 async function refreshClient(client){
   const {spid,marketplace,name}=client; const mkt=MKT_BY_CC[marketplace]||MKT_BY_CC.DE;
-  const at=await accessToken(spid); if(!at){console.log(`  ${name}: kein SP-API-Token`);return;}
-  const H={'x-amz-access-token':at,'Content-Type':'application/json'}; const api=makeApi(H);
+  const api=makeApi(spid); if(!await api.init()){console.log(`  ${name}: kein SP-API-Token`);return;}
   const asins=await applyBrandFilter(spid, await listAsins(api,mkt)); console.log(`  ${name}: ${asins.length} ASINs`);
+  // Riesen-Kataloge (Haendler ohne Marken-Filter) sprengen das Zeitfenster: 3.720 ASINs
+  // = 18.600 Reports = rechnerisch >40h. SQP gibt es ohnehin nur fuer eigene Marken —
+  // solche Kunden brauchen einen Marken-Filter (unter "Kunde verbinden" pflegbar).
+  if(asins.length>300){ console.log(`  ${name}: ${asins.length} ASINs ohne wirksamen Marken-Filter — ÜBERSPRUNGEN. Marken-Filter setzen, dann laeuft der Kunde wieder mit.`); return; }
   // Aufgaben: MONTH (prev+cur), WEEK (letzte N) — alle force (überschreiben)
   const jobs=[]; for(const m of months()) for(const a of asins) jobs.push({a,period:'MONTH',start:m,end:monthEnd(m)});
   for(const w of weeks(NWEEKS)) for(const a of asins) jobs.push({a,period:'WEEK',start:w,end:satOf(w)});
@@ -86,7 +100,7 @@ async function refreshClient(client){
   const worker=async()=>{ while(i<jobs.length){ const j=jobs[i++];
     try{ const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[mkt],dataStartTime:j.start+'T00:00:00Z',dataEndTime:j.end+'T00:00:00Z',reportOptions:{reportPeriod:j.period,asin:j.a}};
       const c=await spacedCreate(body); const cj=c?await c.json():{}; done++;
-      if(!cj.reportId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} ${j.a}: create fail`);continue;}
+      if(!cj.reportId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} ${j.a}: create fail ${c?c.status:'-'} ${JSON.stringify(cj).slice(0,120)}`);continue;}
       const docId=await pollDoc(api,cj.reportId); if(!docId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} ${j.a}: FATAL`);continue;}
       const n=await upsert(mapRows(await download(api,docId),spid,mkt,j.a,j.period,j.start),spid,mkt,j.a,j.period,j.start);
       if(done%10===0||n===0) console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} ${j.a}: ${n}`);
