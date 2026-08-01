@@ -81,6 +81,22 @@ async function main() {
     const mktCode = (cl.marketplace || 'DE').toUpperCase();
     const rows = [...map.entries()].map(([asin, m]) => ({ spid: cl.spid, marketplace: mktCode, asin, sku: m.sku || null, title: m.title || null, status: m.status }));
     const ok = await upsertMeta(rows);
+    // Aufraeumen: Zeilen dieses (spid, marketplace), deren ASIN nicht mehr im aktuellen
+    // Produktbericht steht (z.B. Titel, die vor der Migration unter dem falschen
+    // Marktplatz gespeichert wurden). Schutz: nur bei plausibel vollstaendigem Report.
+    const fresh = new Set(rows.map(r => r.asin));
+    if (fresh.size >= 10) {
+      const er = await fetch(`${U}/rest/v1/sqp_asin_meta?spid=eq.${cl.spid}&marketplace=eq.${mktCode}&select=asin`, { headers: { ...sbHead, Range: '0-9999' } });
+      if (er.ok) {
+        const stale = (await er.json()).map(x => x.asin).filter(a => !fresh.has(a));
+        if (stale.length && stale.length <= fresh.size) {
+          for (let i = 0; i < stale.length; i += 100) {
+            await fetch(`${U}/rest/v1/sqp_asin_meta?spid=eq.${cl.spid}&marketplace=eq.${mktCode}&asin=in.(${stale.slice(i, i + 100).join(',')})`, { method: 'DELETE', headers: sbHead });
+          }
+          console.log(`  ${cl.name}: ${stale.length} veraltete ASIN-Zeile(n) entfernt`);
+        }
+      }
+    }
     console.log(`  ${cl.name}: ${ok} ASINs mit Titel/SKU gespeichert`);
     // Marke je ASIN via Listings-Items-API ergaenzen (attributes.brand; Catalog-API-Rolle fehlt im Consent)
     const br = await fetch(`${U}/rest/v1/sqp_asin_meta?spid=eq.${cl.spid}&brand=is.null&select=asin&limit=10000`, { headers: { ...sbHead, Range: '0-9999' } });
