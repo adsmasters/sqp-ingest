@@ -21,7 +21,12 @@ async function queuedJobs() {
   return r.ok ? await r.json() : [];
 }
 async function patch(id, body) {
-  await fetch(`${U}/rest/v1/sqp_backfill_jobs?id=eq.${id}`, { method: 'PATCH', headers: H, body: JSON.stringify(body) });
+  // Nie werfen: ein transienter Netzfehler (EPIPE) hat am 01.08. den ganzen Worker gekillt
+  for (let a = 0; a < 5; a++) {
+    try { const r = await fetch(`${U}/rest/v1/sqp_backfill_jobs?id=eq.${id}`, { method: 'PATCH', headers: H, body: JSON.stringify(body) }); if (r.ok) return; } catch (e) {}
+    await new Promise(r => setTimeout(r, 3000 * (a + 1)));
+  }
+  console.log(`  WARNUNG: Status-Update für Job ${id} fehlgeschlagen — weiter.`);
 }
 
 // Kind-Prozess mit Deadline; stdout-Zeilen bekommen ein Kunden-Präfix (parallele Logs lesbar halten)
@@ -63,6 +68,7 @@ const lanes = [...bySeller.values()]; // jede "Lane" = ein Seller, Jobs darin se
 
 async function runLane(jobs) {
   for (const j of jobs) {
+    try {
     const remaining = sqpDeadlineMs - (Date.now() - t0);
     if (remaining < 5 * 60000) { console.log(`[${j.spid}] Fenster zu — Job ${j.id} bleibt eingereiht.`); return; }
     const range = rangeFor(j);
@@ -79,6 +85,10 @@ async function runLane(jobs) {
       const keepFull = /voll|full/i.test(j.note || '') ? ' [voll]' : '';
       await patch(j.id, { status: 'queued', note: 'Teillauf, wird beim nächsten Lauf fortgesetzt' + keepFull });
       console.log(`[${j.spid}] Job ${j.id}: Teillauf (${m}/${w}), erneut eingereiht${keepFull}`);
+    }
+    } catch (e) { // ein Job darf nicht die ganze Lane/den Worker abreissen
+      console.log(`[${j.spid}] Job ${j.id}: FEHLER ${e.message} — erneut eingereiht, nächster Job.`);
+      await patch(j.id, { status: 'queued', note: 'Fehler im Lauf, wird erneut versucht' });
     }
   }
 }

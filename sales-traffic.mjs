@@ -66,7 +66,11 @@ async function runClient(cl) {
 async function main() {
   const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&spid=not.is.null&select=name,spid,marketplace`, { headers: sbHead });
   const clients = await cr.json();
-  // je Seller-Konto (spid) nur einmal
+  // je Seller-Konto (spid) nur einmal — DE-Kunde bevorzugen: asin_sales_traffic hat (noch)
+  // keine Marketplace-Dimension, und das Tool zeigt Gesamtumsatz/TACoS nur in der DE-Ansicht.
+  // Ohne diese Sortierung konnte bei Recoactiv (DE+IT, gleiche spid) zufällig der IT-Umsatz
+  // gespeichert werden. Sauberer Fix (marketplace-Spalte) braucht eine Migration.
+  clients.sort((a, b) => (((a.marketplace || 'DE').toUpperCase() === 'DE') ? 0 : 1) - (((b.marketplace || 'DE').toUpperCase() === 'DE') ? 0 : 1));
   const seen = new Set();
   console.log(`Sales&Traffic: ${clients.length} Kunde(n), ${DAYS} Tage`);
   for (const cl of clients) {

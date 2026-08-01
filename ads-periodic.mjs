@@ -8,8 +8,12 @@ const sbHead = { apikey: KEY, Authorization: 'Bearer ' + KEY };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const iso = d => d.toISOString().slice(0, 10);
 const NM = +(process.argv[2] || 4);
+const NW = +(process.argv[3] || 3); // letzte N abgeschlossene Wochen (So-Sa, wie SQP-Refresh)
 const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 function months(n) { const out = []; const now = new Date(); for (let i = 1; i <= n; i++) { const s = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1)); const e = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i + 1, 0)); out.push({ start: iso(s), end: iso(e) }); } return out.reverse(); }
+function weeksList(n) { const now = new Date(); const day = now.getUTCDay();
+  const curSun = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - day)); const out = [];
+  for (let i = 1; i <= n; i++) { const s = new Date(curSun); s.setUTCDate(curSun.getUTCDate() - 7 * i); const e = new Date(s); e.setUTCDate(s.getUTCDate() + 6); out.push({ start: iso(s), end: iso(e) }); } return out.reverse(); }
 
 let AT;
 async function auth() { const t = await fetch('https://api.amazon.co.uk/auth/o2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: RT, client_id: CID, client_secret: SEC }) }); AT = (await t.json()).access_token; }
@@ -34,16 +38,17 @@ async function pull(profile, reportTypeId, columns, startDate, endDate) {
 }
 async function upsert(rows) { let ins = 0; for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_terms_periodic`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  INSERT', r.status, (await r.text()).slice(0, 150)); break; } } return ins; }
 
-async function hasMonth(profile, m) {
-  const r = await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.MONTH&period_start=eq.${m}&select=id`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });
+async function hasPeriod(profile, type, start) {
+  const r = await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.${type}&period_start=eq.${start}&select=id`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });
   return +((r.headers.get('content-range') || '0/0').split('/')[1]) > 0;
 }
+const hasMonth = (profile, m) => hasPeriod(profile, 'MONTH', m);
 
 async function main() {
   await auth();
   const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&ads_profile_id=not.is.null&select=name,ads_profile_id`, { headers: sbHead });
   const clients = await cr.json();
-  console.log(`Ads-Periodic: ${clients.length} Kunde(n), letzte ${NM} Monate`);
+  console.log(`Ads-Periodic: ${clients.length} Kunde(n), letzte ${NM} Monate + ${NW} Wochen`);
   const ms = months(NM);
   for (const cl of clients) {
     const profile = String(cl.ads_profile_id);
@@ -66,6 +71,25 @@ async function main() {
         const n = await upsert([...agg.values()]);
         console.log(`  ${m.start}: ${st.length} Terms -> ${n} Zeilen`);
       } catch (e) { console.log(`  ${m.start}: FEHLER ${e.message} -> weiter`); }
+    }
+    // Letzte N Wochen: echte Ad-Werte je Woche (statt 30-Tage-Näherung in der Wochenansicht).
+    // Wochen, die vor >8 Tagen endeten, sind final (7-Tage-Attribution) -> überspringen wenn vorhanden.
+    for (const w of weeksList(NW)) {
+      try {
+        const final = w.end < iso(new Date(Date.now() - 8 * 864e5));
+        if (final && await hasPeriod(profile, 'WEEK', w.start)) { console.log(`  Woche ${w.start}: schon da`); continue; }
+        if (!agToAsins) {
+          const adv = await pull(profile, 'spAdvertisedProduct', ['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks'], iso(new Date(Date.now() - 30 * 864e5)), iso(new Date(Date.now() - 864e5)));
+          agToAsins = new Map(); for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Set()); agToAsins.get(k).add(r.advertisedAsin); }
+        }
+        const st = await pull(profile, 'spSearchTerm', ['searchTerm', 'adGroupId', 'clicks', 'cost', 'purchases7d', 'sales7d'], w.start, w.end);
+        if (!st.length) { console.log(`  Woche ${w.start}: keine Ads-Daten`); continue; }
+        const agg = new Map();
+        for (const r of st) { const asins = agToAsins.get(String(r.adGroupId)); if (!asins) continue; const term = norm(r.searchTerm); if (!term) continue; for (const asin of asins) { const k = asin + '||' + term; let e = agg.get(k); if (!e) { e = { profile_id: profile, asin, period_type: 'WEEK', period_start: w.start, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); } e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; } }
+        await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.WEEK&period_start=eq.${w.start}`, { method: 'DELETE', headers: sbHead });
+        const n = await upsert([...agg.values()]);
+        console.log(`  Woche ${w.start}: ${st.length} Terms -> ${n} Zeilen`);
+      } catch (e) { console.log(`  Woche ${w.start}: FEHLER ${e.message} -> weiter`); }
     }
   }
   console.log('FERTIG.');
