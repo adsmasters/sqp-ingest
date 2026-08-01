@@ -31,6 +31,8 @@ async function pullListings(H, mkt) {
   const dr = await api(H, `/reports/2021-06-30/documents/${docId}`); if (!dr) return null; const drj = await dr.json();
   const raw = await fetch(drj.url); let buf = Buffer.from(await raw.arrayBuffer());
   if (drj.compressionAlgorithm === 'GZIP') buf = zlib.gunzipSync(buf);
+  // Kaputte/absurd grosse Reports abfangen (V8-Stringlimit ~512MB wuerde den ganzen Lauf killen)
+  if (buf.length > 256 * 1024 * 1024) { console.log(`  Report unplausibel gross (${Math.round(buf.length / 1048576)} MB) — übersprungen`); return null; }
   return buf.toString('utf8'); // Titel korrekt dekodieren (Report ist UTF-8)
 }
 // Upsert marketplace-aware; Fallback aufs alte Schema (spid,asin), solange die
@@ -54,6 +56,7 @@ async function main() {
   const clients = await cr.json();
   console.log(`ASIN-Meta: ${clients.length} Kunde(n)`);
   for (const cl of clients) {
+    try { // ein Kunde darf nicht den ganzen Lauf killen
     const mkt = MKT_MAP[(cl.marketplace || 'DE').toUpperCase()] || 'A1PA6795UKMFR9';
     const H = await authFor(cl.spid);
     if (!H) { console.log(`  ${cl.name}: kein Token — übersprungen`); continue; }
@@ -119,6 +122,7 @@ async function main() {
       await upsertMeta(bu);
       console.log(`  ${cl.name}: Marken ergänzt für ${bu.length}/${missing.size} ASINs`);
     }
+    } catch (e) { console.log(`  ${cl.name}: FEHLER ${e.message} — übersprungen`); }
   }
   console.log('FERTIG.');
 }
