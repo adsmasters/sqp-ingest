@@ -13,16 +13,18 @@ const DAYS = 30; // Ads-Report max 31 Tage
 const end = new Date(Date.now() - 864e5), start = new Date(Date.now() - DAYS * 864e5);
 
 let ACCESS;
+let ACCESS_T = 0;
 async function auth() {
   const t = await fetch('https://api.amazon.co.uk/auth/o2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: RT, client_id: CID, client_secret: SEC }) });
-  ACCESS = (await t.json()).access_token;
+  ACCESS = (await t.json()).access_token; ACCESS_T = Date.now();
 }
+const freshAuth = async () => { if (Date.now() - ACCESS_T > 50 * 60000) await auth(); }; // Token laeuft nach 60min ab
 function H(profile) { return { 'Amazon-Advertising-API-ClientId': CID, 'Amazon-Advertising-API-Scope': String(profile), Authorization: 'Bearer ' + ACCESS, 'Content-Type': 'application/json' }; }
 async function pull(profile, reportTypeId, columns) {
   const body = { name: `${reportTypeId} ${Date.now()}`, startDate: iso(start), endDate: iso(end), configuration: { adProduct: 'SPONSORED_PRODUCTS', groupBy: reportTypeId === 'spAdvertisedProduct' ? ['advertiser'] : ['searchTerm'], columns, reportTypeId, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } };
   let cj;
-  for (let a = 0; a < 6; a++) { const c = await fetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) }); if (c.status === 429) { await sleep(30000); continue; } cj = await c.json(); if (!cj.reportId) throw new Error(reportTypeId + ' create: ' + JSON.stringify(cj).slice(0, 200)); break; }
-  let url = null; for (let i = 0; i < 90; i++) { await sleep(8000); const g = await fetch(`${ADS}/reporting/reports/${cj.reportId}`, { headers: H(profile) }); const gj = await g.json(); if (gj.status === 'COMPLETED') { url = gj.url; break; } if (gj.status === 'FAILURE') throw new Error(reportTypeId + ' FAILURE'); }
+  for (let a = 0; a < 6; a++) { await freshAuth(); const c = await fetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) }); if (c.status === 429) { await sleep(30000); continue; } cj = await c.json(); if (!cj.reportId) throw new Error(reportTypeId + ' create: ' + JSON.stringify(cj).slice(0, 200)); break; }
+  let url = null; for (let i = 0; i < 90; i++) { await sleep(8000); await freshAuth(); const g = await fetch(`${ADS}/reporting/reports/${cj.reportId}`, { headers: H(profile) }); const gj = await g.json(); if (gj.status === 'COMPLETED') { url = gj.url; break; } if (gj.status === 'FAILURE') throw new Error(reportTypeId + ' FAILURE'); }
   if (!url) throw new Error(reportTypeId + ' timeout');
   const raw = await fetch(url); let buf = Buffer.from(await raw.arrayBuffer()); buf = zlib.gunzipSync(buf); return JSON.parse(buf.toString('utf8'));
 }

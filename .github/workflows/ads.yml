@@ -1,0 +1,40 @@
+name: Ads Refresh (PPC-Daten)
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '30 5 * * *'   # täglich 05:30 UTC — unabhängig vom SQP-Zeitbudget
+                           # (im Backfill-Worker verhungerte der Ads-Block regelmäßig)
+
+jobs:
+  ads:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Ads-Refresh (PPC-Luecken je ASIN, letzte 30 Tage)
+        run: node ads-refresh.mjs
+        env:
+          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
+          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
+          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - name: Ads-Historie (Monate + Wochen)
+        if: always()
+        run: node ads-periodic.mjs 2 3
+        env:
+          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
+          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
+          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - name: Slack-Alert bei Fehlschlag
+        if: failure() || cancelled()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && { echo "Kein SLACK_WEBHOOK_URL-Secret — Alert übersprungen."; exit 0; }
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ *${{ github.workflow }}* fehlgeschlagen — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"
