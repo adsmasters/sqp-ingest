@@ -102,7 +102,8 @@ await Promise.all(Array.from({ length: Math.min(MAX_PAR, lanes.length) }, async 
 // PPC-Daten EINMAL am Ende (Ads-API, EINE Agentur-Quota — deshalb nicht parallel und nicht je Job)
 if (leftMin() > 10) {
   console.log('\n--- PPC-Daten (Ads), einmal fuer alle Kunden ---');
-  spawnSync('node', ['ads-refresh.mjs'], { stdio: 'inherit', env: process.env, timeout: Math.max(60000, leftMin() * 60000), killSignal: 'SIGTERM' });
-  spawnSync('node', ['ads-periodic.mjs', '4'], { stdio: 'inherit', env: process.env, timeout: Math.max(60000, leftMin() * 60000), killSignal: 'SIGTERM' });
+  // Math.round: spawnSync verlangt Integer-Timeout — Float crashte den Ads-Block (01.08.)
+  spawnSync('node', ['ads-refresh.mjs'], { stdio: 'inherit', env: process.env, timeout: Math.round(Math.max(60000, leftMin() * 60000)), killSignal: 'SIGTERM' });
+  spawnSync('node', ['ads-periodic.mjs', '4'], { stdio: 'inherit', env: process.env, timeout: Math.round(Math.max(60000, leftMin() * 60000)), killSignal: 'SIGTERM' });
 }
 console.log('\nWorker fertig.');
