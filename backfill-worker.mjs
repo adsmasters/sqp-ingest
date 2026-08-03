@@ -65,6 +65,12 @@ console.log(`SQP-Fenster: ${Math.round(sqpDeadlineMs / 60000)} Min, bis zu ${MAX
 const bySeller = new Map();
 for (const j of list) { if (!bySeller.has(j.spid)) bySeller.set(j.spid, []); bySeller.get(j.spid).push(j); }
 const lanes = [...bySeller.values()]; // jede "Lane" = ein Seller, Jobs darin sequenziell
+// Frische Jobs ZUERST: Riesen-Kataloge landen als "Teillauf" täglich wieder vorne in der
+// Queue und liessen kleine/neue Kunden verhungern (warmpack/Box/Recoactiv_IT: nie gestartet).
+lanes.sort((a, b) => {
+  const partial = jobs => (jobs.some(j => /Teillauf/i.test(j.note || '')) ? 1 : 0);
+  return partial(a) - partial(b) || (a[0].requested_at < b[0].requested_at ? -1 : 1);
+});
 
 async function runLane(jobs) {
   for (const j of jobs) {
