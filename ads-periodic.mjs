@@ -37,7 +37,11 @@ async function pull(profile, reportTypeId, columns, startDate, endDate) {
   let url = null;
   for (let i = 0; i < 120; i++) { await sleep(8000); await freshAuth(); const g = await fetch(`${ADS}/reporting/reports/${cj.reportId}`, { headers: H(profile) }); const gj = await g.json(); if (gj.status === 'COMPLETED') { url = gj.url; break; } if (gj.status === 'FAILURE') throw new Error(reportTypeId + ' FAILURE'); }
   if (!url) throw new Error(reportTypeId + ' timeout');
-  const raw = await fetch(url); let buf = Buffer.from(await raw.arrayBuffer()); buf = zlib.gunzipSync(buf); return JSON.parse(buf.toString('utf8'));
+  const raw = await fetch(url); let buf = Buffer.from(await raw.arrayBuffer());
+  if (buf.length > 200 * 1024 * 1024) throw new Error(`${reportTypeId} Report zu gross (${Math.round(buf.length / 1048576)} MB komprimiert)`); // OOM-Schutz (Pixxprint)
+  buf = zlib.gunzipSync(buf);
+  if (buf.length > 800 * 1024 * 1024) throw new Error(`${reportTypeId} Report zu gross (${Math.round(buf.length / 1048576)} MB)`);
+  return JSON.parse(buf.toString('utf8'));
 }
 async function upsert(rows) { let ins = 0; for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_terms_periodic`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  INSERT', r.status, (await r.text()).slice(0, 150)); break; } } return ins; }
 

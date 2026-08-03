@@ -26,7 +26,11 @@ async function pull(profile, reportTypeId, columns) {
   for (let a = 0; a < 6; a++) { await freshAuth(); const c = await fetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) }); if (c.status === 429) { await sleep(30000); continue; } cj = await c.json(); if (!cj.reportId) throw new Error(reportTypeId + ' create: ' + JSON.stringify(cj).slice(0, 200)); break; }
   let url = null; for (let i = 0; i < 90; i++) { await sleep(8000); await freshAuth(); const g = await fetch(`${ADS}/reporting/reports/${cj.reportId}`, { headers: H(profile) }); const gj = await g.json(); if (gj.status === 'COMPLETED') { url = gj.url; break; } if (gj.status === 'FAILURE') throw new Error(reportTypeId + ' FAILURE'); }
   if (!url) throw new Error(reportTypeId + ' timeout');
-  const raw = await fetch(url); let buf = Buffer.from(await raw.arrayBuffer()); buf = zlib.gunzipSync(buf); return JSON.parse(buf.toString('utf8'));
+  const raw = await fetch(url); let buf = Buffer.from(await raw.arrayBuffer());
+  if (buf.length > 200 * 1024 * 1024) throw new Error(`${reportTypeId} Report zu gross (${Math.round(buf.length / 1048576)} MB komprimiert)`); // OOM-Schutz (Pixxprint)
+  buf = zlib.gunzipSync(buf);
+  if (buf.length > 800 * 1024 * 1024) throw new Error(`${reportTypeId} Report zu gross (${Math.round(buf.length / 1048576)} MB)`);
+  return JSON.parse(buf.toString('utf8'));
 }
 const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 async function refreshProfile(profile) {
