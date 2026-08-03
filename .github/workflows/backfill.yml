@@ -4,7 +4,8 @@ on:
   schedule:
     - cron: '30 4 * * *'    # tägliches Auffangnetz 04:30 UTC
 concurrency:
-  group: sqp-quota          # nie parallel zu anderen SQP-Läufen (Amazon-Quota)
+  group: sqp-backfill       # nur nicht parallel zu sich selbst; 429-Handling faengt
+                            # seltene Ueberschneidungen mit dem Weekly Refresh ab
 jobs:
   work:
     runs-on: ubuntu-latest

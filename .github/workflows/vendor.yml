@@ -17,7 +17,8 @@ on:
         required: false
         default: ''
 concurrency:
-  group: sqp-quota         # nie parallel zu SQP-Jobs (Amazon-Quota)
+  group: vendor-import     # nur nicht parallel zu sich selbst — Vendor-Tokens haben eigene Quotas,
+                           # die geteilte Gruppe liess Vendor-Buttonklicks wartende SQP-Läufe canceln
 jobs:
   vendor:
     runs-on: ubuntu-latest

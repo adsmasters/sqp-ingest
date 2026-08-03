@@ -4,7 +4,8 @@ on:
     - cron: '0 3 * * 1'   # jeden Montag 03:00 UTC
   workflow_dispatch: {}    # zusätzlich manuell auslösbar
 concurrency:
-  group: sqp-quota         # nie parallel zum Backfill-Worker (Amazon-Quota)
+  group: sqp-refresh       # nur nicht parallel zu sich selbst; 429-Handling faengt
+                           # seltene Ueberschneidungen mit dem Backfill ab
 jobs:
   refresh:
     runs-on: ubuntu-latest
