@@ -55,27 +55,26 @@ async function runClient(cl) {
     agg[a].units += (r.salesByAsin && r.salesByAsin.unitsOrdered) || 0;
     agg[a].sessions += (r.trafficByAsin && r.trafficByAsin.sessions) || 0;
   }
-  const rows = Object.entries(agg).map(([asin, v]) => ({ spid: cl.spid, asin, days: DAYS, sales: +v.sales.toFixed(2), units: v.units, sessions: v.sessions, updated_at: new Date().toISOString() }));
+  const mktCC = (cl.marketplace || 'DE').toUpperCase();
+  const rows = Object.entries(agg).map(([asin, v]) => ({ spid: cl.spid, asin, days: DAYS, marketplace: mktCC, sales: +v.sales.toFixed(2), units: v.units, sessions: v.sessions, updated_at: new Date().toISOString() }));
   for (let i = 0; i < rows.length; i += 500) {
-    const up = await fetch(`${U}/rest/v1/asin_sales_traffic?on_conflict=spid,asin,days`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows.slice(i, i + 500)) });
+    const up = await fetch(`${U}/rest/v1/asin_sales_traffic?on_conflict=spid,asin,days,marketplace`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows.slice(i, i + 500)) });
     if (!up.ok) { console.log(`  ${cl.name}: UPSERT ${up.status} ${(await up.text()).slice(0, 120)}`); return; }
   }
-  console.log(`  ${cl.name}: ${rows.length} ASINs, Gesamt €${rows.reduce((s, r) => s + r.sales, 0).toFixed(0)}`);
+  console.log(`  ${cl.name} (${mktCC}): ${rows.length} ASINs, Gesamt ${rows.reduce((s, r) => s + r.sales, 0).toFixed(0)} (Landeswährung)`);
 }
 
 async function main() {
   const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&spid=not.is.null&select=name,spid,marketplace`, { headers: sbHead });
   const clients = await cr.json();
-  // je Seller-Konto (spid) nur einmal — DE-Kunde bevorzugen: asin_sales_traffic hat (noch)
-  // keine Marketplace-Dimension, und das Tool zeigt Gesamtumsatz/TACoS nur in der DE-Ansicht.
-  // Ohne diese Sortierung konnte bei Recoactiv (DE+IT, gleiche spid) zufällig der IT-Umsatz
-  // gespeichert werden. Sauberer Fix (marketplace-Spalte) braucht eine Migration.
-  clients.sort((a, b) => (((a.marketplace || 'DE').toUpperCase() === 'DE') ? 0 : 1) - (((b.marketplace || 'DE').toUpperCase() === 'DE') ? 0 : 1));
+  // Seit der Marketplace-Migration (PK spid,asin,days,marketplace) läuft jeder
+  // (Seller × Marktplatz) einzeln — Recoactiv DE+IT bekommen getrennte Zeilen.
   const seen = new Set();
   console.log(`Sales&Traffic: ${clients.length} Kunde(n), ${DAYS} Tage`);
   for (const cl of clients) {
-    if (seen.has(cl.spid)) continue; seen.add(cl.spid);
-    console.log(`\n=== ${cl.name} (${cl.spid}) ===`);
+    const key = cl.spid + '|' + (cl.marketplace || 'DE').toUpperCase();
+    if (seen.has(key)) continue; seen.add(key);
+    console.log(`\n=== ${cl.name} (${cl.spid} · ${(cl.marketplace || 'DE').toUpperCase()}) ===`);
     try { await runClient(cl); } catch (e) { console.log('  FEHLER:', e.message); }
     await sleep(60000); // Sales&Traffic-Create-Quota ist hart limitiert
   }
