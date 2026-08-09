@@ -7,7 +7,7 @@ if (!U || !KEY || !CID || !SEC) { console.error('FEHLER: ENV fehlt.'); process.e
 const SPAPI = 'https://sellingpartnerapi-eu.amazon.com';
 const sbHead = { apikey: KEY, Authorization: 'Bearer ' + KEY };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const MKT_MAP = { DE: 'A1PA6795UKMFR9', FR: 'A13V1IB3VIYZZH', IT: 'APJ6JRA9NG5V4', ES: 'A1RKKUPIHCS9HS', UK: 'A1F83G8C2ARO7P', US: 'ATVPDKIKX0DER', NL: 'A1805IZSGTT6HS' };
+const MKT_MAP = { DE: 'A1PA6795UKMFR9', FR: 'A13V1IB3VIYZZH', IT: 'APJ6JRA9NG5V4', ES: 'A1RKKUPIHCS9HS', UK: 'A1F83G8C2ARO7P', US: 'ATVPDKIKX0DER', NL: 'A1805IZSGTT6HS', SE: 'A2NODRKZP88ZB9', PL: 'A1C3SOZRARQ6R3', TR: 'A33AVAJ2PDY3EV', BE: 'AMEN7PMS3EDWL', SA: 'A17E79C6D8DWNP', AE: 'A2VIGQ35RCS4UG' };
 
 async function authFor(spid) {
   const r = await fetch(`${U}/rest/v1/spapi_accounts?selling_partner_id=eq.${spid}&select=refresh_token`, { headers: sbHead });
