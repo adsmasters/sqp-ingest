@@ -98,12 +98,19 @@ async function rankAndCap(asins){
   }catch(e){}
   const ranked=[...asins].sort((a,b)=>(sales.get(b)||0)-(sales.get(a)||0));
   if(sales.size) console.log(`Priorisierung: verkaufsstärkste zuerst (Umsatzdaten für ${sales.size} ASINs, ${cc}).`);
+  // Manuell angeforderte ASINs (asin_focus am Kunden) laufen IMMER mit — vom Team im Tool eingetragen
+  let focus=[];
+  try{
+    const fr=await fetch(`${U}/rest/v1/sqp_clients?spid=eq.${SPID}&active=eq.true&marketplace=eq.${cc}&select=asin_focus`,{headers:{apikey:KEY,Authorization:'Bearer '+KEY}});
+    if(fr.ok) focus=[...new Set((await fr.json()).flatMap(c=>c.asin_focus||[]))].filter(a=>/^B0[A-Z0-9]{8}$/i.test(a)).map(a=>a.toUpperCase());
+  }catch(e){}
+  const withFocus=list=>{ const set=new Set(list); const extra=focus.filter(a=>!set.has(a)); if(extra.length) console.log(`+ ${extra.length} manuell angeforderte Fokus-ASINs.`); return [...extra,...list]; };
   const mTop=note.match(/top\s*(\d+)/i);
   const cap=mTop?+mTop[1]:50;
-  if(/alle-asins/i.test(note)||ranked.length<=cap) return ranked;
-  if(!sales.size){ console.log(`Kein Umsatz-Ranking für ${cc} verfügbar — KEINE Kappung, alle ${ranked.length} ASINs.`); return ranked; }
+  if(/alle-asins/i.test(note)||ranked.length<=cap) return withFocus(ranked);
+  if(!sales.size){ console.log(`Kein Umsatz-Ranking für ${cc} verfügbar — KEINE Kappung, alle ${ranked.length} ASINs.`); return withFocus(ranked); }
   console.log(`Kappung: Top ${cap} von ${ranked.length} ASINs nach 30-Tage-Umsatz (Job-Notiz 'alle-asins' = alles, 'top<N>' = anderes Limit).`);
-  return ranked.slice(0,cap);
+  return withFocus(ranked.slice(0,cap));
 }
 // Leer-Vermerke: Perioden, die Amazon geprüft aber ohne (relevante) Daten beantwortet hat —
 // werden sonst in JEDEM Teillauf erneut angefragt (Riesen-Kataloge: Tausende Anfragen pro Nacht umsonst)
