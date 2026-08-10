@@ -1,0 +1,70 @@
+// Unabhängiger Pipeline-Wächter: prüft Queue-Gesundheit, Workflow-Erfolge und Datenfrische
+// und meldet Probleme nach Slack. Läuft in Minuten — kann selbst nie ins Timeout laufen.
+// Lehre aus 08/2026: der Alarm-Step IM Backfill-Workflow starb mit dessen Timeout,
+// die Pipeline war eine Woche verstopft und niemand hat es gemerkt.
+// ENV: SUPABASE_URL, SUPABASE_SERVICE_KEY, SLACK_WEBHOOK_URL, GITHUB_TOKEN, GITHUB_REPOSITORY
+const U = process.env.SUPABASE_URL, KEY = process.env.SUPABASE_SERVICE_KEY;
+const SLACK = process.env.SLACK_WEBHOOK_URL, GH = process.env.GITHUB_TOKEN;
+const REPO = process.env.GITHUB_REPOSITORY || 'adsmasters/sqp-ingest';
+if (!U || !KEY) { console.error('FEHLER: SUPABASE-ENV fehlt.'); process.exit(1); }
+const H = { apikey: KEY, Authorization: 'Bearer ' + KEY };
+const hours = ms => Math.round(ms / 3600e3);
+const issues = [];
+
+// 1) Job-Queue: hängende und verhungernde Jobs (paused = absichtlich, zählt nicht)
+try {
+  const jr = await fetch(`${U}/rest/v1/sqp_backfill_jobs?status=in.(queued,running)&select=id,spid,status,note,requested_at,started_at`, { headers: H });
+  const jobs = jr.ok ? await jr.json() : [];
+  const cr = await fetch(`${U}/rest/v1/sqp_clients?select=spid,name`, { headers: H });
+  const names = new Map((cr.ok ? await cr.json() : []).map(c => [c.spid, c.name]));
+  const now = Date.now();
+  for (const j of jobs) {
+    const name = names.get(j.spid) || j.spid;
+    const sinceStart = j.started_at ? now - Date.parse(j.started_at) : null;
+    if (j.status === 'running' && sinceStart > 12 * 3600e3)
+      issues.push(`Job ${j.id} (${name}) hängt seit ${hours(sinceStart)}h auf »running« — Lauf vermutlich abgebrochen`);
+    if (j.status === 'queued') {
+      const sinceTouch = sinceStart ?? (now - Date.parse(j.requested_at));
+      if (sinceTouch > 30 * 3600e3)
+        issues.push(`Job ${j.id} (${name}) seit ${hours(sinceTouch)}h nicht angefasst — Import kommt nicht voran`);
+    }
+  }
+} catch (e) { issues.push(`Watchdog: Job-Queue nicht prüfbar (${e.message})`); }
+
+// 2) Nächtliche Workflows: gab es in den letzten 30h einen erfolgreichen Lauf?
+for (const wf of ['backfill.yml', 'daily-data.yml']) {
+  try {
+    const gh = (url) => fetch(url, { headers: { Authorization: 'Bearer ' + GH, Accept: 'application/vnd.github+json' } });
+    const ok = await (await gh(`https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?status=success&per_page=1`)).json();
+    const last = ok.workflow_runs && ok.workflow_runs[0];
+    if (last && Date.now() - Date.parse(last.updated_at) <= 30 * 3600e3) continue;
+    // kein frischer Erfolg: nur melden, wenn nicht gerade ein Lauf unterwegs ist (frisch eingerichteter Workflow)
+    const any = await (await gh(`https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?per_page=1`)).json();
+    const newest = any.workflow_runs && any.workflow_runs[0];
+    if (newest && ['in_progress', 'queued'].includes(newest.status)) continue;
+    issues.push(`${wf}: kein erfolgreicher Lauf in den letzten 30h${last ? ` (letzter Erfolg: ${last.updated_at.slice(0, 16)}Z)` : ''}`);
+  } catch (e) { issues.push(`Watchdog: ${wf}-Läufe nicht prüfbar (${e.message})`); }
+}
+
+// 3) Datenfrische Sales&Traffic (Basis für TACoS)
+try {
+  const r = await fetch(`${U}/rest/v1/asin_sales_traffic?select=updated_at&order=updated_at.desc&limit=1`, { headers: H });
+  const rows = r.ok ? await r.json() : [];
+  const age = rows[0] ? Date.now() - Date.parse(rows[0].updated_at) : null;
+  if (age != null && age > 48 * 3600e3) issues.push(`Sales&Traffic-Daten sind ${hours(age)}h alt (TACoS veraltet)`);
+} catch (e) { issues.push(`Watchdog: Sales&Traffic-Frische nicht prüfbar (${e.message})`); }
+
+// Melden: Probleme sofort; sonst montags 05-Uhr-Lauf als Lebenszeichen (Stille ≠ gesund)
+const sendSlack = async text => {
+  if (!SLACK) { console.log('Kein SLACK_WEBHOOK_URL — Meldung nur im Log:\n' + text); return; }
+  const r = await fetch(SLACK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+  if (!r.ok) { console.error('Slack-POST fehlgeschlagen: ' + r.status); process.exit(1); }
+};
+const d = new Date();
+if (issues.length) {
+  console.log('PROBLEME:\n- ' + issues.join('\n- '));
+  await sendSlack(`🚨 *SQPR-Pipeline-Wächter* — ${issues.length} Problem(e):\n• ${issues.join('\n• ')}\n<https://github.com/${REPO}/actions|Zu den Läufen →>`);
+} else {
+  console.log('Alles gesund.');
+  if (d.getUTCDay() === 1 && d.getUTCHours() === 5) await sendSlack('✅ *SQPR-Pipeline-Wächter*: Wochen-Check — Queue, Nachtläufe und Datenfrische in Ordnung.');
+}

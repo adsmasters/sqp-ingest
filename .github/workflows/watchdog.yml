@@ -1,0 +1,27 @@
+name: Pipeline-Wächter
+# Unabhängige Überwachung der Import-Pipeline — bewusst NICHT Teil der Daten-Workflows:
+# deren Timeout hatte 08/2026 auch den eigenen Slack-Alert gekillt (eine Woche unbemerkt kaputt).
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 5,11,17,23 * * *'   # 4× täglich, Laufzeit < 1 Min
+permissions:
+  actions: read
+concurrency:
+  group: sqp-watchdog
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Pipeline prüfen (Queue, Nachtläufe, Datenfrische)
+        run: node watchdog.mjs
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
