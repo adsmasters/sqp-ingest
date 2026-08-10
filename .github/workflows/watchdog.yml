@@ -6,7 +6,8 @@ on:
   schedule:
     - cron: '0 5,11,17,23 * * *'   # 4× täglich, Laufzeit < 1 Min
 permissions:
-  actions: read
+  actions: read     # Läufe der anderen Workflows abfragen
+  contents: read    # Checkout — ein permissions-Block setzt alles Ungenannte auf none!
 concurrency:
   group: sqp-watchdog
 jobs:
