@@ -84,9 +84,9 @@ async function applyBrandFilter(asins){
   return keep;
 }
 // Umsatz-Priorisierung + optionale Kappung: verkaufsstärkste ASINs zuerst (30-Tage-Umsatz
-// aus asin_sales_traffic). Standard-Kappung Top 150 bei grossen Katalogen — Job-Notiz
+// aus asin_sales_traffic). Standard-Kappung Top 50 bei grossen Katalogen — Job-Notiz
 // 'alle-asins' importiert alles, 'topN' (z.B. top300) ändert das Limit. OHNE Umsatzdaten
-// wird NIE gekappt (sonst wären die 150 zufällig gewählt).
+// wird NIE gekappt (sonst wäre die Top-Auswahl zufällig).
 const MKT_CC={A1PA6795UKMFR9:'DE',A13V1IB3VIYZZH:'FR',APJ6JRA9NG5V4:'IT',A1RKKUPIHCS9HS:'ES',A1F83G8C2ARO7P:'UK',ATVPDKIKX0DER:'US',A1805IZSGTT6HS:'NL',A2NODRKZP88ZB9:'SE',A1C3SOZRARQ6R3:'PL',A33AVAJ2PDY3EV:'TR',AMEN7PMS3EDWL:'BE',A17E79C6D8DWNP:'SA',A2VIGQ35RCS4UG:'AE'};
 async function rankAndCap(asins){
   const note=process.env.SQP_JOB_NOTE||'';
@@ -99,7 +99,7 @@ async function rankAndCap(asins){
   const ranked=[...asins].sort((a,b)=>(sales.get(b)||0)-(sales.get(a)||0));
   if(sales.size) console.log(`Priorisierung: verkaufsstärkste zuerst (Umsatzdaten für ${sales.size} ASINs, ${cc}).`);
   const mTop=note.match(/top\s*(\d+)/i);
-  const cap=mTop?+mTop[1]:150;
+  const cap=mTop?+mTop[1]:50;
   if(/alle-asins/i.test(note)||ranked.length<=cap) return ranked;
   if(!sales.size){ console.log(`Kein Umsatz-Ranking für ${cc} verfügbar — KEINE Kappung, alle ${ranked.length} ASINs.`); return ranked; }
   console.log(`Kappung: Top ${cap} von ${ranked.length} ASINs nach 30-Tage-Umsatz (Job-Notiz 'alle-asins' = alles, 'top<N>' = anderes Limit).`);

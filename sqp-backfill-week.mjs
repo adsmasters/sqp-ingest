@@ -126,7 +126,7 @@ async function rankAndCap(asins){
   const ranked=[...asins].sort((a,b)=>(sales.get(b)||0)-(sales.get(a)||0));
   if(sales.size) console.log(`  Priorisierung: verkaufsstärkste zuerst (Umsatzdaten für ${sales.size} ASINs, ${cc}).`);
   const mTop=note.match(/top\s*(\d+)/i);
-  const cap=mTop?+mTop[1]:150;
+  const cap=mTop?+mTop[1]:50;
   if(/alle-asins/i.test(note)||ranked.length<=cap) return ranked;
   if(!sales.size){ console.log(`  Kein Umsatz-Ranking für ${cc} — KEINE Kappung, alle ${ranked.length} ASINs.`); return ranked; }
   console.log(`  Kappung: Top ${cap} von ${ranked.length} ASINs nach 30-Tage-Umsatz.`);
