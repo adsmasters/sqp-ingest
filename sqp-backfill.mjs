@@ -83,6 +83,45 @@ async function applyBrandFilter(asins){
   console.log(`Marken-Filter aktiv [${[...want].join(', ')}]: ${keep.length} von ${asins.length} ASINs.`);
   return keep;
 }
+// Umsatz-Priorisierung + optionale Kappung: verkaufsstärkste ASINs zuerst (30-Tage-Umsatz
+// aus asin_sales_traffic). Standard-Kappung Top 150 bei grossen Katalogen — Job-Notiz
+// 'alle-asins' importiert alles, 'topN' (z.B. top300) ändert das Limit. OHNE Umsatzdaten
+// wird NIE gekappt (sonst wären die 150 zufällig gewählt).
+const MKT_CC={A1PA6795UKMFR9:'DE',A13V1IB3VIYZZH:'FR',APJ6JRA9NG5V4:'IT',A1RKKUPIHCS9HS:'ES',A1F83G8C2ARO7P:'UK',ATVPDKIKX0DER:'US',A1805IZSGTT6HS:'NL',A2NODRKZP88ZB9:'SE',A1C3SOZRARQ6R3:'PL',A33AVAJ2PDY3EV:'TR',AMEN7PMS3EDWL:'BE',A17E79C6D8DWNP:'SA',A2VIGQ35RCS4UG:'AE'};
+async function rankAndCap(asins){
+  const note=process.env.SQP_JOB_NOTE||'';
+  const cc=MKT_CC[MKT]||'DE';
+  const sales=new Map();
+  try{
+    const r=await fetch(`${U}/rest/v1/asin_sales_traffic?spid=eq.${SPID}&days=eq.30&marketplace=eq.${cc}&select=asin,sales`,{headers:{apikey:KEY,Authorization:'Bearer '+KEY,Range:'0-4999'}});
+    if(r.ok) for(const x of await r.json()) sales.set(x.asin,+x.sales||0);
+  }catch(e){}
+  const ranked=[...asins].sort((a,b)=>(sales.get(b)||0)-(sales.get(a)||0));
+  if(sales.size) console.log(`Priorisierung: verkaufsstärkste zuerst (Umsatzdaten für ${sales.size} ASINs, ${cc}).`);
+  const mTop=note.match(/top\s*(\d+)/i);
+  const cap=mTop?+mTop[1]:150;
+  if(/alle-asins/i.test(note)||ranked.length<=cap) return ranked;
+  if(!sales.size){ console.log(`Kein Umsatz-Ranking für ${cc} verfügbar — KEINE Kappung, alle ${ranked.length} ASINs.`); return ranked; }
+  console.log(`Kappung: Top ${cap} von ${ranked.length} ASINs nach 30-Tage-Umsatz (Job-Notiz 'alle-asins' = alles, 'top<N>' = anderes Limit).`);
+  return ranked.slice(0,cap);
+}
+// Leer-Vermerke: Perioden, die Amazon geprüft aber ohne (relevante) Daten beantwortet hat —
+// werden sonst in JEDEM Teillauf erneut angefragt (Riesen-Kataloge: Tausende Anfragen pro Nacht umsonst)
+const EMPTY=new Set();
+async function loadEmpty(){
+  for(let from=0;;from+=1000){
+    const r=await fetch(`${U}/rest/v1/sqp_empty_periods?spid=eq.${SPID}&marketplace_id=eq.${MKT}&report_period=eq.MONTH&select=asin,start_date`,{headers:{apikey:KEY,Authorization:'Bearer '+KEY,Range:`${from}-${from+999}`}});
+    if(!r.ok) break;
+    const rows=await r.json();
+    for(const x of rows) EMPTY.add(x.asin+'|'+x.start_date);
+    if(rows.length<1000) break;
+  }
+  if(EMPTY.size) console.log(`${EMPTY.size} bekannte Leer-Perioden werden übersprungen.`);
+}
+async function markEmpty(asin,month){
+  try{ await fetch(`${U}/rest/v1/sqp_empty_periods?on_conflict=spid,marketplace_id,asin,report_period,start_date`,{method:'POST',headers:{apikey:KEY,Authorization:'Bearer '+KEY,'Content-Type':'application/json',Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({spid:SPID,marketplace_id:MKT,asin,report_period:'MONTH',start_date:month})}); }catch(e){}
+  EMPTY.add(asin+'|'+month);
+}
 const num=x=>(x&&typeof x==='object'&&'amount'in x)?x.amount:x;
 function mapRows(data,asin){ return (data.dataByAsin||[]).map(r=>({
   selling_partner_id:SPID,marketplace_id:MKT,asin,report_period:'MONTH',start_date:r.startDate,end_date:r.endDate,
@@ -115,6 +154,7 @@ async function spacedCreate(body){
   return c;
 }
 async function task(asin,month){
+  if(EMPTY.has(asin+'|'+month)) return `skip ${month} ${asin} (bekannt leer)`;
   if(await hasData(asin,month)) return `skip ${month} ${asin} (schon da)`;
   const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[MKT],dataStartTime:month+'T00:00:00Z',dataEndTime:monthEnd(month)+'T00:00:00Z',reportOptions:{reportPeriod:'MONTH',asin}};
   const c=await spacedCreate(body);
@@ -122,6 +162,7 @@ async function task(asin,month){
   const cj=await c.json(); if(!cj.reportId) return `ERR ${month} ${asin}: ${JSON.stringify(cj).slice(0,120)}`;
   const docId=await pollDoc(cj.reportId); if(!docId) return `FATAL ${month} ${asin}`;
   const n=await upsert(mapRows(await download(docId),asin),asin,month);
+  if(n===0){ await markEmpty(asin,month); return `leer ${month} ${asin} (vermerkt, wird nicht erneut angefragt)`; }
   return `ok ${month} ${asin}: ${n}`;
 }
 async function pool(tasks,conc){
@@ -133,8 +174,10 @@ async function pool(tasks,conc){
 }
 async function main(){
   await refreshAuth();
-  const asins=await listAsins(); const ms=months(startM,endM);
-  const tasks=[]; for(const m of ms) for(const a of asins) tasks.push([a,m]);
+  const asins=await rankAndCap(await listAsins()); const ms=months(startM,endM);
+  await loadEmpty();
+  const tasks=[]; for(const a of asins) for(const m of ms) tasks.push([a,m]); // ASIN-major: wichtigste ASINs zuerst KOMPLETT
+  console.log(`Reihenfolge: verkaufsstärkste ASINs zuerst (je ASIN alle Monate am Stück).`);
   console.log(`Backfill ${startM}..${endM}: ${ms.length} Monate × ${asins.length} ASINs = ${tasks.length} Tasks, Concurrency ${CONC}`);
   const t0=Date.now();
   await pool(tasks,CONC);

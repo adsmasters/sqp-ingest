@@ -79,7 +79,7 @@ async function runJob(j, budgetMs) {
     console.log(`[${j.spid}] Job ${j.id} startet (${j.marketplace_id}) — ${range.label}, Zeitscheibe ${Math.round(budgetMs / 60000)} Min`);
     await patch(j.id, { status: 'running', started_at: new Date().toISOString() });
     const jt0 = Date.now();
-    const env = { ...process.env, SQP_SPID: j.spid, SQP_MKT: j.marketplace_id, SQP_CREATE_GAP: '15000' };
+    const env = { ...process.env, SQP_SPID: j.spid, SQP_MKT: j.marketplace_id, SQP_CREATE_GAP: '15000', SQP_JOB_NOTE: j.note || '' };
     const m = await run(['sqp-backfill.mjs', range.start, end, '3'], env, j.spid, budgetMs);
     const w = m === 0 ? await run(['sqp-backfill-week.mjs', range.weeks, '3'], env, j.spid, budgetMs - (Date.now() - jt0)) : 'skipped';
     if (m === 0 && w === 0) {
