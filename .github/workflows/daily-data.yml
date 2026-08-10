@@ -1,0 +1,42 @@
+name: Tagesdaten (Audit + Sales&Traffic)
+# Ausgelagert aus backfill.yml (10.08.2026): dort sprengte die Step-Summe das Timeout,
+# der Job wurde ab 04.08. JEDE Nacht bei 350 Min hart gecancelt — diese Steps liefen
+# dadurch tagelang gar nicht (Sales&Traffic-Daten blieben beim Stand 02.08. stehen).
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 2 * * *'     # 02:00 UTC — fertig bevor der Backfill um 04:30 startet
+concurrency:
+  group: sqp-daily-data
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: PPC-Audit vorladen (alle Kunden, 30 Tage)
+        run: node audit-refresh.mjs 30
+        env:
+          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
+          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
+          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - name: Gesamt-Umsaetze je ASIN (Sales & Traffic, 30 Tage)
+        if: always()          # Basis fuer echten TACoS — auch wenn das Audit hakt
+        run: node sales-traffic.mjs 30
+        env:
+          SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
+          SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - name: Slack-Alert bei Fehlschlag
+        if: failure() || cancelled()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && { echo "Kein SLACK_WEBHOOK_URL-Secret — Alert übersprungen."; exit 0; }
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ *${{ github.workflow }}* fehlgeschlagen — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"

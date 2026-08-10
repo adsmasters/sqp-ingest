@@ -65,45 +65,57 @@ console.log(`SQP-Fenster: ${Math.round(sqpDeadlineMs / 60000)} Min, bis zu ${MAX
 const bySeller = new Map();
 for (const j of list) { if (!bySeller.has(j.spid)) bySeller.set(j.spid, []); bySeller.get(j.spid).push(j); }
 const lanes = [...bySeller.values()]; // jede "Lane" = ein Seller, Jobs darin sequenziell
-// Frische Jobs ZUERST: Riesen-Kataloge landen als "Teillauf" täglich wieder vorne in der
-// Queue und liessen kleine/neue Kunden verhungern (warmpack/Box/Recoactiv_IT: nie gestartet).
-lanes.sort((a, b) => {
-  const partial = jobs => (jobs.some(j => /Teillauf/i.test(j.note || '')) ? 1 : 0);
-  return partial(a) - partial(b) || (a[0].requested_at < b[0].requested_at ? -1 : 1);
-});
+const isPartial = j => /Teillauf/i.test(j.note || '');
+// Innerhalb der Lane: frisches Onboarding VOR alten Teillauf-Riesen (Recoactiv FR
+// verhungerte sonst hinter dem 12-Monats-VOLL-Job desselben Sellers).
+for (const l of lanes) l.sort((a, b) => (isPartial(a) - isPartial(b)) || (a.requested_at < b.requested_at ? -1 : 1));
+// Lanes mit frischen Jobs zuerst (bestimmt nur die Reihenfolge der Zeitscheiben)
+lanes.sort((a, b) => (a.every(isPartial) - b.every(isPartial)) || (a[0].requested_at < b[0].requested_at ? -1 : 1));
 
-async function runLane(jobs) {
-  for (const j of jobs) {
-    try {
-    const remaining = sqpDeadlineMs - (Date.now() - t0);
-    if (remaining < 5 * 60000) { console.log(`[${j.spid}] Fenster zu — Job ${j.id} bleibt eingereiht.`); return; }
+async function runJob(j, budgetMs) {
+  if (budgetMs < 5 * 60000) { console.log(`[${j.spid}] Fenster zu — Job ${j.id} bleibt eingereiht.`); return 'skipped'; }
+  try {
     const range = rangeFor(j);
-    console.log(`[${j.spid}] Job ${j.id} startet (${j.marketplace_id}) — ${range.label}`);
+    console.log(`[${j.spid}] Job ${j.id} startet (${j.marketplace_id}) — ${range.label}, Zeitscheibe ${Math.round(budgetMs / 60000)} Min`);
     await patch(j.id, { status: 'running', started_at: new Date().toISOString() });
+    const jt0 = Date.now();
     const env = { ...process.env, SQP_SPID: j.spid, SQP_MKT: j.marketplace_id, SQP_CREATE_GAP: '15000' };
-    const m = await run(['sqp-backfill.mjs', range.start, end, '3'], env, j.spid, sqpDeadlineMs - (Date.now() - t0));
-    const w = m === 0 ? await run(['sqp-backfill-week.mjs', range.weeks, '3'], env, j.spid, sqpDeadlineMs - (Date.now() - t0)) : 'skipped';
+    const m = await run(['sqp-backfill.mjs', range.start, end, '3'], env, j.spid, budgetMs);
+    const w = m === 0 ? await run(['sqp-backfill-week.mjs', range.weeks, '3'], env, j.spid, budgetMs - (Date.now() - jt0)) : 'skipped';
     if (m === 0 && w === 0) {
       await patch(j.id, { status: 'done', finished_at: new Date().toISOString(), note: /voll|full/i.test(j.note || '') ? 'volle Historie geladen' : null });
       console.log(`[${j.spid}] Job ${j.id}: FERTIG (${range.label})`);
-    } else {
-      // Teillauf: "voll"-Marker im note erhalten, sonst wuerde die Fortsetzung im Schnell-Modus laufen
-      const keepFull = /voll|full/i.test(j.note || '') ? ' [voll]' : '';
-      await patch(j.id, { status: 'queued', note: 'Teillauf, wird beim nächsten Lauf fortgesetzt' + keepFull });
-      console.log(`[${j.spid}] Job ${j.id}: Teillauf (${m}/${w}), erneut eingereiht${keepFull}`);
+      return 'done';
     }
-    } catch (e) { // ein Job darf nicht die ganze Lane/den Worker abreissen
-      console.log(`[${j.spid}] Job ${j.id}: FEHLER ${e.message} — erneut eingereiht, nächster Job.`);
-      await patch(j.id, { status: 'queued', note: 'Fehler im Lauf, wird erneut versucht' });
-    }
+    // Teillauf: "voll"-Marker im note erhalten, sonst wuerde die Fortsetzung im Schnell-Modus laufen
+    const keepFull = /voll|full/i.test(j.note || '') ? ' [voll]' : '';
+    await patch(j.id, { status: 'queued', note: 'Teillauf, wird beim nächsten Lauf fortgesetzt' + keepFull });
+    console.log(`[${j.spid}] Job ${j.id}: Teillauf (${m}/${w}), erneut eingereiht${keepFull}`);
+    return 'partial';
+  } catch (e) { // ein Job darf nicht den Worker abreissen
+    console.log(`[${j.spid}] Job ${j.id}: FEHLER ${e.message} — erneut eingereiht.`);
+    await patch(j.id, { status: 'queued', note: 'Fehler im Lauf, wird erneut versucht' });
+    return 'partial';
   }
 }
 
-// Lanes parallel, gedeckelt auf MAX_PAR
-let idx = 0;
-await Promise.all(Array.from({ length: Math.min(MAX_PAR, lanes.length) }, async () => {
-  while (idx < lanes.length) { const lane = lanes[idx++]; await runLane(lane); }
-}));
+// Zeitscheiben-Rotation: jede Lane bekommt pro Runde höchstens EINE Scheibe, statt dass
+// die 4 ältesten Teillauf-Riesen das ganze Fenster monopolisieren — Jobs ab Ende Juli
+// bekamen dadurch NÄCHTELANG "Fenster zu" und neue Kunden sahen tagelang keinen Import.
+const SLICE_MS = Math.max(20 * 60000, Math.floor(sqpDeadlineMs / Math.max(1, lanes.length)));
+console.log(`Zeitscheibe je Seller und Runde: ${Math.round(SLICE_MS / 60000)} Min (${lanes.length} Seller).`);
+const queues = lanes.map(l => [...l]);
+const windowLeft = () => sqpDeadlineMs - (Date.now() - t0);
+while (windowLeft() > 5 * 60000 && queues.some(q => q.length)) {
+  const active = queues.filter(q => q.length);
+  for (let i = 0; i < active.length && windowLeft() > 5 * 60000; i += MAX_PAR) {
+    await Promise.all(active.slice(i, i + MAX_PAR).map(async q => {
+      const j = q.shift(); if (!j) return;
+      const res = await runJob(j, Math.min(SLICE_MS, windowLeft()));
+      if (res === 'partial') q.push(j); // ans Lane-Ende — nächste Runde wieder dran
+    }));
+  }
+}
 
 // PPC-Daten EINMAL am Ende (Ads-API, EINE Agentur-Quota — deshalb nicht parallel und nicht je Job)
 if (leftMin() > 10) {

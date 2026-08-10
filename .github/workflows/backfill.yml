@@ -9,7 +9,11 @@ concurrency:
 jobs:
   work:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    # Worker-Budget ist 230 Min (WORKER_BUDGET_MIN) + Meta/Ads-Bloecke — 300 laesst Luft,
+    # statt dass der Job ins Timeout laeuft und hart gekillt wird (Jobs blieben "running").
+    # Audit + Sales&Traffic laufen seit 10.08. im eigenen Workflow daily-data.yml:
+    # die Step-Summe sprengte hier das Timeout, ab 04.08. wurde JEDE Nacht gecancelt.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,23 +27,6 @@ jobs:
           ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
           ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
           ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      - name: PPC-Audit vorladen (alle Kunden, 30 Tage)
-        if: always()          # laeuft auch wenn die Queue leer war
-        run: node audit-refresh.mjs 30
-        env:
-          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
-          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
-          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      - name: Gesamt-Umsaetze je ASIN (Sales & Traffic, 30 Tage)
-        if: always()          # Basis fuer echten TACoS
-        run: node sales-traffic.mjs 30
-        env:
-          SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
-          SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       - name: Slack-Alert bei Fehlschlag
