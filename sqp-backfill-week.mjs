@@ -53,9 +53,9 @@ async function pollDoc(reportId){
   for(let i=0;i<240;i++){ await sleep(5000);
     const g=await api(`/reports/2021-06-30/reports/${reportId}`); if(!g) return null;
     const gj=await g.json();
-    if(gj.processingStatus==='DONE') return gj.reportDocumentId;
-    if(['FATAL','CANCELLED'].includes(gj.processingStatus)) return null;
-  } return null;
+    if(gj.processingStatus==='DONE') return {docId:gj.reportDocumentId};
+    if(['FATAL','CANCELLED'].includes(gj.processingStatus)) return {fatal:true};
+  } return {timeout:true};
 }
 async function download(docId){
   const dr=await api(`/reports/2021-06-30/documents/${docId}`); const drj=await dr.json();
@@ -66,7 +66,7 @@ async function download(docId){
 async function listAsinsOnce(){
   const c=await api(`/reports/2021-06-30/reports`,{method:'POST',body:JSON.stringify({reportType:'GET_MERCHANT_LISTINGS_ALL_DATA',marketplaceIds:[MKT]})});
   if(!c) return null; const cj=await c.json(); if(!cj.reportId) return null;
-  const docId=await pollDoc(cj.reportId); if(!docId) return null;
+  const docId=((await pollDoc(cj.reportId))||{}).docId; if(!docId) return null;
   const dr=await api(`/reports/2021-06-30/documents/${docId}`); if(!dr) return null; const drj=await dr.json();
   const raw=await fetch(drj.url); let buf=Buffer.from(await raw.arrayBuffer());
   if(drj.compressionAlgorithm==='GZIP') buf=zlib.gunzipSync(buf);
@@ -186,8 +186,14 @@ async function task(batch,week){
   const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[MKT],dataStartTime:week+'T00:00:00Z',dataEndTime:satOf(week)+'T00:00:00Z',reportOptions:{reportPeriod:'WEEK',asin:batch.join(' ')}};
   const c=await spacedCreate(body); if(!c) return `FAIL ${week} [${batch.length}]`;
   const cj=await c.json(); if(!cj.reportId) return `ERR ${week} [${batch.length}]: ${JSON.stringify(cj).slice(0,100)}`;
-  const docId=await pollDoc(cj.reportId); if(!docId) return `FATAL ${week} [${batch.length} ASINs]`;
-  const rows=(await download(docId)).dataByAsin||[];
+  const pd=await pollDoc(cj.reportId);
+  if(!pd||pd.timeout) return `TIMEOUT ${week} [${batch.length} ASINs]`;
+  if(pd.fatal){
+    if(batch.length>1){ const out=[]; for(const a of batch) out.push(await task([a],week)); return `split ${week}: ${out.length} einzeln nachgeprüft`; }
+    await markEmpty(batch[0],week);
+    return `leer ${week} ${batch[0]} (FATAL = keine Daten, vermerkt)`;
+  }
+  const rows=(await download(pd.docId)).dataByAsin||[];
   if(batch.length>1&&rows.length&&rows[0].asin===undefined){
     const out=[]; for(const a of batch) out.push(await task([a],week)); return out.join(' | ');
   }

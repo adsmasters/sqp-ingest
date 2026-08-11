@@ -41,12 +41,12 @@ function makeApi(spid){ let H=null,t0=0;
       return r; } return null; };
   api.init=auth; return api; }
 // 20 Min: Multi-ASIN-Reports stehen deutlich laenger IN_QUEUE als Einzel-Reports
-async function pollDoc(api,id){ for(let i=0;i<240;i++){await sleep(5000);const g=await api(`/reports/2021-06-30/reports/${id}`);if(!g)return null;const gj=await g.json();if(gj.processingStatus==='DONE')return gj.reportDocumentId;if(['FATAL','CANCELLED'].includes(gj.processingStatus))return null;} return null; }
+async function pollDoc(api,id){ for(let i=0;i<240;i++){await sleep(5000);const g=await api(`/reports/2021-06-30/reports/${id}`);if(!g)return null;const gj=await g.json();if(gj.processingStatus==='DONE')return {docId:gj.reportDocumentId};if(['FATAL','CANCELLED'].includes(gj.processingStatus))return {fatal:true};} return {timeout:true}; }
 async function download(api,docId){ const dr=await api(`/reports/2021-06-30/documents/${docId}`); if(!dr) throw new Error('Dokument-Abruf fehlgeschlagen (Rate-Limit?)');
   const drj=await dr.json(); if(!drj||!drj.url) throw new Error('Report-Dokument ohne Download-URL'); // crashte sonst den ganzen Lauf (20.07.)
   const raw=await fetch(drj.url);let buf=Buffer.from(await raw.arrayBuffer());if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);return JSON.parse(buf.toString('utf8')); }
 async function listAsins(api,mkt){ const c=await api(`/reports/2021-06-30/reports`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reportType:'GET_MERCHANT_LISTINGS_ALL_DATA',marketplaceIds:[mkt]})});
-  const docId=await pollDoc(api,(await c.json()).reportId);
+  const docId=((await pollDoc(api,(await c.json()).reportId))||{}).docId;
   if(!docId) throw new Error('Listings-Report nicht fertig geworden (grosser Katalog?) — Kunde wird uebersprungen');
   const dr=await api(`/reports/2021-06-30/documents/${docId}`);const drj=await dr.json();
   if(!drj||!drj.url) throw new Error('Listings-Report-Dokument ohne Download-URL — Kunde wird uebersprungen');
@@ -116,8 +116,14 @@ async function refreshClient(client){
     try{ const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[mkt],dataStartTime:j.start+'T00:00:00Z',dataEndTime:j.end+'T00:00:00Z',reportOptions:{reportPeriod:j.period,asin:j.batch.join(' ')}};
       const c=await spacedCreate(body); const cj=c?await c.json():{}; done++;
       if(!cj.reportId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length}]: create fail ${c?c.status:'-'} ${JSON.stringify(cj).slice(0,120)}`);continue;}
-      const docId=await pollDoc(api,cj.reportId); if(!docId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: FATAL`);continue;}
-      const rows=(await download(api,docId)).dataByAsin||[];
+      const pd=await pollDoc(api,cj.reportId);
+      if(!pd||pd.timeout){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: TIMEOUT`);continue;}
+      if(pd.fatal){
+        // FATAL = keine Daten fuer die Anfrage; bei Batches Rest einzeln — hier nur loggen
+        // (der Backfill pflegt die Leer-Vermerke; Refresh laeuft force ohne EMPTY-Logik)
+        console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: keine Daten (FATAL)`);continue;
+      }
+      const rows=(await download(api,pd.docId)).dataByAsin||[];
       if(j.batch.length>1&&rows.length&&rows[0].asin===undefined){ console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start}: Zeilen ohne asin-Feld — Batch übersprungen (Format prüfen!)`); continue; }
       const byAsin=new Map(j.batch.map(a=>[a,[]]));
       for(const r of rows){ const a=String(r.asin||j.batch[0]).toUpperCase(); if(byAsin.has(a)) byAsin.get(a).push(r); }

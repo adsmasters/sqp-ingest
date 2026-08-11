@@ -43,9 +43,9 @@ async function pollDoc(reportId){
   for(let i=0;i<240;i++){ await sleep(5000);
     const g=await api(`/reports/2021-06-30/reports/${reportId}`); if(!g) return null;
     const gj=await g.json();
-    if(gj.processingStatus==='DONE') return gj.reportDocumentId;
-    if(['FATAL','CANCELLED'].includes(gj.processingStatus)) return null;
-  } return null;
+    if(gj.processingStatus==='DONE') return {docId:gj.reportDocumentId};
+    if(['FATAL','CANCELLED'].includes(gj.processingStatus)) return {fatal:true};
+  } return {timeout:true};
 }
 async function download(docId){
   const dr=await api(`/reports/2021-06-30/documents/${docId}`); const drj=await dr.json();
@@ -55,7 +55,7 @@ async function download(docId){
 }
 async function listAsins(){
   const c=await api(`/reports/2021-06-30/reports`,{method:'POST',body:JSON.stringify({reportType:'GET_MERCHANT_LISTINGS_ALL_DATA',marketplaceIds:[MKT]})});
-  const docId=await pollDoc((await c.json()).reportId);
+  const docId=((await pollDoc((await c.json()).reportId))||{}).docId;
   const dr=await api(`/reports/2021-06-30/documents/${docId}`); const drj=await dr.json();
   const raw=await fetch(drj.url); let buf=Buffer.from(await raw.arrayBuffer());
   if(drj.compressionAlgorithm==='GZIP') buf=zlib.gunzipSync(buf);
@@ -171,8 +171,17 @@ async function task(batch,month){
   const c=await spacedCreate(body);
   if(!c) return `FAIL create ${month} [${batch.length} ASINs]`;
   const cj=await c.json(); if(!cj.reportId) return `ERR ${month} [${batch.length} ASINs]: ${JSON.stringify(cj).slice(0,120)}`;
-  const docId=await pollDoc(cj.reportId); if(!docId) return `FATAL ${month} [${batch.length} ASINs]`;
-  const rows=(await download(docId)).dataByAsin||[];
+  const pd=await pollDoc(cj.reportId);
+  if(!pd||pd.timeout) return `TIMEOUT ${month} [${batch.length} ASINs] (nächster Lauf versucht erneut)`;
+  if(pd.fatal){
+    // Amazon meldet FATAL, wenn es fuer die Anfrage KEINE Daten gibt. Batch einmal
+    // aufspalten, Einzel-FATAL dauerhaft als leer vermerken — sonst Endlosschleife
+    // (die Nachtlaeufe wiederholten dieselben FATALs jede Runde; 11.08.).
+    if(batch.length>1){ const out=[]; for(const a of batch) out.push(await task([a],month)); return `split ${month}: ${out.length} einzeln nachgeprüft`; }
+    await markEmpty(batch[0],month);
+    return `leer ${month} ${batch[0]} (FATAL = keine Daten, vermerkt)`;
+  }
+  const rows=(await download(pd.docId)).dataByAsin||[];
   if(batch.length>1&&rows.length&&rows[0].asin===undefined){
     // Format-Überraschung: Zeilen ohne eigenes ASIN-Feld -> einzeln nachladen statt falsch zuordnen
     const out=[]; for(const a of batch) out.push(await task([a],month)); return out.join(' | ');
