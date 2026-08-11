@@ -15,13 +15,19 @@ const AT = (await t.json()).access_token;
 const H = { 'x-amz-access-token': AT, 'Content-Type': 'application/json' };
 const SPAPI = 'https://sellingpartnerapi-eu.amazon.com';
 
-const c = await fetch(`${SPAPI}/reports/2021-06-30/reports`, { method: 'POST', headers: H, body: JSON.stringify({ reportType: 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT', marketplaceIds: [MKT], dataStartTime: '2026-06-01T00:00:00Z', dataEndTime: '2026-06-30T00:00:00Z', reportOptions: { reportPeriod: 'MONTH', asin: ASINS } }) });
-const cj = await c.json();
-console.log('CREATE:', c.status, JSON.stringify(cj).slice(0, 200));
-if (!cj.reportId) process.exit(1);
+// Report vom letzten Versuch weiterverwenden (Multi-ASIN-Generierung dauert >5 Min)
+let reportId = '747420020676';
+if (!reportId) {
+  const c = await fetch(`${SPAPI}/reports/2021-06-30/reports`, { method: 'POST', headers: H, body: JSON.stringify({ reportType: 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT', marketplaceIds: [MKT], dataStartTime: '2026-06-01T00:00:00Z', dataEndTime: '2026-06-30T00:00:00Z', reportOptions: { reportPeriod: 'MONTH', asin: ASINS } }) });
+  const cj = await c.json();
+  console.log('CREATE:', c.status, JSON.stringify(cj).slice(0, 200));
+  if (!cj.reportId) process.exit(1);
+  reportId = cj.reportId;
+}
+const cj = { reportId };
 
 let docId = null;
-for (let i = 0; i < 60; i++) {
+for (let i = 0; i < 240; i++) {
   await sleep(5000);
   const g = await fetch(`${SPAPI}/reports/2021-06-30/reports/${cj.reportId}`, { headers: H });
   const gj = await g.json();
