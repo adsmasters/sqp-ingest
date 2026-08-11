@@ -40,7 +40,8 @@ function makeApi(spid){ let H=null,t0=0;
       if(r.status===403){ await auth(); continue; }
       return r; } return null; };
   api.init=auth; return api; }
-async function pollDoc(api,id){ for(let i=0;i<120;i++){await sleep(5000);const g=await api(`/reports/2021-06-30/reports/${id}`);if(!g)return null;const gj=await g.json();if(gj.processingStatus==='DONE')return gj.reportDocumentId;if(['FATAL','CANCELLED'].includes(gj.processingStatus))return null;} return null; }
+// 20 Min: Multi-ASIN-Reports stehen deutlich laenger IN_QUEUE als Einzel-Reports
+async function pollDoc(api,id){ for(let i=0;i<240;i++){await sleep(5000);const g=await api(`/reports/2021-06-30/reports/${id}`);if(!g)return null;const gj=await g.json();if(gj.processingStatus==='DONE')return gj.reportDocumentId;if(['FATAL','CANCELLED'].includes(gj.processingStatus))return null;} return null; }
 async function download(api,docId){ const dr=await api(`/reports/2021-06-30/documents/${docId}`); if(!dr) throw new Error('Dokument-Abruf fehlgeschlagen (Rate-Limit?)');
   const drj=await dr.json(); if(!drj||!drj.url) throw new Error('Report-Dokument ohne Download-URL'); // crashte sonst den ganzen Lauf (20.07.)
   const raw=await fetch(drj.url);let buf=Buffer.from(await raw.arrayBuffer());if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);return JSON.parse(buf.toString('utf8')); }
@@ -71,6 +72,20 @@ async function applyBrandFilter(spid,asins){
   console.log(`  Marken-Filter aktiv [${[...want].join(', ')}]: ${keep.length} von ${asins.length} ASINs.`);
   return keep;
 }
+// Gleicher ASIN-Umfang wie der Backfill: Top 50 nach 30-Tage-Umsatz + manuell
+// angeforderte Fokus-ASINs (asin_focus). Ohne Umsatzdaten wird nicht gekappt.
+async function rankAndCap(spid,marketplace,asins){
+  const cc=(marketplace||'DE').toUpperCase();
+  const sales=new Map();
+  try{ const r=await fetch(`${U}/rest/v1/asin_sales_traffic?spid=eq.${spid}&days=eq.30&marketplace=eq.${cc}&select=asin,sales`,{headers:{...sbHead,Range:'0-4999'}}); if(r.ok) for(const x of await r.json()) sales.set(x.asin,+x.sales||0); }catch(e){}
+  let focus=[];
+  try{ const fr=await fetch(`${U}/rest/v1/sqp_clients?spid=eq.${spid}&active=eq.true&marketplace=eq.${cc}&select=asin_focus`,{headers:sbHead}); if(fr.ok) focus=[...new Set((await fr.json()).flatMap(c=>c.asin_focus||[]))].filter(a=>/^B0[A-Z0-9]{8}$/i.test(a)).map(a=>a.toUpperCase()); }catch(e){}
+  const ranked=[...asins].sort((a,b)=>(sales.get(b)||0)-(sales.get(a)||0));
+  const capped=(sales.size&&ranked.length>50)?ranked.slice(0,50):ranked;
+  const set=new Set(capped); const extra=focus.filter(a=>!set.has(a));
+  if(capped.length<ranked.length) console.log(`  Top 50 von ${ranked.length} ASINs (Umsatz-Ranking)${extra.length?` + ${extra.length} Fokus-ASINs`:''}.`);
+  return [...extra,...capped];
+}
 const num=x=>(x&&typeof x==='object'&&'amount'in x)?x.amount:x;
 function mapRows(data,spid,mkt,asin,period){ return (data.dataByAsin||[]).map(r=>({selling_partner_id:spid,marketplace_id:mkt,asin,report_period:period,start_date:r.startDate,end_date:r.endDate,
   search_query:r.searchQueryData?.searchQuery,search_query_score:r.searchQueryData?.searchQueryScore,search_query_volume:r.searchQueryData?.searchQueryVolume,
@@ -86,27 +101,32 @@ async function upsert(rows,spid,mkt,asin,period,start){ const q=`selling_partner
 async function refreshClient(client){
   const {spid,marketplace,name}=client; const mkt=MKT_BY_CC[marketplace]||MKT_BY_CC.DE;
   const api=makeApi(spid); if(!await api.init()){console.log(`  ${name}: kein SP-API-Token`);return;}
-  const asins=await applyBrandFilter(spid, await listAsins(api,mkt)); console.log(`  ${name}: ${asins.length} ASINs`);
-  // Riesen-Kataloge (Haendler ohne Marken-Filter) sprengen das Zeitfenster: 3.720 ASINs
-  // = 18.600 Reports = rechnerisch >40h. SQP gibt es ohnehin nur fuer eigene Marken —
-  // solche Kunden brauchen einen Marken-Filter (unter "Kunde verbinden" pflegbar).
+  const asins=await rankAndCap(spid,marketplace, await applyBrandFilter(spid, await listAsins(api,mkt))); console.log(`  ${name}: ${asins.length} ASINs`);
+  // Sicherheitsnetz (greift mit Top-50-Kappung praktisch nie mehr)
   if(asins.length>300){ console.log(`  ${name}: ${asins.length} ASINs ohne wirksamen Marken-Filter — ÜBERSPRUNGEN. Marken-Filter setzen, dann laeuft der Kunde wieder mit.`); return; }
-  // Aufgaben: MONTH (prev+cur), WEEK (letzte N) — alle force (überschreiben)
-  const jobs=[]; for(const m of months()) for(const a of asins) jobs.push({a,period:'MONTH',start:m,end:monthEnd(m)});
-  for(const w of weeks(NWEEKS)) for(const a of asins) jobs.push({a,period:'WEEK',start:w,end:satOf(w)});
+  // Aufgaben: MONTH (prev+cur), WEEK (letzte N) — alle force (überschreiben),
+  // als 18er-ASIN-Batches je Periode (Amazon-Limit 200 Zeichen; live verifiziert 11.08.)
+  const periods=[]; for(const m of months()) periods.push({period:'MONTH',start:m,end:monthEnd(m)});
+  for(const w of weeks(NWEEKS)) periods.push({period:'WEEK',start:w,end:satOf(w)});
+  const jobs=[]; for(let s=0;s<asins.length;s+=18){ const grp=asins.slice(s,s+18); for(const p of periods) jobs.push({batch:grp,...p}); }
   // Create-Gate (Rate-Limit) + Concurrency für Poll/Download
   let gate=Promise.resolve(); const spacedCreate=async body=>{let rel;const prev=gate;gate=new Promise(r=>rel=r);await prev;const c=await api(`/reports/2021-06-30/reports`,{method:'POST',body:JSON.stringify(body)},12);setTimeout(rel,8000);return c;};
   let i=0,done=0,total=jobs.length;
   const worker=async()=>{ while(i<jobs.length){ const j=jobs[i++];
-    try{ const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[mkt],dataStartTime:j.start+'T00:00:00Z',dataEndTime:j.end+'T00:00:00Z',reportOptions:{reportPeriod:j.period,asin:j.a}};
+    try{ const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[mkt],dataStartTime:j.start+'T00:00:00Z',dataEndTime:j.end+'T00:00:00Z',reportOptions:{reportPeriod:j.period,asin:j.batch.join(' ')}};
       const c=await spacedCreate(body); const cj=c?await c.json():{}; done++;
-      if(!cj.reportId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} ${j.a}: create fail ${c?c.status:'-'} ${JSON.stringify(cj).slice(0,120)}`);continue;}
-      const docId=await pollDoc(api,cj.reportId); if(!docId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} ${j.a}: FATAL`);continue;}
-      const n=await upsert(mapRows(await download(api,docId),spid,mkt,j.a,j.period,j.start),spid,mkt,j.a,j.period,j.start);
-      if(done%10===0||n===0) console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} ${j.a}: ${n}`);
-    }catch(e){done++;console.log(`  ${name} [${done}/${total}] EXC ${j.period} ${j.start} ${j.a}: ${e.message}`);} } };
+      if(!cj.reportId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length}]: create fail ${c?c.status:'-'} ${JSON.stringify(cj).slice(0,120)}`);continue;}
+      const docId=await pollDoc(api,cj.reportId); if(!docId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: FATAL`);continue;}
+      const rows=(await download(api,docId)).dataByAsin||[];
+      if(j.batch.length>1&&rows.length&&rows[0].asin===undefined){ console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start}: Zeilen ohne asin-Feld — Batch übersprungen (Format prüfen!)`); continue; }
+      const byAsin=new Map(j.batch.map(a=>[a,[]]));
+      for(const r of rows){ const a=String(r.asin||j.batch[0]).toUpperCase(); if(byAsin.has(a)) byAsin.get(a).push(r); }
+      let n=0;
+      for(const [a,rws] of byAsin) n+=await upsert(mapRows({dataByAsin:rws},spid,mkt,a,j.period,j.start),spid,mkt,a,j.period,j.start);
+      if(done%5===0||n===0) console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: ${n} Zeilen`);
+    }catch(e){done++;console.log(`  ${name} [${done}/${total}] EXC ${j.period} ${j.start}: ${e.message}`);} } };
   await Promise.all(Array.from({length:CONC},worker));
-  console.log(`  ${name}: fertig (${total} Reports).`);
+  console.log(`  ${name}: fertig (${total} Batch-Reports).`);
 }
 
 async function main(){

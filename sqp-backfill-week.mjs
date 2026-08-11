@@ -49,7 +49,8 @@ async function api(path,opts={},retries=10){
   } return null;
 }
 async function pollDoc(reportId){
-  for(let i=0;i<60;i++){ await sleep(5000);
+  // 20 Min: Multi-ASIN-Reports stehen deutlich laenger IN_QUEUE als Einzel-Reports
+  for(let i=0;i<240;i++){ await sleep(5000);
     const g=await api(`/reports/2021-06-30/reports/${reportId}`); if(!g) return null;
     const gj=await g.json();
     if(gj.processingStatus==='DONE') return gj.reportDocumentId;
@@ -179,26 +180,47 @@ async function upsert(rows,asin,week){
 const CREATE_GAP=+(process.env.SQP_CREATE_GAP||8000); let gate=Promise.resolve();
 async function spacedCreate(body){ let rel; const prev=gate; gate=new Promise(r=>rel=r); await prev;
   const c=await api(`/reports/2021-06-30/reports`,{method:'POST',body:JSON.stringify(body)},12); setTimeout(rel,CREATE_GAP); return c; }
-async function task(asin,week){
-  if(EMPTY.has(asin+'|'+week)) return `skip ${week} ${asin} (bekannt leer)`;
-  if(await hasData(asin,week)) return `skip ${week} ${asin}`;
-  const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[MKT],dataStartTime:week+'T00:00:00Z',dataEndTime:satOf(week)+'T00:00:00Z',reportOptions:{reportPeriod:'WEEK',asin}};
-  const c=await spacedCreate(body); if(!c) return `FAIL ${week} ${asin}`;
-  const cj=await c.json(); if(!cj.reportId) return `ERR ${week} ${asin}: ${JSON.stringify(cj).slice(0,100)}`;
-  const docId=await pollDoc(cj.reportId); if(!docId) return `FATAL ${week} ${asin}`;
-  const n=await upsert(mapRows(await download(docId),asin),asin,week);
-  if(n===0){ await markEmpty(asin,week); return `leer ${week} ${asin} (vermerkt)`; }
-  return `ok ${week} ${asin}: ${n}`;
+// ASIN-Batching: 18 ASINs je Report (Details siehe sqp-backfill.mjs; live verifiziert 11.08.)
+const BATCH=18;
+async function task(batch,week){
+  const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[MKT],dataStartTime:week+'T00:00:00Z',dataEndTime:satOf(week)+'T00:00:00Z',reportOptions:{reportPeriod:'WEEK',asin:batch.join(' ')}};
+  const c=await spacedCreate(body); if(!c) return `FAIL ${week} [${batch.length}]`;
+  const cj=await c.json(); if(!cj.reportId) return `ERR ${week} [${batch.length}]: ${JSON.stringify(cj).slice(0,100)}`;
+  const docId=await pollDoc(cj.reportId); if(!docId) return `FATAL ${week} [${batch.length} ASINs]`;
+  const rows=(await download(docId)).dataByAsin||[];
+  if(batch.length>1&&rows.length&&rows[0].asin===undefined){
+    const out=[]; for(const a of batch) out.push(await task([a],week)); return out.join(' | ');
+  }
+  const byAsin=new Map(batch.map(a=>[a,[]]));
+  for(const r of rows){ const a=String(r.asin||batch[0]).toUpperCase(); if(byAsin.has(a)) byAsin.get(a).push(r); }
+  let ok=0,leer=0;
+  for(const [a,rws] of byAsin){
+    const n=await upsert(mapRows({dataByAsin:rws},a),a,week);
+    if(n===0){ await markEmpty(a,week); leer++; } else ok+=n;
+  }
+  return `ok ${week} [${batch.length} ASINs]: ${ok} Zeilen${leer?`, ${leer} leer`:''}`;
 }
 async function pool(tasks,conc){ let i=0,done=0; const runners=Array.from({length:conc},async()=>{
-  while(i<tasks.length){ const idx=i++; const [asin,week]=tasks[idx];
-    try{ const m=await task(asin,week); done++; console.log(`[${done}/${tasks.length}] ${m}`);}catch(e){done++;console.log(`[${done}/${tasks.length}] EXC ${week} ${asin}: ${e.message}`);} }});
+  while(i<tasks.length){ const idx=i++; const [batch,week]=tasks[idx];
+    try{ const m=await task(batch,week); done++; console.log(`[${done}/${tasks.length}] ${m}`);}catch(e){done++;console.log(`[${done}/${tasks.length}] EXC ${week} [${batch.length}]: ${e.message}`);} }});
   await Promise.all(runners); }
+async function buildTasks(asins,ws){
+  const pairs=[]; for(const a of asins) for(const w of ws) pairs.push([a,w]);
+  const need=new Set(); let i=0;
+  await Promise.all(Array.from({length:8},async()=>{
+    while(i<pairs.length){ const idx=i++; const [a,w]=pairs[idx];
+      if(EMPTY.has(a+'|'+w)) continue;
+      if(!(await hasData(a,w))) need.add(a+'|'+w); } }));
+  const tasks=[];
+  for(let s=0;s<asins.length;s+=BATCH){ const grp=asins.slice(s,s+BATCH);
+    for(const w of ws){ const sub=grp.filter(a=>need.has(a+'|'+w)); if(sub.length) tasks.push([sub,w]); } }
+  return tasks;
+}
 async function main(){
   await refreshAuth(); const asins=await rankAndCap(await listAsins()); const ws=weeks(NWEEKS);
   await loadEmpty();
-  const tasks=[]; for(const a of asins) for(const w of ws) tasks.push([a,w]); // ASIN-major: wichtigste ASINs zuerst komplett
-  console.log(`Wochen-Backfill: ${ws.length} Wochen (${ws[0]}..${ws[ws.length-1]}) × ${asins.length} ASINs = ${tasks.length} Tasks`);
+  const tasks=await buildTasks(asins,ws);
+  console.log(`Wochen-Backfill: ${ws.length} Wochen (${ws[0]}..${ws[ws.length-1]}) × ${asins.length} ASINs -> ${tasks.length} Batch-Reports`);
   const t0=Date.now(); await pool(tasks,CONC); console.log(`FERTIG in ${Math.round((Date.now()-t0)/60000)} Min.`);
 }
 main().catch(e=>{console.error('FEHLER',e);process.exit(1);});

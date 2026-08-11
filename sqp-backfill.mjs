@@ -39,7 +39,8 @@ async function api(path,opts={},retries=6){
   return null;
 }
 async function pollDoc(reportId){
-  for(let i=0;i<60;i++){ await sleep(5000);
+  // 20 Min: Multi-ASIN-Reports stehen deutlich laenger IN_QUEUE als Einzel-Reports
+  for(let i=0;i<240;i++){ await sleep(5000);
     const g=await api(`/reports/2021-06-30/reports/${reportId}`); if(!g) return null;
     const gj=await g.json();
     if(gj.processingStatus==='DONE') return gj.reportDocumentId;
@@ -160,32 +161,59 @@ async function spacedCreate(body){
   setTimeout(release,CREATE_GAP);
   return c;
 }
-async function task(asin,month){
-  if(EMPTY.has(asin+'|'+month)) return `skip ${month} ${asin} (bekannt leer)`;
-  if(await hasData(asin,month)) return `skip ${month} ${asin} (schon da)`;
-  const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[MKT],dataStartTime:month+'T00:00:00Z',dataEndTime:monthEnd(month)+'T00:00:00Z',reportOptions:{reportPeriod:'MONTH',asin}};
+// ASIN-Batching: Amazon erlaubt eine leerzeichengetrennte ASIN-Liste je Report
+// (max 200 Zeichen -> 18 ASINs; live verifiziert 11.08.: Zeilen tragen ihr eigenes
+// asin-Feld). 18x weniger Reports = Onboarding in Minuten statt Stunden.
+// Achtung: Multi-ASIN-Reports stehen laenger IN_QUEUE (~10 Min) — pollDoc ist darauf ausgelegt.
+const BATCH=18;
+async function task(batch,month){
+  const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[MKT],dataStartTime:month+'T00:00:00Z',dataEndTime:monthEnd(month)+'T00:00:00Z',reportOptions:{reportPeriod:'MONTH',asin:batch.join(' ')}};
   const c=await spacedCreate(body);
-  if(!c) return `FAIL create ${month} ${asin}`;
-  const cj=await c.json(); if(!cj.reportId) return `ERR ${month} ${asin}: ${JSON.stringify(cj).slice(0,120)}`;
-  const docId=await pollDoc(cj.reportId); if(!docId) return `FATAL ${month} ${asin}`;
-  const n=await upsert(mapRows(await download(docId),asin),asin,month);
-  if(n===0){ await markEmpty(asin,month); return `leer ${month} ${asin} (vermerkt, wird nicht erneut angefragt)`; }
-  return `ok ${month} ${asin}: ${n}`;
+  if(!c) return `FAIL create ${month} [${batch.length} ASINs]`;
+  const cj=await c.json(); if(!cj.reportId) return `ERR ${month} [${batch.length} ASINs]: ${JSON.stringify(cj).slice(0,120)}`;
+  const docId=await pollDoc(cj.reportId); if(!docId) return `FATAL ${month} [${batch.length} ASINs]`;
+  const rows=(await download(docId)).dataByAsin||[];
+  if(batch.length>1&&rows.length&&rows[0].asin===undefined){
+    // Format-Überraschung: Zeilen ohne eigenes ASIN-Feld -> einzeln nachladen statt falsch zuordnen
+    const out=[]; for(const a of batch) out.push(await task([a],month)); return out.join(' | ');
+  }
+  const byAsin=new Map(batch.map(a=>[a,[]]));
+  for(const r of rows){ const a=String(r.asin||batch[0]).toUpperCase(); if(byAsin.has(a)) byAsin.get(a).push(r); }
+  let ok=0,leer=0;
+  for(const [a,rws] of byAsin){
+    const n=await upsert(mapRows({dataByAsin:rws},a),a,month);
+    if(n===0){ await markEmpty(a,month); leer++; } else ok+=n;
+  }
+  return `ok ${month} [${batch.length} ASINs]: ${ok} Zeilen${leer?`, ${leer} leer vermerkt`:''}`;
 }
 async function pool(tasks,conc){
   let i=0,done=0; const runners=Array.from({length:conc},async()=>{
-    while(i<tasks.length){ const idx=i++; const [asin,month]=tasks[idx];
-      try{ const msg=await task(asin,month); done++; console.log(`[${done}/${tasks.length}] ${msg}`); }
-      catch(e){ done++; console.log(`[${done}/${tasks.length}] EXC ${month} ${asin}: ${e.message}`); } } });
+    while(i<tasks.length){ const idx=i++; const [batch,month]=tasks[idx];
+      try{ const msg=await task(batch,month); done++; console.log(`[${done}/${tasks.length}] ${msg}`); }
+      catch(e){ done++; console.log(`[${done}/${tasks.length}] EXC ${month} [${batch.length} ASINs]: ${e.message}`); } } });
   await Promise.all(runners);
+}
+// Bedarf je (ASIN,Monat) vorab prüfen (8 parallel), dann ASIN-major in 18er-Batches:
+// die Top-18-Gruppe zuerst über alle Monate — wichtigste ASINs sind zuerst KOMPLETT.
+async function buildTasks(asins,ms){
+  const pairs=[]; for(const a of asins) for(const m of ms) pairs.push([a,m]);
+  const need=new Set(); let i=0;
+  await Promise.all(Array.from({length:8},async()=>{
+    while(i<pairs.length){ const idx=i++; const [a,m]=pairs[idx];
+      if(EMPTY.has(a+'|'+m)) continue;
+      if(!(await hasData(a,m))) need.add(a+'|'+m); } }));
+  const tasks=[];
+  for(let s=0;s<asins.length;s+=BATCH){ const grp=asins.slice(s,s+BATCH);
+    for(const m of ms){ const sub=grp.filter(a=>need.has(a+'|'+m)); if(sub.length) tasks.push([sub,m]); } }
+  return tasks;
 }
 async function main(){
   await refreshAuth();
   const asins=await rankAndCap(await listAsins()); const ms=months(startM,endM);
   await loadEmpty();
-  const tasks=[]; for(const a of asins) for(const m of ms) tasks.push([a,m]); // ASIN-major: wichtigste ASINs zuerst KOMPLETT
-  console.log(`Reihenfolge: verkaufsstärkste ASINs zuerst (je ASIN alle Monate am Stück).`);
-  console.log(`Backfill ${startM}..${endM}: ${ms.length} Monate × ${asins.length} ASINs = ${tasks.length} Tasks, Concurrency ${CONC}`);
+  const tasks=await buildTasks(asins,ms);
+  const nAsins=tasks.reduce((s,[b])=>s+b.length,0);
+  console.log(`Backfill ${startM}..${endM}: ${ms.length} Monate × ${asins.length} ASINs -> ${tasks.length} Batch-Reports (${nAsins} offene ASIN-Perioden), Concurrency ${CONC}`);
   const t0=Date.now();
   await pool(tasks,CONC);
   console.log(`FERTIG in ${Math.round((Date.now()-t0)/60000)} Min.`);
