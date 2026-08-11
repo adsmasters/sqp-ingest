@@ -67,17 +67,30 @@ async function runClient(cl) {
 async function main() {
   const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&spid=not.is.null&select=name,spid,marketplace`, { headers: sbHead });
   const clients = await cr.json();
-  // Seit der Marketplace-Migration (PK spid,asin,days,marketplace) läuft jeder
-  // (Seller × Marktplatz) einzeln — Recoactiv DE+IT bekommen getrennte Zeilen.
-  const seen = new Set();
-  console.log(`Sales&Traffic: ${clients.length} Kunde(n), ${DAYS} Tage`);
+  // Jeder (Seller × Marktplatz) einzeln (PK spid,asin,days,marketplace). Die Create-Quota
+  // gilt JE Seller-Konto — verschiedene Seller laufen deshalb parallel (max 3), innerhalb
+  // eines Sellers sequenziell mit Abstand. Rein sequenziell dauerte der Rundlauf länger
+  // als das Workflow-Fenster (Lauf 10.08. im Timeout gestorben).
+  const seen = new Set(); const bySeller = new Map();
   for (const cl of clients) {
     const key = cl.spid + '|' + (cl.marketplace || 'DE').toUpperCase();
     if (seen.has(key)) continue; seen.add(key);
-    console.log(`\n=== ${cl.name} (${cl.spid} · ${(cl.marketplace || 'DE').toUpperCase()}) ===`);
-    try { await runClient(cl); } catch (e) { console.log('  FEHLER:', e.message); }
-    await sleep(60000); // Sales&Traffic-Create-Quota ist hart limitiert
+    if (!bySeller.has(cl.spid)) bySeller.set(cl.spid, []);
+    bySeller.get(cl.spid).push(cl);
   }
+  const lanes = [...bySeller.values()];
+  console.log(`Sales&Traffic: ${seen.size} Lauf/Läufe bei ${lanes.length} Seller(n), ${DAYS} Tage, max 3 parallel`);
+  let idx = 0;
+  await Promise.all(Array.from({ length: Math.min(3, lanes.length) }, async () => {
+    while (idx < lanes.length) {
+      const lane = lanes[idx++];
+      for (const cl of lane) {
+        console.log(`=== ${cl.name} (${cl.spid} · ${(cl.marketplace || 'DE').toUpperCase()}) startet ===`);
+        try { await runClient(cl); } catch (e) { console.log(`  ${cl.name}: FEHLER ${e.message}`); }
+        await sleep(60000); // Create-Quota je Seller-Konto
+      }
+    }
+  }));
   console.log('\nFERTIG.');
 }
 main().catch(e => { console.error('FEHLER', e.message); process.exit(1); });

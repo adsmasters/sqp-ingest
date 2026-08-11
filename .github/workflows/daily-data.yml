@@ -1,7 +1,7 @@
 name: Tagesdaten (Audit + Sales&Traffic)
-# Ausgelagert aus backfill.yml (10.08.2026): dort sprengte die Step-Summe das Timeout,
-# der Job wurde ab 04.08. JEDE Nacht bei 350 Min hart gecancelt — diese Steps liefen
-# dadurch tagelang gar nicht (Sales&Traffic-Daten blieben beim Stand 02.08. stehen).
+# Ausgelagert aus backfill.yml (10.08.2026); seit 11.08. zwei PARALLELE Jobs:
+# Audit (Ads-Agentur-Quota) und Sales&Traffic (SP-API-Quota je Seller) sind unabhängig —
+# sequenziell sprengte die Summe das Timeout (Lauf vom 10.08. bei 335 Min gecancelt).
 on:
   workflow_dispatch: {}
   schedule:
@@ -9,9 +9,9 @@ on:
 concurrency:
   group: sqp-daily-data
 jobs:
-  work:
+  audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,8 +25,22 @@ jobs:
           ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - name: Slack-Alert bei Fehlschlag
+        if: failure() || cancelled()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && { echo "Kein SLACK_WEBHOOK_URL-Secret — Alert übersprungen."; exit 0; }
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ *${{ github.workflow }} / Audit* fehlgeschlagen — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"
+  salestraffic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - name: Gesamt-Umsaetze je ASIN (Sales & Traffic, 30 Tage)
-        if: always()          # Basis fuer echten TACoS — auch wenn das Audit hakt
         run: node sales-traffic.mjs 30
         env:
           SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
@@ -39,4 +53,4 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           [ -z "$SLACK_WEBHOOK_URL" ] && { echo "Kein SLACK_WEBHOOK_URL-Secret — Alert übersprungen."; exit 0; }
-          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ *${{ github.workflow }}* fehlgeschlagen — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ *${{ github.workflow }} / Sales&Traffic* fehlgeschlagen — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"

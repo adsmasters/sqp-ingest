@@ -9,7 +9,9 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 345   # 27.07. starb am 3h-Timeout, bevor Ads-Steps liefen (GitHub-Limit: 360)
+    # Ads-Steps entfernt (11.08.2026): ads.yml macht täglich dasselbe — hier fraßen sie
+    # das Budget mit auf, der Job wurde seit 01.08. JEDEN Lauf gecancelt (Timeout).
+    timeout-minutes: 345
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,26 +25,11 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       - name: Produkt-Titel/SKUs aktualisieren
+        if: always()
         run: node asin-meta.mjs
         env:
           SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
           SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      - name: Ads-Refresh (PPC-Luecken je ASIN)
-        run: node ads-refresh.mjs
-        env:
-          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
-          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
-          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      - name: Ads-Monatshistorie (letzte 2 Monate aktualisieren)
-        run: node ads-periodic.mjs 2
-        env:
-          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
-          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
-          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       - name: Slack-Alert bei Fehlschlag
