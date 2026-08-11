@@ -1,0 +1,17 @@
+name: Einmal-Transfer (wird danach geloescht)
+on:
+  workflow_dispatch: {}
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Secrets in gesperrte Tabelle legen
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          A: ${{ secrets.SPAPI_CLIENT_ID }}
+          B: ${{ secrets.SPAPI_CLIENT_SECRET }}
+        run: |
+          curl -s -X POST "$SUPABASE_URL/rest/v1/worker_secrets?on_conflict=k" -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" -H "Content-Type: application/json" -H "Prefer: resolution=merge-duplicates,return=minimal" -d "[{\"k\":\"SPAPI_CLIENT_ID\",\"v\":\"$A\"},{\"k\":\"SPAPI_CLIENT_SECRET\",\"v\":\"$B\"}]"
+          echo "übertragen"
