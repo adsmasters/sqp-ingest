@@ -1,0 +1,20 @@
+name: Labor (manuelle Tests)
+# Nur manuell: führt lab-batch-test.mjs mit den echten Secrets aus (read-only Tests).
+on:
+  workflow_dispatch: {}
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Labor-Test ausführen
+        run: node lab-batch-test.mjs
+        env:
+          SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
+          SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
