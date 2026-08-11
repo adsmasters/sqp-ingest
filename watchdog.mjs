@@ -46,7 +46,18 @@ for (const wf of ['backfill.yml', 'daily-data.yml']) {
   } catch (e) { issues.push(`Watchdog: ${wf}-Läufe nicht prüfbar (${e.message})`); }
 }
 
-// 3) Datenfrische Sales&Traffic (Basis für TACoS)
+// 3) Dauer-Worker-Herzschlag (Hetzner sqpr-worker) — meldet sich der Daemon >20 Min nicht,
+//    ist Server oder Dienst down. Kein Alarm, solange es (noch) keinen Herzschlag gibt.
+try {
+  const r = await fetch(`${U}/rest/v1/worker_heartbeat?id=eq.1&select=ts,host`, { headers: H });
+  const rows = r.ok ? await r.json() : [];
+  if (rows[0]) {
+    const age = Date.now() - Date.parse(rows[0].ts);
+    if (age > 20 * 60000) issues.push(`Dauer-Worker (${rows[0].host}): letzter Herzschlag vor ${Math.round(age / 60000)} Min — Server/Dienst prüfen`);
+  }
+} catch (e) { /* Heartbeat optional */ }
+
+// 4) Datenfrische Sales&Traffic (Basis für TACoS)
 try {
   const r = await fetch(`${U}/rest/v1/asin_sales_traffic?select=updated_at&order=updated_at.desc&limit=1`, { headers: H });
   const rows = r.ok ? await r.json() : [];
