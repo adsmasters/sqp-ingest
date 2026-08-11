@@ -80,8 +80,10 @@ async function runJob(j, budgetMs) {
     await patch(j.id, { status: 'running', started_at: new Date().toISOString() });
     const jt0 = Date.now();
     const env = { ...process.env, SQP_SPID: j.spid, SQP_MKT: j.marketplace_id, SQP_CREATE_GAP: '15000', SQP_JOB_NOTE: j.note || '' };
-    const m = await run(['sqp-backfill.mjs', range.start, end, '3'], env, j.spid, budgetMs);
-    const w = m === 0 ? await run(['sqp-backfill-week.mjs', range.weeks, '3'], env, j.spid, budgetMs - (Date.now() - jt0)) : 'skipped';
+    // Concurrency 8: Multi-ASIN-Reports stehen ~10 Min in Amazons Queue — mehr gleichzeitig
+    // wartende Reports überlappen die Latenz (die Create-RATE drosselt weiter das Gate)
+    const m = await run(['sqp-backfill.mjs', range.start, end, '8'], env, j.spid, budgetMs);
+    const w = m === 0 ? await run(['sqp-backfill-week.mjs', range.weeks, '8'], env, j.spid, budgetMs - (Date.now() - jt0)) : 'skipped';
     if (m === 0 && w === 0) {
       await patch(j.id, { status: 'done', finished_at: new Date().toISOString(), note: /voll|full/i.test(j.note || '') ? 'volle Historie geladen' : null });
       console.log(`[${j.spid}] Job ${j.id}: FERTIG (${range.label})`);
