@@ -74,8 +74,24 @@ const sendSlack = async text => {
 const d = new Date();
 if (issues.length) {
   console.log('PROBLEME:\n- ' + issues.join('\n- '));
-  await sendSlack(`🚨 *SQPR-Pipeline-Wächter* — ${issues.length} Problem(e):\n• ${issues.join('\n• ')}\n<https://github.com/${REPO}/actions|Zu den Läufen →>`);
+  // Anti-Spam: dieselbe Problemlage wird höchstens 1x pro 24h gemeldet — der Wächter
+  // läuft 4x täglich und wiederholte sonst jede ungelöste Meldung (Feedback 11.08.).
+  // NEUE oder veränderte Probleme melden sofort.
+  const fp = issues.slice().sort().join('|');
+  let suppress = false;
+  try {
+    const sr = await fetch(`${U}/rest/v1/watchdog_state?id=eq.1&select=fingerprint,alerted_at`, { headers: H });
+    const st = sr.ok ? (await sr.json())[0] : null;
+    if (st && st.fingerprint === fp && Date.now() - Date.parse(st.alerted_at) < 24 * 3600e3) suppress = true;
+  } catch (e) { /* im Zweifel melden */ }
+  if (suppress) { console.log('Gleiche Problemlage wie zuletzt — Slack-Meldung unterdrückt (max 1x/24h).'); }
+  else {
+    await sendSlack(`🚨 *SQPR-Pipeline-Wächter* — ${issues.length} Problem(e):\n• ${issues.join('\n• ')}\n<https://github.com/${REPO}/actions|Zu den Läufen →>`);
+    try { await fetch(`${U}/rest/v1/watchdog_state?on_conflict=id`, { method: 'POST', headers: { ...H, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ id: 1, fingerprint: fp, alerted_at: new Date().toISOString() }) }); } catch (e) {}
+  }
 } else {
   console.log('Alles gesund.');
+  // Gelöste Probleme: Fingerprint löschen, damit ein Rückfall wieder sofort meldet
+  try { await fetch(`${U}/rest/v1/watchdog_state?id=eq.1`, { method: 'DELETE', headers: H }); } catch (e) {}
   if (d.getUTCDay() === 1 && d.getUTCHours() === 5) await sendSlack('✅ *SQPR-Pipeline-Wächter*: Wochen-Check — Queue, Nachtläufe und Datenfrische in Ordnung.');
 }
