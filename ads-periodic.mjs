@@ -21,11 +21,16 @@ async function auth() { const t = await fetch('https://api.amazon.co.uk/auth/o2/
 const freshAuth = async () => { if (Date.now() - AT_T > 50 * 60000) await auth(); }; // Token laeuft nach 60min ab
 const H = profile => ({ 'Amazon-Advertising-API-ClientId': CID, 'Amazon-Advertising-API-Scope': profile, Authorization: 'Bearer ' + AT, 'Content-Type': 'application/json' });
 
-async function pull(profile, reportTypeId, columns, startDate, endDate) {
+// Wartezeit auf Amazons Report: 16 Min reichten bei grossen Konten nicht — der Lauf brach
+// mit "timeout -> weiter" ab und der Nachimport kam bei 13 von 15 Kunden nie an (12.08.)
+const POLL_MAX = +(process.env.ADS_POLL_MAX || 300); // 300 x 10s = 50 Min
+async function pull(profile, reportTypeId, columns, startDate, endDate, versuch = 0) {
   let cj;
   for (let a = 0; a < 6; a++) {
     await freshAuth();
-    const body = { name: `${reportTypeId} ${startDate} ${a}`, startDate, endDate, configuration: { adProduct: 'SPONSORED_PRODUCTS', groupBy: reportTypeId === 'spAdvertisedProduct' ? ['advertiser'] : ['searchTerm'], columns, reportTypeId, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } };
+    // Report-Name OHNE Versuchszaehler: gleiche Anfrage -> Amazon antwortet 425 mit der
+    // ID des bereits laufenden Reports, ein Wiederholungsversuch ADOPTIERT ihn also
+    const body = { name: `${reportTypeId} ${startDate}`, startDate, endDate, configuration: { adProduct: 'SPONSORED_PRODUCTS', groupBy: reportTypeId === 'spAdvertisedProduct' ? ['advertiser'] : ['searchTerm'], columns, reportTypeId, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } };
     const c = await fetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) });
     if (c.status === 429) { await sleep(30000); continue; }
     const j = await c.json();
@@ -35,8 +40,13 @@ async function pull(profile, reportTypeId, columns, startDate, endDate) {
   }
   if (!cj || !cj.reportId) throw new Error(reportTypeId + ' create fehlgeschlagen');
   let url = null;
-  for (let i = 0; i < 120; i++) { await sleep(8000); await freshAuth(); const g = await fetch(`${ADS}/reporting/reports/${cj.reportId}`, { headers: H(profile) }); const gj = await g.json(); if (gj.status === 'COMPLETED') { url = gj.url; break; } if (gj.status === 'FAILURE') throw new Error(reportTypeId + ' FAILURE'); }
-  if (!url) throw new Error(reportTypeId + ' timeout');
+  for (let i = 0; i < POLL_MAX; i++) { await sleep(10000); await freshAuth(); const g = await fetch(`${ADS}/reporting/reports/${cj.reportId}`, { headers: H(profile) }); const gj = await g.json(); if (gj.status === 'COMPLETED') { url = gj.url; break; } if (gj.status === 'FAILURE') throw new Error(reportTypeId + ' FAILURE'); }
+  // Timeout: Amazon rechnet weiter — erneut anfordern uebernimmt denselben Report (425),
+  // statt die Periode zu ueberspringen und beim naechsten Lauf ganz von vorn zu beginnen
+  if (!url) {
+    if (versuch < 1) { console.log(`    ${reportTypeId} ${startDate}: dauert laenger, uebernehme den laufenden Report…`); return pull(profile, reportTypeId, columns, startDate, endDate, versuch + 1); }
+    throw new Error(reportTypeId + ' timeout');
+  }
   const raw = await fetch(url); let buf = Buffer.from(await raw.arrayBuffer());
   if (buf.length > 200 * 1024 * 1024) throw new Error(`${reportTypeId} Report zu gross (${Math.round(buf.length / 1048576)} MB komprimiert)`); // OOM-Schutz (Pixxprint)
   buf = zlib.gunzipSync(buf);
@@ -50,6 +60,10 @@ async function hasPeriod(profile, type, start, table = 'ads_asin_terms_periodic'
   return +((r.headers.get('content-range') || '0/0').split('/')[1]) > 0;
 }
 const hasMonth = (profile, m) => hasPeriod(profile, 'MONTH', m);
+async function hasAnyTotals(profile) {
+  const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&select=asin`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });
+  return +((r.headers.get('content-range') || '0/0').split('/')[1]) > 0;
+}
 
 // Exakte Ad-Werte je ASIN & Periode aus dem Advertised-Product-Bericht -> ads_asin_totals_periodic.
 // Der Suchbegriffsbericht kennt keine ASIN: Anzeigengruppen mit mehreren ASINs bekamen ihren
@@ -70,8 +84,19 @@ async function main() {
   let clients = await cr.json();
   // Gezielter Einzellauf (z.B. Nachzug fuer einen Kunden): ADS_ONLY_PROFILE=<profile_id>
   if (process.env.ADS_ONLY_PROFILE) clients = clients.filter(c => String(c.ads_profile_id) === String(process.env.ADS_ONLY_PROFILE));
+  // ADS_TOTALS_ONLY=1: nur die exakten ASIN-Totale nachziehen (Suchbegriff-Reports
+  // ueberspringen) — halbiert die Laufzeit beim Nachimport nach dem Duplikations-Fix.
+  // Kunden OHNE Totale kommen zuerst, damit die falschen Zahlen zuerst verschwinden.
+  const TOTALS_ONLY = /^(1|true|yes)$/i.test(process.env.ADS_TOTALS_ONLY || '');
+  if (TOTALS_ONLY) {
+    const withTotals = new Set();
+    for (const cl of clients) if (await hasAnyTotals(String(cl.ads_profile_id))) withTotals.add(String(cl.ads_profile_id));
+    clients.sort((a, b) => withTotals.has(String(a.ads_profile_id)) - withTotals.has(String(b.ads_profile_id)));
+    console.log(`TOTALS-ONLY-Modus: ${clients.length - withTotals.size} Kunde(n) ohne Totale zuerst.`);
+  }
   console.log(`Ads-Periodic: ${clients.length} Kunde(n), letzte ${NM} Monate + ${NW} Wochen`);
-  const ms = months(NM);
+  // Beim Nachimport neueste Perioden zuerst — die schaut das Team zuerst an
+  const ms = TOTALS_ONLY ? [...months(NM)].reverse() : months(NM);
   for (const cl of clients) {
     const profile = String(cl.ads_profile_id);
     console.log(`Kunde: ${cl.name} (Profil ${profile})`);
@@ -79,8 +104,8 @@ async function main() {
     for (const m of ms) {
       try {
         // Vergangene Monate überspringen, wenn schon vorhanden (aktueller/letzter Monat wird aktualisiert)
-        const isNewest = m.start >= ms[ms.length - 1].start;
-        const needTerms = isNewest || !(await hasMonth(profile, m.start));
+        const isNewest = m.start >= ms.map(x => x.start).sort().slice(-1)[0]; // Reihenfolge kann umgedreht sein
+        const needTerms = !TOTALS_ONLY && (isNewest || !(await hasMonth(profile, m.start)));
         const needTotals = isNewest || !(await hasPeriod(profile, 'MONTH', m.start, 'ads_asin_totals_periodic'));
         if (!needTerms && !needTotals) { console.log(`  ${m.start}: schon da`); continue; }
         if (needTotals) { try { const n = await pullTotals(profile, 'MONTH', m); console.log(`  ${m.start}: ${n} ASIN-Totale`); } catch (e) { console.log(`  ${m.start}: TOTALS-FEHLER ${e.message} -> weiter`); } }
@@ -106,7 +131,7 @@ async function main() {
     for (const w of weeksList(NW)) {
       try {
         const final = w.end < iso(new Date(Date.now() - 8 * 864e5));
-        const needTerms = !final || !(await hasPeriod(profile, 'WEEK', w.start));
+        const needTerms = !TOTALS_ONLY && (!final || !(await hasPeriod(profile, 'WEEK', w.start)));
         const needTotals = !final || !(await hasPeriod(profile, 'WEEK', w.start, 'ads_asin_totals_periodic'));
         if (!needTerms && !needTotals) { console.log(`  Woche ${w.start}: schon da`); continue; }
         if (needTotals) { try { const n = await pullTotals(profile, 'WEEK', w); console.log(`  Woche ${w.start}: ${n} ASIN-Totale`); } catch (e) { console.log(`  Woche ${w.start}: TOTALS-FEHLER ${e.message} -> weiter`); } }
