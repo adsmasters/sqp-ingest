@@ -93,8 +93,18 @@ async function runJob(j, budgetMs) {
   if (budgetMs < 5 * 60000) { console.log(`[${j.spid}] Fenster zu — Job ${j.id} bleibt eingereiht.`); return 'skipped'; }
   try {
     const range = rangeFor(j);
+    // Atomarer Claim (Compare-and-Swap): nur übernehmen, wenn der Job noch queued oder
+    // verwaist ist — GitHub-Actions-Lauf und Server-Daemon konnten denselben Job sonst
+    // GLEICHZEITIG bearbeiten (doppeltes Report-Kontingent + Zeilen-Duplikate)
+    const stale = new Date(Date.now() - 6 * 3600e3).toISOString();
+    let claimed = false;
+    try {
+      const cr = await fetch(`${U}/rest/v1/sqp_backfill_jobs?id=eq.${j.id}&or=(status.eq.queued,started_at.lt.${stale})`,
+        { method: 'PATCH', headers: { ...H, Prefer: 'return=representation' }, body: JSON.stringify({ status: 'running', started_at: new Date().toISOString() }) });
+      claimed = cr.ok && (await cr.json()).length > 0;
+    } catch (e) {}
+    if (!claimed) { console.log(`[${j.spid}] Job ${j.id}: schon von anderem Worker übernommen — übersprungen.`); return 'skipped'; }
     console.log(`[${j.spid}] Job ${j.id} startet (${j.marketplace_id}) — ${range.label}, Zeitscheibe ${Math.round(budgetMs / 60000)} Min`);
-    await patch(j.id, { status: 'running', started_at: new Date().toISOString() });
     const jt0 = Date.now();
     const env = { ...process.env, SQP_SPID: j.spid, SQP_MKT: j.marketplace_id, SQP_CREATE_GAP: '15000', SQP_JOB_NOTE: j.note || '' };
     // Hat der Kunde noch GAR KEINE Wochen, laufen die Wochen ZUERST — bei VOLL-Jobs

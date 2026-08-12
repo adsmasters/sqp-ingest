@@ -153,7 +153,7 @@ async function upsert(rows,asin,month){
   await fetch(`${U}/rest/v1/sqp_asin_rows?${q}`,{method:'DELETE',headers:{apikey:KEY,Authorization:'Bearer '+KEY}});
   if(!rows.length) return 0;
   const ins=await fetch(`${U}/rest/v1/sqp_asin_rows`,{method:'POST',headers:{apikey:KEY,Authorization:'Bearer '+KEY,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(rows)});
-  return ins.ok?rows.length:0;
+  return ins.ok?rows.length:-1; // -1 = Insert-Fehler, NICHT als "leer" vermerken
 }
 // Create-Gate: serialisiert die Report-Erstellungen mit Mindestabstand (Rate-Limit),
 // während Poll/Download parallel laufen dürfen.
@@ -195,7 +195,7 @@ async function task(batch,month){
   let ok=0,leer=0;
   for(const [a,rws] of byAsin){
     const n=await upsert(mapRows({dataByAsin:rws},a),a,month);
-    if(n===0){ await markEmpty(a,month); leer++; } else ok+=n;
+    if(n===0){ await markEmpty(a,month); leer++; } else if(n===-1){ UNVOLLSTAENDIG++; } else ok+=n;
   }
   return `ok ${month} [${batch.length} ASINs]: ${ok} Zeilen${leer?`, ${leer} leer vermerkt`:''}`;
 }

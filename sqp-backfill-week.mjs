@@ -176,7 +176,7 @@ async function upsert(rows,asin,week){
   await fetch(`${U}/rest/v1/sqp_asin_rows?${q}`,{method:'DELETE',headers:{apikey:KEY,Authorization:'Bearer '+KEY}});
   if(!rows.length) return 0;
   const ins=await fetch(`${U}/rest/v1/sqp_asin_rows`,{method:'POST',headers:{apikey:KEY,Authorization:'Bearer '+KEY,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(rows)});
-  return ins.ok?rows.length:0;
+  return ins.ok?rows.length:-1; // -1 = Insert-Fehler, NICHT als "leer" vermerken
 }
 const CREATE_GAP=+(process.env.SQP_CREATE_GAP||8000); let gate=Promise.resolve();
 async function spacedCreate(body){ let rel; const prev=gate; gate=new Promise(r=>rel=r); await prev;
@@ -203,7 +203,7 @@ async function task(batch,week){
   let ok=0,leer=0;
   for(const [a,rws] of byAsin){
     const n=await upsert(mapRows({dataByAsin:rws},a),a,week);
-    if(n===0){ await markEmpty(a,week); leer++; } else ok+=n;
+    if(n===0){ await markEmpty(a,week); leer++; } else if(n===-1){ UNVOLLSTAENDIG++; } else ok+=n;
   }
   return `ok ${week} [${batch.length} ASINs]: ${ok} Zeilen${leer?`, ${leer} leer`:''}`;
 }
