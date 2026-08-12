@@ -80,11 +80,14 @@ const bySeller = new Map();
 for (const j of list) { if (!bySeller.has(j.spid)) bySeller.set(j.spid, []); bySeller.get(j.spid).push(j); }
 const lanes = [...bySeller.values()]; // jede "Lane" = ein Seller, Jobs darin sequenziell
 const isPartial = j => /Teillauf/i.test(j.note || '');
+// [prio] in der Job-Notiz = dieser Kunde bekommt JEDE Runde zuerst eine Scheibe
+// (ABACUS wartete 1,5 Wochen, weil alte Teillauf-Riesen per requested_at vorne lagen)
+const isPrio = j => /\[prio\]/i.test(j.note || '');
 // Innerhalb der Lane: frisches Onboarding VOR alten Teillauf-Riesen (Recoactiv FR
 // verhungerte sonst hinter dem 12-Monats-VOLL-Job desselben Sellers).
-for (const l of lanes) l.sort((a, b) => (isPartial(a) - isPartial(b)) || (a.requested_at < b.requested_at ? -1 : 1));
+for (const l of lanes) l.sort((a, b) => (isPrio(b) - isPrio(a)) || (isPartial(a) - isPartial(b)) || (a.requested_at < b.requested_at ? -1 : 1));
 // Lanes mit frischen Jobs zuerst (bestimmt nur die Reihenfolge der Zeitscheiben)
-lanes.sort((a, b) => (a.every(isPartial) - b.every(isPartial)) || (a[0].requested_at < b[0].requested_at ? -1 : 1));
+lanes.sort((a, b) => (b.some(isPrio) - a.some(isPrio)) || (a.every(isPartial) - b.every(isPartial)) || (a[0].requested_at < b[0].requested_at ? -1 : 1));
 
 async function runJob(j, budgetMs) {
   if (budgetMs < 5 * 60000) { console.log(`[${j.spid}] Fenster zu — Job ${j.id} bleibt eingereiht.`); return 'skipped'; }
@@ -117,8 +120,9 @@ async function runJob(j, budgetMs) {
       console.log(`[${j.spid}] Job ${j.id}: FERTIG (${range.label})`);
       return 'done';
     }
-    // Teillauf: "voll"-Marker im note erhalten, sonst wuerde die Fortsetzung im Schnell-Modus laufen
-    const keepFull = /voll|full/i.test(j.note || '') ? ' [voll]' : '';
+    // Teillauf: "voll"/"prio"-Marker im note erhalten, sonst wuerde die Fortsetzung
+    // im Schnell-Modus bzw. ohne Vorrang laufen
+    const keepFull = (/voll|full/i.test(j.note || '') ? ' [voll]' : '') + (/\[prio\]/i.test(j.note || '') ? ' [prio]' : '');
     await patch(j.id, { status: 'queued', note: 'Teillauf, wird beim nächsten Lauf fortgesetzt' + keepFull });
     console.log(`[${j.spid}] Job ${j.id}: Teillauf (${m}/${w}), erneut eingereiht${keepFull}`);
     return 'partial';
