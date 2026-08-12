@@ -24,6 +24,8 @@ while true; do
   # Budget quasi unbegrenzt: Jobs laufen am Stück durch statt in Nacht-Scheiben
   # 60-Min-Zyklen: lange genug für echte Arbeit, kurz genug, dass NEUE Jobs
   # (die während eines Laufs eingereiht werden) spätestens nach einer Stunde dran sind
-  WORKER_BUDGET_MIN=60 node backfill-worker.mjs
+  # Ads/Meta nur alle 6h statt jeden Zyklus — sie fraßen sonst ~25+ Min von 60 (14 Kunden),
+  # während SQP-Reparatur-Jobs warteten. Nachts läuft zusätzlich die GitHub Action.
+  WORKER_BUDGET_MIN=60 SIDE_MIN_GAP_H=6 node backfill-worker.mjs
   sleep 30
 done

@@ -3,6 +3,7 @@
 // PARALLEL je Seller: Amazons SQP-Report-Drossel gilt pro Verkäuferkonto (eigener Token je Kunde),
 // darum laufen bis zu 4 Kunden gleichzeitig — statt dass ein Riesen-Katalog alle anderen blockiert.
 import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 const U = process.env.SUPABASE_URL, KEY = process.env.SUPABASE_SERVICE_KEY;
 if (!U || !KEY) { console.error('FEHLER: SUPABASE_URL/SERVICE_KEY fehlen.'); process.exit(1); }
 const H = { apikey: KEY, Authorization: 'Bearer ' + KEY, 'Content-Type': 'application/json' };
@@ -47,9 +48,18 @@ function run(args, env, label, deadlineMs) {
 const list = await queuedJobs();
 if (!list.length) { console.log('Queue leer — nichts zu tun.'); process.exit(0); }
 
+// Daemon-Modus (SIDE_MIN_GAP_H gesetzt): Meta/Ads nur, wenn der letzte Lauf laenger her ist —
+// sie fraßen sonst jeden 60-Min-Zyklus ~25+ Min (14 Kunden), waehrend SQP-Jobs warteten.
+const SIDE_GAP_MS = +(process.env.SIDE_MIN_GAP_H || 0) * 3600e3;
+const sideDue = mark => { if (!SIDE_GAP_MS) return true; try { return Date.now() - fs.statSync(mark).mtimeMs > SIDE_GAP_MS; } catch (e) { return true; } };
+const sideDone = mark => { try { fs.writeFileSync(mark, String(Date.now())); } catch (e) {} };
+
 // Meta EINMAL fuer alle (Titel/SKU/Status/Marke) — der Marken-Filter braucht die Brand-Zuordnung vor dem SQP-Import
-console.log('--- Produkt-Meta (Titel/SKU/Marke), einmal fuer alle Kunden ---');
-spawnSync('node', ['asin-meta.mjs'], { stdio: 'inherit', env: process.env });
+if (sideDue('/tmp/sqpr-meta-last')) {
+  console.log('--- Produkt-Meta (Titel/SKU/Marke), einmal fuer alle Kunden ---');
+  spawnSync('node', ['asin-meta.mjs'], { stdio: 'inherit', env: process.env });
+  sideDone('/tmp/sqpr-meta-last');
+} else console.log('Produkt-Meta: zuletzt vor <' + process.env.SIDE_MIN_GAP_H + 'h — übersprungen.');
 
 const now = new Date();
 const end = iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1)));
@@ -122,10 +132,11 @@ while (windowLeft() > 5 * 60000 && queues.some(q => q.length)) {
 }
 
 // PPC-Daten EINMAL am Ende (Ads-API, EINE Agentur-Quota — deshalb nicht parallel und nicht je Job)
-if (leftMin() > 10) {
+if (leftMin() > 10 && sideDue('/tmp/sqpr-ads-last')) {
   console.log('\n--- PPC-Daten (Ads), einmal fuer alle Kunden ---');
   // Math.round: spawnSync verlangt Integer-Timeout — Float crashte den Ads-Block (01.08.)
   spawnSync('node', ['ads-refresh.mjs'], { stdio: 'inherit', env: process.env, timeout: Math.round(Math.max(60000, leftMin() * 60000)), killSignal: 'SIGTERM' });
   spawnSync('node', ['ads-periodic.mjs', '4'], { stdio: 'inherit', env: process.env, timeout: Math.round(Math.max(60000, leftMin() * 60000)), killSignal: 'SIGTERM' });
-}
+  sideDone('/tmp/sqpr-ads-last');
+} else if (SIDE_GAP_MS) console.log('Ads-Block: zuletzt vor <' + process.env.SIDE_MIN_GAP_H + 'h — übersprungen.');
 console.log('\nWorker fertig.');
