@@ -39,7 +39,8 @@ for (const [wf, fristH] of Object.entries(WF_FRIST)) {
   try {
     const gh = (url) => fetch(url, { headers: { Authorization: 'Bearer ' + GH, Accept: 'application/vnd.github+json' } });
     const ok = await (await gh(`https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?status=success&per_page=1`)).json();
-    const last = ok.workflow_runs && ok.workflow_runs[0];
+    if (!ok.workflow_runs) { issues.push(`Watchdog: ${wf} nicht prüfbar (GitHub-API/Token)`); continue; }
+    const last = ok.workflow_runs[0];
     if (last && Date.now() - Date.parse(last.updated_at) <= fristH * 3600e3) continue;
     // kein frischer Erfolg: nur melden, wenn nicht gerade ein Lauf unterwegs ist (frisch eingerichteter Workflow)
     const any = await (await gh(`https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?per_page=1`)).json();
