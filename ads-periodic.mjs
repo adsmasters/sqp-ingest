@@ -97,6 +97,35 @@ async function main() {
   console.log(`Ads-Periodic: ${clients.length} Kunde(n), letzte ${NM} Monate + ${NW} Wochen`);
   // Beim Nachimport neueste Perioden zuerst — die schaut das Team zuerst an
   const ms = TOTALS_ONLY ? [...months(NM)].reverse() : months(NM);
+
+  // Nachzug-Modus: alle (Kunde x Periode) als Aufgabenliste PARALLEL abarbeiten.
+  // Sequenziell dauerte der Durchlauf durch 15 Kunden x 7 Perioden Stunden — die
+  // Wartezeit auf Amazons Reports laesst sich ueberlappen (12.08.).
+  if (TOTALS_ONLY) {
+    const tasks = [];
+    for (const cl of clients) {
+      const profile = String(cl.ads_profile_id);
+      for (const m of ms) tasks.push({ profile, name: cl.name, type: 'MONTH', p: m });
+      for (const w of weeksList(NW)) tasks.push({ profile, name: cl.name, type: 'WEEK', p: w });
+    }
+    const CONC = +(process.env.ADS_CONC || 4);
+    console.log(`Nachzug: ${tasks.length} Perioden, ${CONC} parallel.`);
+    let i = 0, done = 0, ok = 0;
+    await Promise.all(Array.from({ length: CONC }, async () => {
+      while (i < tasks.length) {
+        const t = tasks[i++];
+        const label = `${t.name} ${t.type} ${t.p.start}`;
+        try {
+          if (await hasPeriod(t.profile, t.type, t.p.start, 'ads_asin_totals_periodic')) { done++; console.log(`[${done}/${tasks.length}] ${label}: schon da`); continue; }
+          const n = await pullTotals(t.profile, t.type, t.p);
+          done++; ok++;
+          console.log(`[${done}/${tasks.length}] ${label}: ${n} ASIN-Totale`);
+        } catch (e) { done++; console.log(`[${done}/${tasks.length}] ${label}: FEHLER ${e.message}`); }
+      }
+    }));
+    console.log(`\nTOTALS-NACHZUG FERTIG: ${ok} Perioden neu geladen.`);
+    return;
+  }
   for (const cl of clients) {
     const profile = String(cl.ads_profile_id);
     console.log(`Kunde: ${cl.name} (Profil ${profile})`);
