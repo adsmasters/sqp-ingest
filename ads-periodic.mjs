@@ -45,11 +45,24 @@ async function pull(profile, reportTypeId, columns, startDate, endDate) {
 }
 async function upsert(rows) { let ins = 0; for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_terms_periodic`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  INSERT', r.status, (await r.text()).slice(0, 150)); break; } } return ins; }
 
-async function hasPeriod(profile, type, start) {
-  const r = await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.${type}&period_start=eq.${start}&select=id`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });
+async function hasPeriod(profile, type, start, table = 'ads_asin_terms_periodic') {
+  const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&period_type=eq.${type}&period_start=eq.${start}&select=${table.includes('totals') ? 'asin' : 'id'}`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });
   return +((r.headers.get('content-range') || '0/0').split('/')[1]) > 0;
 }
 const hasMonth = (profile, m) => hasPeriod(profile, 'MONTH', m);
+
+// Exakte Ad-Werte je ASIN & Periode aus dem Advertised-Product-Bericht -> ads_asin_totals_periodic.
+// Der Suchbegriffsbericht kennt keine ASIN: Anzeigengruppen mit mehreren ASINs bekamen ihren
+// KOMPLETTEN Spend auf jede ASIN dupliziert (ABACUS 5L/20L identisch, Stichprobe 12.08.).
+async function pullTotals(profile, type, p) {
+  const adv = await pull(profile, 'spAdvertisedProduct', ['advertisedAsin', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'], p.start, p.end);
+  const agg = new Map();
+  for (const r of adv) { const a = r.advertisedAsin; if (!a) continue; let e = agg.get(a); if (!e) { e = { profile_id: profile, asin: a, period_type: type, period_start: p.start, impressions: 0, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(a, e); } e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; }
+  await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&period_type=eq.${type}&period_start=eq.${p.start}`, { method: 'DELETE', headers: sbHead });
+  const rows = [...agg.values()]; let ins = 0;
+  for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS INSERT', r.status, (await r.text()).slice(0, 150)); break; } }
+  return ins;
+}
 
 async function main() {
   await auth();
@@ -64,7 +77,12 @@ async function main() {
     for (const m of ms) {
       try {
         // Vergangene Monate überspringen, wenn schon vorhanden (aktueller/letzter Monat wird aktualisiert)
-        if (m.start < ms[ms.length - 1].start && await hasMonth(profile, m.start)) { console.log(`  ${m.start}: schon da`); continue; }
+        const isNewest = m.start >= ms[ms.length - 1].start;
+        const needTerms = isNewest || !(await hasMonth(profile, m.start));
+        const needTotals = isNewest || !(await hasPeriod(profile, 'MONTH', m.start, 'ads_asin_totals_periodic'));
+        if (!needTerms && !needTotals) { console.log(`  ${m.start}: schon da`); continue; }
+        if (needTotals) { try { const n = await pullTotals(profile, 'MONTH', m); console.log(`  ${m.start}: ${n} ASIN-Totale`); } catch (e) { console.log(`  ${m.start}: TOTALS-FEHLER ${e.message} -> weiter`); } }
+        if (!needTerms) continue;
         if (!agToAsins) {
           const adv = await pull(profile, 'spAdvertisedProduct', ['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks'], iso(new Date(Date.now() - 30 * 864e5)), iso(new Date(Date.now() - 864e5)));
           agToAsins = new Map(); for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Set()); agToAsins.get(k).add(r.advertisedAsin); }
@@ -84,7 +102,11 @@ async function main() {
     for (const w of weeksList(NW)) {
       try {
         const final = w.end < iso(new Date(Date.now() - 8 * 864e5));
-        if (final && await hasPeriod(profile, 'WEEK', w.start)) { console.log(`  Woche ${w.start}: schon da`); continue; }
+        const needTerms = !final || !(await hasPeriod(profile, 'WEEK', w.start));
+        const needTotals = !final || !(await hasPeriod(profile, 'WEEK', w.start, 'ads_asin_totals_periodic'));
+        if (!needTerms && !needTotals) { console.log(`  Woche ${w.start}: schon da`); continue; }
+        if (needTotals) { try { const n = await pullTotals(profile, 'WEEK', w); console.log(`  Woche ${w.start}: ${n} ASIN-Totale`); } catch (e) { console.log(`  Woche ${w.start}: TOTALS-FEHLER ${e.message} -> weiter`); } }
+        if (!needTerms) continue;
         if (!agToAsins) {
           const adv = await pull(profile, 'spAdvertisedProduct', ['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks'], iso(new Date(Date.now() - 30 * 864e5)), iso(new Date(Date.now() - 864e5)));
           agToAsins = new Map(); for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Set()); agToAsins.get(k).add(r.advertisedAsin); }
