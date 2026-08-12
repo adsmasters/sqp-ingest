@@ -102,11 +102,14 @@ async function main() {
   // Sequenziell dauerte der Durchlauf durch 15 Kunden x 7 Perioden Stunden — die
   // Wartezeit auf Amazons Reports laesst sich ueberlappen (12.08.).
   if (TOTALS_ONLY) {
+    // Reihenfolge PERIODE-zuerst statt Kunde-zuerst: nach einer Runde haben ALLE Kunden
+    // den aktuellen Monat korrekt — die Zahl, die das Team anschaut. Kunde-fuer-Kunde
+    // haetten die letzten Kunden stundenlang weiter falsche Werte gezeigt (12.08.).
+    const wl = weeksList(NW).reverse(); // neueste Woche zuerst
+    const perioden = [...ms.map(m => ({ type: 'MONTH', p: m })), ...wl.map(w => ({ type: 'WEEK', p: w }))];
     const tasks = [];
-    for (const cl of clients) {
-      const profile = String(cl.ads_profile_id);
-      for (const m of ms) tasks.push({ profile, name: cl.name, type: 'MONTH', p: m });
-      for (const w of weeksList(NW)) tasks.push({ profile, name: cl.name, type: 'WEEK', p: w });
+    for (const per of perioden) {
+      for (const cl of clients) tasks.push({ profile: String(cl.ads_profile_id), name: cl.name, type: per.type, p: per.p });
     }
     const CONC = +(process.env.ADS_CONC || 4);
     console.log(`Nachzug: ${tasks.length} Perioden, ${CONC} parallel.`);
