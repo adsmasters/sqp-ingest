@@ -31,18 +31,21 @@ try {
   }
 } catch (e) { issues.push(`Watchdog: Job-Queue nicht prüfbar (${e.message})`); }
 
-// 2) Nächtliche Workflows: gab es in den letzten 30h einen erfolgreichen Lauf?
-for (const wf of ['backfill.yml', 'daily-data.yml']) {
+// 2) Geplante Workflows: gab es innerhalb der Frist einen erfolgreichen Lauf?
+//    (vorher nur backfill+daily-data — ads/vendor/refresh/bid-rules konnten wochenlang
+//    still sterben, weil deren Skripte Fehler schlucken; Deep-Dive 12.08.)
+const WF_FRIST = { 'backfill.yml': 30, 'daily-data.yml': 30, 'ads.yml': 30, 'vendor.yml': 30, 'bid-rules.yml': 30, 'refresh.yml': 8 * 24 };
+for (const [wf, fristH] of Object.entries(WF_FRIST)) {
   try {
     const gh = (url) => fetch(url, { headers: { Authorization: 'Bearer ' + GH, Accept: 'application/vnd.github+json' } });
     const ok = await (await gh(`https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?status=success&per_page=1`)).json();
     const last = ok.workflow_runs && ok.workflow_runs[0];
-    if (last && Date.now() - Date.parse(last.updated_at) <= 30 * 3600e3) continue;
+    if (last && Date.now() - Date.parse(last.updated_at) <= fristH * 3600e3) continue;
     // kein frischer Erfolg: nur melden, wenn nicht gerade ein Lauf unterwegs ist (frisch eingerichteter Workflow)
     const any = await (await gh(`https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?per_page=1`)).json();
     const newest = any.workflow_runs && any.workflow_runs[0];
     if (newest && ['in_progress', 'queued'].includes(newest.status)) continue;
-    issues.push(`${wf}: kein erfolgreicher Lauf in den letzten 30h${last ? ` (letzter Erfolg: ${last.updated_at.slice(0, 16)}Z)` : ''}`);
+    issues.push(`${wf}: kein erfolgreicher Lauf in den letzten ${fristH}h${last ? ` (letzter Erfolg: ${last.updated_at.slice(0, 16)}Z)` : ''}`);
   } catch (e) { issues.push(`Watchdog: ${wf}-Läufe nicht prüfbar (${e.message})`); }
 }
 
@@ -57,13 +60,50 @@ try {
   }
 } catch (e) { /* Heartbeat optional */ }
 
-// 4) Datenfrische Sales&Traffic (Basis für TACoS)
+// 3b) Zyklus-Signal (worker_heartbeat id=2): Daemon-Herzschlag (id=1) läuft auch, wenn
+//     jeder Worker-Zyklus crasht — id=2 wird nur am ENDE eines Zyklus geschrieben
 try {
-  const r = await fetch(`${U}/rest/v1/asin_sales_traffic?select=updated_at&order=updated_at.desc&limit=1`, { headers: H });
+  const r = await fetch(`${U}/rest/v1/worker_heartbeat?id=eq.2&select=ts`, { headers: H });
   const rows = r.ok ? await r.json() : [];
-  const age = rows[0] ? Date.now() - Date.parse(rows[0].updated_at) : null;
-  if (age != null && age > 48 * 3600e3) issues.push(`Sales&Traffic-Daten sind ${hours(age)}h alt (TACoS veraltet)`);
-} catch (e) { issues.push(`Watchdog: Sales&Traffic-Frische nicht prüfbar (${e.message})`); }
+  if (rows[0]) {
+    const age = Date.now() - Date.parse(rows[0].ts);
+    if (age > 4 * 3600e3) issues.push(`Dauer-Worker: seit ${hours(age)}h kein abgeschlossener Zyklus — Worker crasht vermutlich jede Runde (Herzschlag allein täuscht Gesundheit vor)`);
+  }
+} catch (e) { /* optional */ }
+
+// 4) Datenfrische JE KUNDE (vorher global: EIN gesunder Kunde maskierte 13 tote; Deep-Dive 12.08.)
+//    a) Sales&Traffic <48h  b) SQP-Zeilen <9 Tage (Woechentlicher Refresh)  c) Ads-Terms <3 Tage
+try {
+  const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&select=name,spid,marketplace,ads_profile_id`, { headers: H });
+  const clients = cr.ok ? await cr.json() : [];
+  const MKT_MAP = { DE: 'A1PA6795UKMFR9', FR: 'A13V1IB3VIYZZH', IT: 'APJ6JRA9NG5V4', ES: 'A1RKKUPIHCS9HS', UK: 'A1F83G8C2ARO7P', US: 'ATVPDKIKX0DER', NL: 'A1805IZSGTT6HS', SE: 'A2NODRKZP88ZB9', PL: 'A1C3SOZRARQ6R3' };
+  const stale = { st: [], sqp: [], ads: [] };
+  for (const c of clients) {
+    const cc = (c.marketplace || 'DE').toUpperCase();
+    // a) Sales&Traffic
+    try {
+      const r = await fetch(`${U}/rest/v1/asin_sales_traffic?spid=eq.${c.spid}&marketplace=eq.${cc}&select=updated_at&order=updated_at.desc&limit=1`, { headers: H });
+      const rows = r.ok ? await r.json() : [];
+      if (rows[0] && Date.now() - Date.parse(rows[0].updated_at) > 48 * 3600e3) stale.st.push(c.name);
+    } catch (e) {}
+    // b) SQP-Zeilen (nur Kunden, die schon Daten haben — Onboarding meldet Check 1)
+    try {
+      const mkt = MKT_MAP[cc] || cc;
+      const r = await fetch(`${U}/rest/v1/sqp_asin_rows?selling_partner_id=eq.${c.spid}&marketplace_id=eq.${mkt}&select=ingested_at&order=ingested_at.desc&limit=1`, { headers: H });
+      const rows = r.ok ? await r.json() : [];
+      if (rows[0] && Date.now() - Date.parse(rows[0].ingested_at) > 9 * 24 * 3600e3) stale.sqp.push(c.name);
+    } catch (e) {}
+    // c) Ads-Terms (nur Profile, die schon Daten haben)
+    if (c.ads_profile_id) try {
+      const r = await fetch(`${U}/rest/v1/ads_asin_terms?profile_id=eq.${c.ads_profile_id}&select=ingested_at&order=ingested_at.desc&limit=1`, { headers: H });
+      const rows = r.ok ? await r.json() : [];
+      if (rows[0] && Date.now() - Date.parse(rows[0].ingested_at) > 3 * 24 * 3600e3) stale.ads.push(c.name);
+    } catch (e) {}
+  }
+  if (stale.st.length) issues.push(`Sales&Traffic >48h alt bei: ${stale.st.join(', ')} (TACoS veraltet)`);
+  if (stale.sqp.length) issues.push(`SQP-Daten >9 Tage alt bei: ${stale.sqp.join(', ')} (Wochen-Refresh prüfen)`);
+  if (stale.ads.length) issues.push(`Ads-Daten >3 Tage alt bei: ${stale.ads.join(', ')} (Ads-Refresh prüfen)`);
+} catch (e) { issues.push(`Watchdog: Datenfrische nicht prüfbar (${e.message})`); }
 
 // Melden: Probleme sofort; sonst montags 05-Uhr-Lauf als Lebenszeichen (Stille ≠ gesund)
 const sendSlack = async text => {

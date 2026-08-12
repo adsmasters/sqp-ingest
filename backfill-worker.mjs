@@ -62,7 +62,10 @@ if (sideDue('/tmp/sqpr-meta-last')) {
 } else console.log('Produkt-Meta: zuletzt vor <' + process.env.SIDE_MIN_GAP_H + 'h — übersprungen.');
 
 const now = new Date();
-const end = iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1)));
+// Publikations-Lag: Amazon stellt den Vormonat erst ~Tag 3-5 bereit. Ein Import am 1.-4.
+// bekam FATAL und vermerkte jede ASIN dauerhaft als "leer" (Deep-Dive 12.08.) — die
+// Wochen hatten diesen Schutz (LAG_DAYS), die Monate nicht.
+const end = iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - (now.getUTCDate() >= 5 ? 1 : 2), 1)));
 // Schnell-Modus (Standard): 3 Monate + 6 Wochen — Onboarding ist in Stunden statt Naechten fertig.
 // Volle Historie (12 Monate + 13 Wochen) nur, wenn der Job explizit angefordert wurde (note enthaelt "voll").
 const rangeFor = j => /voll|full/i.test(j.note || '')
@@ -174,4 +177,9 @@ if (leftMin() > 10 && sideDue('/tmp/sqpr-ads-last')) {
   spawnSync('node', ['ads-periodic.mjs', '4'], { stdio: 'inherit', env: process.env, timeout: Math.round(Math.max(60000, leftMin() * 60000)), killSignal: 'SIGTERM' });
   sideDone('/tmp/sqpr-ads-last');
 } else if (SIDE_GAP_MS) console.log('Ads-Block: zuletzt vor <' + process.env.SIDE_MIN_GAP_H + 'h — übersprungen.');
+// Zyklus-Signal für den Wächter: der Daemon-Heartbeat (id=1) läuft auch, wenn jeder
+// Zyklus crasht — id=2 beweist, dass Zyklen wirklich zu Ende laufen
+try {
+  await fetch(`${U}/rest/v1/worker_heartbeat?on_conflict=id`, { method: 'POST', headers: { ...H, Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ id: 2, host: 'zyklus-fertig', ts: new Date().toISOString() }) });
+} catch (e) {}
 console.log('\nWorker fertig.');
