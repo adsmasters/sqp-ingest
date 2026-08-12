@@ -77,7 +77,7 @@ if (issues.length) {
   // Anti-Spam: dieselbe Problemlage wird höchstens 1x pro 24h gemeldet — der Wächter
   // läuft 4x täglich und wiederholte sonst jede ungelöste Meldung (Feedback 11.08.).
   // NEUE oder veränderte Probleme melden sofort.
-  const fp = issues.slice().sort().join('|');
+  const fp = issues.map(x => x.replace(/\d+/g, '#')).sort().join('|'); // Zahlen raus: 'vor 170 Min' und 'vor 519 Min' sind DIESELBE Problemlage
   let suppress = false;
   try {
     const sr = await fetch(`${U}/rest/v1/watchdog_state?id=eq.1&select=fingerprint,alerted_at`, { headers: H });

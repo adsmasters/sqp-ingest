@@ -4,13 +4,23 @@
 # nur ohne Zeitfenster/Timeouts. Aktualisiert sich selbst per git pull.
 # Läuft als systemd-Dienst sqpr-worker.service; Logs: journalctl -u sqpr-worker
 cd /opt/sqp-ingest
+
+# Herzschlag im HINTERGRUND alle 2 Min — unabhängig davon, wie lange ein Import läuft.
+# (Vorher schlug er nur zwischen den Läufen: ein mehrstündiger Lauf löste Fehlalarme aus.)
+(
+  while true; do
+    curl -s -X POST "$SUPABASE_URL/rest/v1/worker_heartbeat?on_conflict=id" \
+      -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+      -H "Content-Type: application/json" -H "Prefer: resolution=merge-duplicates,return=minimal" \
+      -d "{\"id\":1,\"host\":\"$(hostname)\",\"ts\":\"$(date -u +%FT%TZ)\"}" >/dev/null 2>&1 || true
+    sleep 120
+  done
+) &
+HB=$!
+trap 'kill $HB 2>/dev/null' EXIT
+
 while true; do
   git pull -q --ff-only 2>/dev/null || true
-  # Herzschlag für den Pipeline-Wächter (Alarm, wenn er >20 Min ausbleibt)
-  curl -s -X POST "$SUPABASE_URL/rest/v1/worker_heartbeat?on_conflict=id" \
-    -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-    -H "Content-Type: application/json" -H "Prefer: resolution=merge-duplicates,return=minimal" \
-    -d "{\"id\":1,\"host\":\"$(hostname)\",\"ts\":\"$(date -u +%FT%TZ)\"}" >/dev/null 2>&1 || true
   # Budget quasi unbegrenzt: Jobs laufen am Stück durch statt in Nacht-Scheiben
   WORKER_BUDGET_MIN=100000 node backfill-worker.mjs
   sleep 30
