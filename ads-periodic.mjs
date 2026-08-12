@@ -67,7 +67,9 @@ async function pullTotals(profile, type, p) {
 async function main() {
   await auth();
   const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&ads_profile_id=not.is.null&select=name,ads_profile_id`, { headers: sbHead });
-  const clients = await cr.json();
+  let clients = await cr.json();
+  // Gezielter Einzellauf (z.B. Nachzug fuer einen Kunden): ADS_ONLY_PROFILE=<profile_id>
+  if (process.env.ADS_ONLY_PROFILE) clients = clients.filter(c => String(c.ads_profile_id) === String(process.env.ADS_ONLY_PROFILE));
   console.log(`Ads-Periodic: ${clients.length} Kunde(n), letzte ${NM} Monate + ${NW} Wochen`);
   const ms = months(NM);
   for (const cl of clients) {
