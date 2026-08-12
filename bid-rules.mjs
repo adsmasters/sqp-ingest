@@ -142,10 +142,11 @@ function isDue(rule, now) {
   const w = WINDOWS[window]; if (!w) return false;
   if (!days.includes(now.wd)) return false;
   if (now.hour < w[0] || now.hour >= w[1]) return false;
-  // Doppellauf-Schutz: schon in diesem Fenster gelaufen?
+  // Doppellauf-Schutz: schon in diesem Fenster gelaufen? 3,5h statt 6h — die Crons
+  // 13:30/17:30 UTC liegen nur 4h auseinander, 6h blockte das Abendfenster IMMER (12.08.)
   if (rule.last_run) {
     const sinceH = (Date.now() - new Date(rule.last_run).getTime()) / 36e5;
-    if (sinceH < 6 ) return false;
+    if (sinceH < 3.5) return false;
   }
   return true;
 }

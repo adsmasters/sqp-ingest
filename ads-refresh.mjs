@@ -35,20 +35,25 @@ async function pull(profile, reportTypeId, columns) {
 const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 async function refreshProfile(profile) {
   const adv = await pull(profile, 'spAdvertisedProduct', ['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks', 'cost']);
-  const agToAsins = new Map();
-  for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Set()); agToAsins.get(k).add(r.advertisedAsin); }
+  // Gewicht je ASIN in der Anzeigengruppe (Klicks, dahinter Impressionen): der Suchbegriffs-
+  // bericht kennt keine ASIN — Vollkopie auf jede ASIN überzählte Spend um Faktor N (12.08.).
+  // Gewichtete Aufteilung hält die Summen exakt; die Abdeckung (Zeile existiert) bleibt.
+  const agToAsins = new Map(); // adGroupId -> Map(asin -> Gewicht)
+  for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Map()); const m = agToAsins.get(k); m.set(r.advertisedAsin, (m.get(r.advertisedAsin) || 0) + 1000 * (+r.clicks || 0) + (+r.impressions || 0) + 1); }
   const st = await pull(profile, 'spSearchTerm', ['searchTerm', 'adGroupId', 'clicks', 'cost', 'purchases7d', 'sales7d']);
   const agg = new Map();
   for (const r of st) {
-    const asins = agToAsins.get(String(r.adGroupId)); if (!asins) continue;
+    const wmap = agToAsins.get(String(r.adGroupId)); if (!wmap) continue;
     const term = norm(r.searchTerm); if (!term) continue;
-    for (const asin of asins) {
+    const wtot = [...wmap.values()].reduce((s, x) => s + x, 0) || 1;
+    for (const [asin, w] of wmap) {
+      const sh = w / wtot;
       const k = asin + '||' + term; let e = agg.get(k);
       if (!e) { e = { profile_id: String(profile), asin, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); }
-      e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0;
+      e.clicks += (+r.clicks || 0) * sh; e.cost += (+r.cost || 0) * sh; e.purchases7d += (+r.purchases7d || 0) * sh; e.sales7d += (+r.sales7d || 0) * sh;
     }
   }
-  const rows = [...agg.values()];
+  const rows = [...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2) }));
   await fetch(`${U}/rest/v1/ads_asin_terms?profile_id=eq.${profile}`, { method: 'DELETE', headers: sbHead });
   let ins = 0;
   for (let i = 0; i < rows.length; i += 1000) {

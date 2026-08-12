@@ -27,10 +27,12 @@ async function token() {
   AT = (await t.json()).access_token;
 }
 const hdr = (profileId, ct) => ({ 'Amazon-Advertising-API-ClientId': CID, 'Amazon-Advertising-API-Scope': String(profileId), Authorization: 'Bearer ' + AT, ...(ct ? { 'Content-Type': ct } : {}) });
-// fetch mit Retry gegen transiente Netzfehler (der Lauf dauert lange — Verbindungen flappen)
-async function rfetch(url, opts, tries = 4) {
+// fetch mit Retry gegen transiente Netzfehler (der Lauf dauert lange — Verbindungen flappen).
+// HARTES 90s-Timeout je Request: ein haengender Socket liess den Lauf 3 Naechte in Folge
+// 2h lang ohne jede Ausgabe stehen, bis GitHub ihn abbrach (10.-12.08.).
+async function rfetch(url, opts = {}, tries = 4) {
   for (let i = 0; i < tries; i++) {
-    try { return await fetch(url, opts); }
+    try { return await fetch(url, { ...opts, signal: AbortSignal.timeout(90000) }); }
     catch (e) { if (i === tries - 1) throw e; await sleep(8000 * (i + 1)); }
   }
 }
@@ -167,10 +169,18 @@ async function main() {
   const cachedIds = ar.ok ? (await ar.json()).map(x => x.profile_id) : [];
   const clientIds = new Set(clients.map(c => String(c.ads_profile_id)));
   for (const pid of cachedIds) if (!clientIds.has(String(pid))) clients.push({ name: `Profil ${pid} (zuletzt auditiert)`, spid: null, ads_profile_id: pid });
+  // Reihenfolge: abgestandenster Cache zuerst + hartes Zeitbudget mit sauberem Ende.
+  // Der Lauf schaffte nie alle 21 Konten (2h-Abbruch 10.-12.08.) und begann jede Nacht
+  // wieder VORNE — dieselben Konten frisch, die hinteren nie. Jetzt rotiert es durch.
+  const ageR = await rfetch(`${U}/rest/v1/ads_audit_cache?days=eq.${DAYS}&select=profile_id,updated_at`, { headers: sbHead });
+  const age = new Map(ageR.ok ? (await ageR.json()).map(x => [String(x.profile_id), x.updated_at]) : []);
+  clients.sort((a, b) => String(age.get(String(a.ads_profile_id)) || '').localeCompare(String(age.get(String(b.ads_profile_id)) || '')));
+  const t0 = Date.now(); const BUDGET_MIN = +(process.env.AUDIT_BUDGET_MIN || 100);
   // ein Job je Ads-Profil (Kunden koennen sich ein Seller-Konto teilen, Profile sind eindeutig)
   const seen = new Set();
-  console.log(`Audit-Vorladung: ${clients.length} Konto/Konten (inkl. zuletzt auditierte), ${DAYS} Tage`);
+  console.log(`Audit-Vorladung: ${clients.length} Konto/Konten (inkl. zuletzt auditierte), ${DAYS} Tage, Budget ${BUDGET_MIN} Min`);
   for (const cl of clients) {
+    if ((Date.now() - t0) / 60000 > BUDGET_MIN) { console.log(`\nZeitbudget erreicht — übrige Konten sind nächste Nacht zuerst dran (ältester Cache zuerst).`); break; }
     if (seen.has(cl.ads_profile_id)) continue; seen.add(cl.ads_profile_id);
     console.log(`\n=== ${cl.name} (${cl.spid}) ===`);
     try {

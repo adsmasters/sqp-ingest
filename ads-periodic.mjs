@@ -86,16 +86,18 @@ async function main() {
         if (needTotals) { try { const n = await pullTotals(profile, 'MONTH', m); console.log(`  ${m.start}: ${n} ASIN-Totale`); } catch (e) { console.log(`  ${m.start}: TOTALS-FEHLER ${e.message} -> weiter`); } }
         if (!needTerms) continue;
         if (!agToAsins) {
+          // Gewicht je ASIN in der Anzeigengruppe (Klicks, dahinter Impressionen) — Vollkopie
+          // auf jede ASIN überzählte Spend um Faktor N; gewichtete Aufteilung hält die Summen (12.08.)
           const adv = await pull(profile, 'spAdvertisedProduct', ['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks'], iso(new Date(Date.now() - 30 * 864e5)), iso(new Date(Date.now() - 864e5)));
-          agToAsins = new Map(); for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Set()); agToAsins.get(k).add(r.advertisedAsin); }
+          agToAsins = new Map(); for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Map()); const mm = agToAsins.get(k); mm.set(r.advertisedAsin, (mm.get(r.advertisedAsin) || 0) + 1000 * (+r.clicks || 0) + (+r.impressions || 0) + 1); }
           console.log(`  ${agToAsins.size} Anzeigengruppen`);
         }
         const st = await pull(profile, 'spSearchTerm', ['searchTerm', 'adGroupId', 'clicks', 'cost', 'purchases7d', 'sales7d'], m.start, m.end);
         if (!st.length) { console.log(`  ${m.start}: keine Ads-Daten`); continue; }
         const agg = new Map();
-        for (const r of st) { const asins = agToAsins.get(String(r.adGroupId)); if (!asins) continue; const term = norm(r.searchTerm); if (!term) continue; for (const asin of asins) { const k = asin + '||' + term; let e = agg.get(k); if (!e) { e = { profile_id: profile, asin, period_type: 'MONTH', period_start: m.start, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); } e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; } }
+        for (const r of st) { const wmap = agToAsins.get(String(r.adGroupId)); if (!wmap) continue; const term = norm(r.searchTerm); if (!term) continue; const wtot = [...wmap.values()].reduce((s, x) => s + x, 0) || 1; for (const [asin, w] of wmap) { const sh = w / wtot; const k = asin + '||' + term; let e = agg.get(k); if (!e) { e = { profile_id: profile, asin, period_type: 'MONTH', period_start: m.start, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); } e.clicks += (+r.clicks || 0) * sh; e.cost += (+r.cost || 0) * sh; e.purchases7d += (+r.purchases7d || 0) * sh; e.sales7d += (+r.sales7d || 0) * sh; } }
         await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.MONTH&period_start=eq.${m.start}`, { method: 'DELETE', headers: sbHead });
-        const n = await upsert([...agg.values()]);
+        const n = await upsert([...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2) })));
         console.log(`  ${m.start}: ${st.length} Terms -> ${n} Zeilen`);
       } catch (e) { console.log(`  ${m.start}: FEHLER ${e.message} -> weiter`); }
     }
@@ -111,14 +113,14 @@ async function main() {
         if (!needTerms) continue;
         if (!agToAsins) {
           const adv = await pull(profile, 'spAdvertisedProduct', ['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks'], iso(new Date(Date.now() - 30 * 864e5)), iso(new Date(Date.now() - 864e5)));
-          agToAsins = new Map(); for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Set()); agToAsins.get(k).add(r.advertisedAsin); }
+          agToAsins = new Map(); for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Map()); const mm = agToAsins.get(k); mm.set(r.advertisedAsin, (mm.get(r.advertisedAsin) || 0) + 1000 * (+r.clicks || 0) + (+r.impressions || 0) + 1); }
         }
         const st = await pull(profile, 'spSearchTerm', ['searchTerm', 'adGroupId', 'clicks', 'cost', 'purchases7d', 'sales7d'], w.start, w.end);
         if (!st.length) { console.log(`  Woche ${w.start}: keine Ads-Daten`); continue; }
         const agg = new Map();
-        for (const r of st) { const asins = agToAsins.get(String(r.adGroupId)); if (!asins) continue; const term = norm(r.searchTerm); if (!term) continue; for (const asin of asins) { const k = asin + '||' + term; let e = agg.get(k); if (!e) { e = { profile_id: profile, asin, period_type: 'WEEK', period_start: w.start, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); } e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; } }
+        for (const r of st) { const wmap = agToAsins.get(String(r.adGroupId)); if (!wmap) continue; const term = norm(r.searchTerm); if (!term) continue; const wtot = [...wmap.values()].reduce((s, x) => s + x, 0) || 1; for (const [asin, wg] of wmap) { const sh = wg / wtot; const k = asin + '||' + term; let e = agg.get(k); if (!e) { e = { profile_id: profile, asin, period_type: 'WEEK', period_start: w.start, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); } e.clicks += (+r.clicks || 0) * sh; e.cost += (+r.cost || 0) * sh; e.purchases7d += (+r.purchases7d || 0) * sh; e.sales7d += (+r.sales7d || 0) * sh; } }
         await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.WEEK&period_start=eq.${w.start}`, { method: 'DELETE', headers: sbHead });
-        const n = await upsert([...agg.values()]);
+        const n = await upsert([...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2) })));
         console.log(`  Woche ${w.start}: ${st.length} Terms -> ${n} Zeilen`);
       } catch (e) { console.log(`  Woche ${w.start}: FEHLER ${e.message} -> weiter`); }
     }
