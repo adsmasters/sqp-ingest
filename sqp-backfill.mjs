@@ -32,7 +32,9 @@ async function api(path,opts={},retries=6){
     let r;
     try{ r=await fetch(`${SPAPI}${path}`,{...opts,headers:{...H,...(opts.headers||{})}}); }
     catch(e){ await sleep(5000+Math.random()*10000); continue; } // transienter Netzfehler
-    if(r.status===429){ await sleep(20000+Math.random()*10000); continue; }
+    // 429: Wartezeit waechst mit — das Create-Kontingent fuellt sich nur ~1/Min auf,
+    // feste 25s liefen ins Leere und ALLE Lanes endeten in "FAIL create" (12.08.)
+    if(r.status===429){ await sleep(Math.min(90000,15000+i*15000)+Math.random()*10000); continue; }
     if(r.status===403){ await refreshAuth(); continue; }
     return r;
   }
@@ -155,7 +157,7 @@ async function upsert(rows,asin,month){
 }
 // Create-Gate: serialisiert die Report-Erstellungen mit Mindestabstand (Rate-Limit),
 // während Poll/Download parallel laufen dürfen.
-const CREATE_GAP=8000; let createGate=Promise.resolve();
+const CREATE_GAP=+(process.env.SQP_CREATE_GAP||8000); let createGate=Promise.resolve();
 async function spacedCreate(body){
   let release; const prev=createGate; createGate=new Promise(r=>release=r);
   await prev;

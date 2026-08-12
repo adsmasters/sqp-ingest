@@ -43,7 +43,8 @@ async function api(path,opts={},retries=10){
     let r;
     try{ r=await fetch(`${SPAPI}${path}`,{...opts,headers:{...H,...(opts.headers||{})}}); }
     catch(e){ await sleep(5000+Math.random()*10000); continue; } // transienter Netzfehler -> erneut versuchen
-    if(r.status===429){ await sleep(25000+Math.random()*10000); continue; }
+    // 429: Wartezeit waechst mit — das Create-Kontingent fuellt sich nur ~1/Min auf (12.08.)
+    if(r.status===429){ await sleep(Math.min(90000,15000+i*15000)+Math.random()*10000); continue; }
     if(r.status===403){ await refreshAuth(); continue; }
     return r;
   } return null;

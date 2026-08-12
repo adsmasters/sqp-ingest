@@ -26,6 +26,9 @@ while true; do
   # (die während eines Laufs eingereiht werden) spätestens nach einer Stunde dran sind
   # Ads/Meta nur alle 6h statt jeden Zyklus — sie fraßen sonst ~25+ Min von 60 (14 Kunden),
   # während SQP-Reparatur-Jobs warteten. Nachts läuft zusätzlich die GitHub Action.
-  WORKER_BUDGET_MIN=60 SIDE_MIN_GAP_H=6 node backfill-worker.mjs
+  # 90-Min-Budget + 60-Min-Scheiben + max 2 Lanes: Amazons SQP-Create-Kontingent wirkt
+  # App-weit — 4 parallele Lanes drosselten sich gegenseitig in "FAIL create" (12.08.),
+  # und 20-Min-Scheiben endeten, bevor Multi-ASIN-Reports (10-30 Min Queue) fertig waren.
+  WORKER_BUDGET_MIN=90 WORKER_SLICE_MIN=60 WORKER_MAX_PARALLEL=2 WORKER_MIN_START_MIN=35 SIDE_MIN_GAP_H=6 node backfill-worker.mjs
   sleep 30
 done

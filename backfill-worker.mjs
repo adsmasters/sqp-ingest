@@ -94,10 +94,24 @@ async function runJob(j, budgetMs) {
     await patch(j.id, { status: 'running', started_at: new Date().toISOString() });
     const jt0 = Date.now();
     const env = { ...process.env, SQP_SPID: j.spid, SQP_MKT: j.marketplace_id, SQP_CREATE_GAP: '15000', SQP_JOB_NOTE: j.note || '' };
+    // Hat der Kunde noch GAR KEINE Wochen, laufen die Wochen ZUERST — bei VOLL-Jobs
+    // verhungerten sie sonst hinter 12 Monaten Backlog (ABACUS: 0 Wochen, 12.08.)
+    let weeksFirst = false;
+    try {
+      const r = await fetch(`${U}/rest/v1/sqp_asin_rows?selling_partner_id=eq.${j.spid}&marketplace_id=eq.${j.marketplace_id}&report_period=eq.WEEK&select=id`, { headers: { ...H, Prefer: 'count=exact', Range: '0-0' } });
+      weeksFirst = +((r.headers.get('content-range') || '0/0').split('/')[1]) === 0;
+    } catch (e) {}
     // Concurrency 8: Multi-ASIN-Reports stehen ~10 Min in Amazons Queue — mehr gleichzeitig
     // wartende Reports überlappen die Latenz (die Create-RATE drosselt weiter das Gate)
-    const m = await run(['sqp-backfill.mjs', range.start, end, '8'], env, j.spid, budgetMs);
-    const w = m === 0 ? await run(['sqp-backfill-week.mjs', range.weeks, '8'], env, j.spid, budgetMs - (Date.now() - jt0)) : 'skipped';
+    let m, w;
+    if (weeksFirst) {
+      console.log(`[${j.spid}] Noch keine Wochendaten — Wochen laufen zuerst.`);
+      w = await run(['sqp-backfill-week.mjs', range.weeks, '8'], env, j.spid, budgetMs);
+      m = w === 0 ? await run(['sqp-backfill.mjs', range.start, end, '8'], env, j.spid, budgetMs - (Date.now() - jt0)) : 'skipped';
+    } else {
+      m = await run(['sqp-backfill.mjs', range.start, end, '8'], env, j.spid, budgetMs);
+      w = m === 0 ? await run(['sqp-backfill-week.mjs', range.weeks, '8'], env, j.spid, budgetMs - (Date.now() - jt0)) : 'skipped';
+    }
     if (m === 0 && w === 0) {
       await patch(j.id, { status: 'done', finished_at: new Date().toISOString(), note: /voll|full/i.test(j.note || '') ? 'volle Historie geladen' : null });
       console.log(`[${j.spid}] Job ${j.id}: FERTIG (${range.label})`);
@@ -118,13 +132,18 @@ async function runJob(j, budgetMs) {
 // Zeitscheiben-Rotation: jede Lane bekommt pro Runde höchstens EINE Scheibe, statt dass
 // die 4 ältesten Teillauf-Riesen das ganze Fenster monopolisieren — Jobs ab Ende Juli
 // bekamen dadurch NÄCHTELANG "Fenster zu" und neue Kunden sahen tagelang keinen Import.
-const SLICE_MS = Math.max(20 * 60000, Math.floor(sqpDeadlineMs / Math.max(1, lanes.length)));
+// Mindest-Scheibe per Env erhoehbar: Multi-ASIN-Reports brauchen 10-30 Min in Amazons
+// Queue — 20-Min-Scheiben warfen die Ergebnisse jede Runde weg (12.08.)
+const SLICE_MS = Math.max((+process.env.WORKER_SLICE_MIN || 20) * 60000, Math.floor(sqpDeadlineMs / Math.max(1, lanes.length)));
 console.log(`Zeitscheibe je Seller und Runde: ${Math.round(SLICE_MS / 60000)} Min (${lanes.length} Seller).`);
 const queues = lanes.map(l => [...l]);
 const windowLeft = () => sqpDeadlineMs - (Date.now() - t0);
-while (windowLeft() > 5 * 60000 && queues.some(q => q.length)) {
+// Keine neue Lane starten, wenn die Restzeit keinen kompletten Report-Durchlauf mehr
+// hergibt (Create + 10-30 Min Amazon-Queue) — halbe Scheiben verbrennen nur Kontingent
+const MIN_START_MS = (+process.env.WORKER_MIN_START_MIN || 5) * 60000;
+while (windowLeft() > MIN_START_MS && queues.some(q => q.length)) {
   const active = queues.filter(q => q.length);
-  for (let i = 0; i < active.length && windowLeft() > 5 * 60000; i += MAX_PAR) {
+  for (let i = 0; i < active.length && windowLeft() > MIN_START_MS; i += MAX_PAR) {
     await Promise.all(active.slice(i, i + MAX_PAR).map(async q => {
       const j = q.shift(); if (!j) return;
       const res = await runJob(j, Math.min(SLICE_MS, windowLeft()));
