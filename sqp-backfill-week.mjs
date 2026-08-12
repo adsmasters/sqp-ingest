@@ -49,8 +49,8 @@ async function api(path,opts={},retries=10){
   } return null;
 }
 async function pollDoc(reportId){
-  // 20 Min: Multi-ASIN-Reports stehen deutlich laenger IN_QUEUE als Einzel-Reports
-  for(let i=0;i<240;i++){ await sleep(5000);
+  // 30 Min: Multi-ASIN-Reports stehen deutlich laenger IN_QUEUE als Einzel-Reports
+  for(let i=0;i<360;i++){ await sleep(5000);
     const g=await api(`/reports/2021-06-30/reports/${reportId}`); if(!g) return null;
     const gj=await g.json();
     if(gj.processingStatus==='DONE') return {docId:gj.reportDocumentId};
@@ -206,9 +206,10 @@ async function task(batch,week){
   }
   return `ok ${week} [${batch.length} ASINs]: ${ok} Zeilen${leer?`, ${leer} leer`:''}`;
 }
+let UNVOLLSTAENDIG=0; // TIMEOUT/FAIL/ERR-Tasks: Lauf darf NICHT als fertig gelten (sonst Job 'done' ohne Daten — MoleQlar/Femarelle 11.08.)
 async function pool(tasks,conc){ let i=0,done=0; const runners=Array.from({length:conc},async()=>{
   while(i<tasks.length){ const idx=i++; const [batch,week]=tasks[idx];
-    try{ const m=await task(batch,week); done++; console.log(`[${done}/${tasks.length}] ${m}`);}catch(e){done++;console.log(`[${done}/${tasks.length}] EXC ${week} [${batch.length}]: ${e.message}`);} }});
+    try{ const m=await task(batch,week); done++; console.log(`[${done}/${tasks.length}] ${m}`); if(/TIMEOUT|FAIL|ERR /.test(m)) UNVOLLSTAENDIG++;}catch(e){done++;UNVOLLSTAENDIG++;console.log(`[${done}/${tasks.length}] EXC ${week} [${batch.length}]: ${e.message}`);} }});
   await Promise.all(runners); }
 async function buildTasks(asins,ws){
   const pairs=[]; for(const a of asins) for(const w of ws) pairs.push([a,w]);
@@ -227,6 +228,8 @@ async function main(){
   await loadEmpty();
   const tasks=await buildTasks(asins,ws);
   console.log(`Wochen-Backfill: ${ws.length} Wochen (${ws[0]}..${ws[ws.length-1]}) × ${asins.length} ASINs -> ${tasks.length} Batch-Reports`);
-  const t0=Date.now(); await pool(tasks,CONC); console.log(`FERTIG in ${Math.round((Date.now()-t0)/60000)} Min.`);
+  const t0=Date.now(); await pool(tasks,CONC);
+  if(UNVOLLSTAENDIG>0){ console.log(`TEILLAUF: ${UNVOLLSTAENDIG} Task(s) unvollständig (Timeout/Fehler) — nächster Lauf setzt fort.`); process.exit(2); }
+  console.log(`FERTIG in ${Math.round((Date.now()-t0)/60000)} Min.`);
 }
 main().catch(e=>{console.error('FEHLER',e);process.exit(1);});

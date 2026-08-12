@@ -39,8 +39,8 @@ async function api(path,opts={},retries=6){
   return null;
 }
 async function pollDoc(reportId){
-  // 20 Min: Multi-ASIN-Reports stehen deutlich laenger IN_QUEUE als Einzel-Reports
-  for(let i=0;i<240;i++){ await sleep(5000);
+  // 30 Min: Multi-ASIN-Reports stehen deutlich laenger IN_QUEUE als Einzel-Reports
+  for(let i=0;i<360;i++){ await sleep(5000);
     const g=await api(`/reports/2021-06-30/reports/${reportId}`); if(!g) return null;
     const gj=await g.json();
     if(gj.processingStatus==='DONE') return {docId:gj.reportDocumentId};
@@ -56,7 +56,9 @@ async function download(docId){
 async function listAsins(){
   const c=await api(`/reports/2021-06-30/reports`,{method:'POST',body:JSON.stringify({reportType:'GET_MERCHANT_LISTINGS_ALL_DATA',marketplaceIds:[MKT]})});
   const docId=((await pollDoc((await c.json()).reportId))||{}).docId;
-  const dr=await api(`/reports/2021-06-30/documents/${docId}`); const drj=await dr.json();
+  if(!docId){ console.error('FEHLER: Listings-Report nicht fertig (FATAL/Timeout) — Teillauf.'); process.exit(1); }
+  const dr=await api(`/reports/2021-06-30/documents/${docId}`); const drj=dr?await dr.json():null;
+  if(!drj||!drj.url){ console.error('FEHLER: Listings-Report-Dokument ohne URL — Teillauf.'); process.exit(1); }
   const raw=await fetch(drj.url); let buf=Buffer.from(await raw.arrayBuffer());
   if(drj.compressionAlgorithm==='GZIP') buf=zlib.gunzipSync(buf);
   const lines=buf.toString('latin1').split('\n').filter(Boolean);
@@ -195,11 +197,12 @@ async function task(batch,month){
   }
   return `ok ${month} [${batch.length} ASINs]: ${ok} Zeilen${leer?`, ${leer} leer vermerkt`:''}`;
 }
+let UNVOLLSTAENDIG=0; // TIMEOUT/FAIL/ERR-Tasks: Lauf darf NICHT als fertig gelten (sonst Job 'done' ohne Daten — MoleQlar/Femarelle 11.08.)
 async function pool(tasks,conc){
   let i=0,done=0; const runners=Array.from({length:conc},async()=>{
     while(i<tasks.length){ const idx=i++; const [batch,month]=tasks[idx];
-      try{ const msg=await task(batch,month); done++; console.log(`[${done}/${tasks.length}] ${msg}`); }
-      catch(e){ done++; console.log(`[${done}/${tasks.length}] EXC ${month} [${batch.length} ASINs]: ${e.message}`); } } });
+      try{ const msg=await task(batch,month); done++; console.log(`[${done}/${tasks.length}] ${msg}`); if(/TIMEOUT|FAIL|ERR /.test(msg)) UNVOLLSTAENDIG++; }
+      catch(e){ done++; UNVOLLSTAENDIG++; console.log(`[${done}/${tasks.length}] EXC ${month} [${batch.length} ASINs]: ${e.message}`); } } });
   await Promise.all(runners);
 }
 // Bedarf je (ASIN,Monat) vorab prüfen (8 parallel), dann ASIN-major in 18er-Batches:
@@ -225,6 +228,7 @@ async function main(){
   console.log(`Backfill ${startM}..${endM}: ${ms.length} Monate × ${asins.length} ASINs -> ${tasks.length} Batch-Reports (${nAsins} offene ASIN-Perioden), Concurrency ${CONC}`);
   const t0=Date.now();
   await pool(tasks,CONC);
+  if(UNVOLLSTAENDIG>0){ console.log(`TEILLAUF: ${UNVOLLSTAENDIG} Task(s) unvollständig (Timeout/Fehler) — nächster Lauf setzt fort.`); process.exit(2); }
   console.log(`FERTIG in ${Math.round((Date.now()-t0)/60000)} Min.`);
 }
 main().catch(e=>{console.error('FEHLER',e);process.exit(1);});
