@@ -53,6 +53,7 @@ async function pollDoc(reportId){
   // 30 Min: Multi-ASIN-Reports stehen deutlich laenger IN_QUEUE als Einzel-Reports
   for(let i=0;i<360;i++){ await sleep(5000);
     const g=await api(`/reports/2021-06-30/reports/${reportId}`); if(!g) return null;
+    if(g.status===400||g.status===404) return {gone:true}; // adoptierter Report existiert nicht mehr
     const gj=await g.json();
     if(gj.processingStatus==='DONE') return {docId:gj.reportDocumentId};
     if(['FATAL','CANCELLED'].includes(gj.processingStatus)) return {fatal:true};
@@ -183,12 +184,32 @@ async function spacedCreate(body){ let rel; const prev=gate; gate=new Promise(r=
   const c=await api(`/reports/2021-06-30/reports`,{method:'POST',body:JSON.stringify(body)},12); setTimeout(rel,CREATE_GAP); return c; }
 // ASIN-Batching: 18 ASINs je Report (Details siehe sqp-backfill.mjs; live verifiziert 11.08.)
 const BATCH=18;
+// Report-Registry: bestellte Reports überleben das Zeitscheiben-Ende — der nächste
+// Lauf adoptiert sie statt neu zu bestellen (Details siehe sqp-backfill.mjs, 12.08.)
+const REG_HD={apikey:KEY,Authorization:'Bearer '+KEY,'Content-Type':'application/json'};
+async function regGet(period,key){
+  try{ const r=await fetch(`${U}/rest/v1/sqp_report_registry?spid=eq.${SPID}&marketplace_id=eq.${MKT}&report_period=eq.WEEK&start_date=eq.${period}&asin_key=eq.${encodeURIComponent(key)}&created_at=gt.${new Date(Date.now()-24*3600e3).toISOString()}&select=report_id`,{headers:REG_HD});
+    const j=r.ok?await r.json():[]; return j[0]&&j[0].report_id; }catch(e){ return null; }
+}
+async function regPut(period,key,reportId){
+  try{ await fetch(`${U}/rest/v1/sqp_report_registry?on_conflict=spid,marketplace_id,report_period,start_date,asin_key`,{method:'POST',headers:{...REG_HD,Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({spid:SPID,marketplace_id:MKT,report_period:'WEEK',start_date:period,asin_key:key,report_id:reportId,created_at:new Date().toISOString()})}); }catch(e){}
+}
+async function regDel(period,key){
+  try{ await fetch(`${U}/rest/v1/sqp_report_registry?spid=eq.${SPID}&marketplace_id=eq.${MKT}&report_period=eq.WEEK&start_date=eq.${period}&asin_key=eq.${encodeURIComponent(key)}`,{method:'DELETE',headers:REG_HD}); }catch(e){}
+}
 async function task(batch,week){
-  const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[MKT],dataStartTime:week+'T00:00:00Z',dataEndTime:satOf(week)+'T00:00:00Z',reportOptions:{reportPeriod:'WEEK',asin:batch.join(' ')}};
-  const c=await spacedCreate(body); if(!c) return `FAIL ${week} [${batch.length}]`;
-  const cj=await c.json(); if(!cj.reportId) return `ERR ${week} [${batch.length}]: ${JSON.stringify(cj).slice(0,100)}`;
-  const pd=await pollDoc(cj.reportId);
-  if(!pd||pd.timeout) return `TIMEOUT ${week} [${batch.length} ASINs]`;
+  const regKey=batch.join(' ');
+  let reportId=await regGet(week,regKey);
+  if(!reportId){
+    const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[MKT],dataStartTime:week+'T00:00:00Z',dataEndTime:satOf(week)+'T00:00:00Z',reportOptions:{reportPeriod:'WEEK',asin:regKey}};
+    const c=await spacedCreate(body); if(!c) return `FAIL ${week} [${batch.length}]`;
+    const cj=await c.json(); if(!cj.reportId) return `ERR ${week} [${batch.length}]: ${JSON.stringify(cj).slice(0,100)}`;
+    reportId=cj.reportId; await regPut(week,regKey,reportId);
+  }
+  const pd=await pollDoc(reportId);
+  if(pd&&pd.gone){ await regDel(week,regKey); return task(batch,week); }
+  if(!pd||pd.timeout) return `TIMEOUT ${week} [${batch.length} ASINs] (Report vorgemerkt — nächster Lauf übernimmt ihn)`;
+  await regDel(week,regKey); // Report ist entschieden (DONE/FATAL) — Vormerkung aufheben
   if(pd.fatal){
     if(batch.length>1){ const out=[]; for(const a of batch) out.push(await task([a],week)); return `split ${week}: ${out.length} einzeln nachgeprüft`; }
     await markEmpty(batch[0],week);

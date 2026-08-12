@@ -44,6 +44,7 @@ async function pollDoc(reportId){
   // 30 Min: Multi-ASIN-Reports stehen deutlich laenger IN_QUEUE als Einzel-Reports
   for(let i=0;i<360;i++){ await sleep(5000);
     const g=await api(`/reports/2021-06-30/reports/${reportId}`); if(!g) return null;
+    if(g.status===400||g.status===404) return {gone:true}; // adoptierter Report existiert nicht mehr
     const gj=await g.json();
     if(gj.processingStatus==='DONE') return {docId:gj.reportDocumentId};
     if(['FATAL','CANCELLED'].includes(gj.processingStatus)) return {fatal:true};
@@ -170,13 +171,34 @@ async function spacedCreate(body){
 // asin-Feld). 18x weniger Reports = Onboarding in Minuten statt Stunden.
 // Achtung: Multi-ASIN-Reports stehen laenger IN_QUEUE (~10 Min) — pollDoc ist darauf ausgelegt.
 const BATCH=18;
+// Report-Registry: bestellte Reports überleben das Zeitscheiben-Ende. Amazon arbeitet
+// sie weiter ab; der nächste Lauf ADOPTIERT sie statt neu zu bestellen — vorher wurde
+// dasselbe Kontingent jede Runde erneut verbrannt und die Queue verstopfte (12.08.).
+const REG_HD={apikey:KEY,Authorization:'Bearer '+KEY,'Content-Type':'application/json'};
+async function regGet(period,key){
+  try{ const r=await fetch(`${U}/rest/v1/sqp_report_registry?spid=eq.${SPID}&marketplace_id=eq.${MKT}&report_period=eq.MONTH&start_date=eq.${period}&asin_key=eq.${encodeURIComponent(key)}&created_at=gt.${new Date(Date.now()-24*3600e3).toISOString()}&select=report_id`,{headers:REG_HD});
+    const j=r.ok?await r.json():[]; return j[0]&&j[0].report_id; }catch(e){ return null; }
+}
+async function regPut(period,key,reportId){
+  try{ await fetch(`${U}/rest/v1/sqp_report_registry?on_conflict=spid,marketplace_id,report_period,start_date,asin_key`,{method:'POST',headers:{...REG_HD,Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({spid:SPID,marketplace_id:MKT,report_period:'MONTH',start_date:period,asin_key:key,report_id:reportId,created_at:new Date().toISOString()})}); }catch(e){}
+}
+async function regDel(period,key){
+  try{ await fetch(`${U}/rest/v1/sqp_report_registry?spid=eq.${SPID}&marketplace_id=eq.${MKT}&report_period=eq.MONTH&start_date=eq.${period}&asin_key=eq.${encodeURIComponent(key)}`,{method:'DELETE',headers:REG_HD}); }catch(e){}
+}
 async function task(batch,month){
-  const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[MKT],dataStartTime:month+'T00:00:00Z',dataEndTime:monthEnd(month)+'T00:00:00Z',reportOptions:{reportPeriod:'MONTH',asin:batch.join(' ')}};
-  const c=await spacedCreate(body);
-  if(!c) return `FAIL create ${month} [${batch.length} ASINs]`;
-  const cj=await c.json(); if(!cj.reportId) return `ERR ${month} [${batch.length} ASINs]: ${JSON.stringify(cj).slice(0,120)}`;
-  const pd=await pollDoc(cj.reportId);
-  if(!pd||pd.timeout) return `TIMEOUT ${month} [${batch.length} ASINs] (nächster Lauf versucht erneut)`;
+  const regKey=batch.join(' ');
+  let reportId=await regGet(month,regKey);
+  if(!reportId){
+    const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[MKT],dataStartTime:month+'T00:00:00Z',dataEndTime:monthEnd(month)+'T00:00:00Z',reportOptions:{reportPeriod:'MONTH',asin:regKey}};
+    const c=await spacedCreate(body);
+    if(!c) return `FAIL create ${month} [${batch.length} ASINs]`;
+    const cj=await c.json(); if(!cj.reportId) return `ERR ${month} [${batch.length} ASINs]: ${JSON.stringify(cj).slice(0,120)}`;
+    reportId=cj.reportId; await regPut(month,regKey,reportId);
+  }
+  const pd=await pollDoc(reportId);
+  if(pd&&pd.gone){ await regDel(month,regKey); return task(batch,month); }
+  if(!pd||pd.timeout) return `TIMEOUT ${month} [${batch.length} ASINs] (Report vorgemerkt — nächster Lauf übernimmt ihn)`;
+  await regDel(month,regKey); // Report ist entschieden (DONE/FATAL) — Vormerkung aufheben
   if(pd.fatal){
     // Amazon meldet FATAL, wenn es fuer die Anfrage KEINE Daten gibt. Batch einmal
     // aufspalten, Einzel-FATAL dauerhaft als leer vermerken — sonst Endlosschleife
