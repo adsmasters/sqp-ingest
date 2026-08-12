@@ -34,7 +34,9 @@ function run(args, env, label, deadlineMs) {
   return new Promise(resolve => {
     const p = spawn('node', args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
     let killed = false;
-    const t = setTimeout(() => { killed = true; p.kill('SIGTERM'); }, Math.max(60000, deadlineMs));
+    // Node-setTimeout ist 32-bit-begrenzt (~24,8 Tage): Überlauf setzt den Timer auf 1ms
+    // und killte jeden Import SOFORT (Daemon-Budget 100000 Min, 12.08.) — deshalb deckeln.
+    const t = setTimeout(() => { killed = true; p.kill('SIGTERM'); }, Math.min(Math.max(60000, deadlineMs), 0x7FFFFFFF));
     const pipe = s => { let buf = ''; s.on('data', d => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { console.log(`[${label}] ${buf.slice(0, i)}`); buf = buf.slice(i + 1); } }); };
     pipe(p.stdout); pipe(p.stderr);
     p.on('close', code => { clearTimeout(t); resolve(killed ? 'timeout' : code); });

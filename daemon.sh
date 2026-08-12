@@ -22,6 +22,8 @@ trap 'kill $HB 2>/dev/null' EXIT
 while true; do
   git pull -q --ff-only 2>/dev/null || true
   # Budget quasi unbegrenzt: Jobs laufen am Stück durch statt in Nacht-Scheiben
-  WORKER_BUDGET_MIN=100000 node backfill-worker.mjs
+  # 60-Min-Zyklen: lange genug für echte Arbeit, kurz genug, dass NEUE Jobs
+  # (die während eines Laufs eingereiht werden) spätestens nach einer Stunde dran sind
+  WORKER_BUDGET_MIN=60 node backfill-worker.mjs
   sleep 30
 done
