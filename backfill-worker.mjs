@@ -69,8 +69,10 @@ const rangeFor = j => /voll|full/i.test(j.note || '')
   ? { start: iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 12, 1))), weeks: '13', label: 'VOLL (12M+13W)' }
   : { start: iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 3, 1))), weeks: '6', label: 'schnell (3M+6W)' };
 
-// SQP-Fenster: alles bis auf eine Reserve fuer den Ads-Block am Ende
-const sqpDeadlineMs = Math.max(20, leftMin() - 25) * 60000;
+// SQP-Fenster: alles bis auf eine Reserve fuer den Ads-Block am Ende —
+// wird der Ads-Block ohnehin uebersprungen (6h-Gate), gehoert die Zeit dem SQP
+const adsDue = sideDue('/tmp/sqpr-ads-last');
+const sqpDeadlineMs = Math.max(20, leftMin() - (adsDue ? 25 : 2)) * 60000;
 console.log(`SQP-Fenster: ${Math.round(sqpDeadlineMs / 60000)} Min, bis zu ${MAX_PAR} Kunden parallel.`);
 
 // Nur ein Job je Seller-Konto gleichzeitig (gleicher Token = gleiche Quota), z.B. Recoactiv DE+IT
