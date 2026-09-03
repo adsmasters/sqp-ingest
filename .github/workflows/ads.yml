@@ -8,7 +8,12 @@ on:
 jobs:
   ads:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    # War 300: der sequenzielle Kunde-fuer-Kunde-Nachzug ist mit wachsendem Kundenstamm
+    # regelmaessig ins Timeout gelaufen (cancelled statt failure) und blieb dadurch
+    # stumm, weil der harte Job-Timeout-Kill den Slack-Alert-Step NICHT mehr ausfuehrt —
+    # der Alert ist deshalb unten in einen eigenen Job ausgelagert (03.09.). 355 ist das
+    # Maximum, das GitHub-gehostete Runner ueberhaupt zulassen (Plattform-Deckel 360 Min).
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -31,10 +36,20 @@ jobs:
           ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+  # Eigener Job statt Step: ein harter Job-Timeout-Kill (siehe oben) beendet den
+  # laufenden Job SOFORT und fuehrt keine weiteren if:failure()/cancelled()-Steps
+  # DARIN mehr aus — ein separater Job mit needs: wird davon nicht betroffen und
+  # laeuft zuverlaessig, auch wenn "ads" per Timeout als cancelled endet (03.09.,
+  # Wochen stumme Timeouts weil der alte Alert-Step im selben Job nie drankam).
+  alert-on-failure:
+    needs: ads
+    if: needs.ads.result != 'success'
+    runs-on: ubuntu-latest
+    steps:
       - name: Slack-Alert bei Fehlschlag
-        if: failure() || cancelled()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           [ -z "$SLACK_WEBHOOK_URL" ] && { echo "Kein SLACK_WEBHOOK_URL-Secret — Alert übersprungen."; exit 0; }
-          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ *${{ github.workflow }}* fehlgeschlagen — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ *${{ github.workflow }}* ${{ needs.ads.result }} — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"
