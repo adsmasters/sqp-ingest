@@ -18,8 +18,17 @@ const leftMin = () => BUDGET_MIN - (Date.now() - t0) / 60000;
 async function queuedJobs() {
   // queued + verwaiste running-Jobs (>6h ohne Abschluss = abgebrochener Lauf)
   const stale = new Date(Date.now() - 6 * 3600e3).toISOString();
-  const r = await fetch(`${U}/rest/v1/sqp_backfill_jobs?or=(status.eq.queued,and(status.eq.running,started_at.lt.${stale}))&order=requested_at.asc`, { headers: H });
-  return r.ok ? await r.json() : [];
+  try {
+    const r = await fetch(`${U}/rest/v1/sqp_backfill_jobs?or=(status.eq.queued,and(status.eq.running,started_at.lt.${stale}))&order=requested_at.asc`, { headers: H });
+    return r.ok ? await r.json() : [];
+  } catch (e) { console.log('WARNUNG: Queue-Abfrage fehlgeschlagen (' + e.message + ') — Zyklus zaehlt trotzdem als abgeschlossen.'); return []; }
+}
+// Zyklus-Signal für den Wächter: der Daemon-Heartbeat (id=1) läuft auch, wenn jeder
+// Zyklus crasht — id=2 beweist, dass Zyklen wirklich zu Ende laufen. Muss auf JEDEM
+// Ausstiegspfad geschrieben werden, auch "Queue leer" — sonst meldet der Wächter nach
+// Tagen ohne neue Jobs faelschlich einen Crash-Loop (13 Tage stille Queue, 03.09.).
+async function cycleDone() {
+  try { await fetch(`${U}/rest/v1/worker_heartbeat?on_conflict=id`, { method: 'POST', headers: { ...H, Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ id: 2, host: 'zyklus-fertig', ts: new Date().toISOString() }) }); } catch (e) {}
 }
 async function patch(id, body) {
   // Nie werfen: ein transienter Netzfehler (EPIPE) hat am 01.08. den ganzen Worker gekillt
@@ -46,7 +55,7 @@ function run(args, env, label, deadlineMs) {
 }
 
 const list = await queuedJobs();
-if (!list.length) { console.log('Queue leer — nichts zu tun.'); process.exit(0); }
+if (!list.length) { console.log('Queue leer — nichts zu tun.'); await cycleDone(); process.exit(0); }
 
 // Daemon-Modus (SIDE_MIN_GAP_H gesetzt): Meta/Ads nur, wenn der letzte Lauf laenger her ist —
 // sie fraßen sonst jeden 60-Min-Zyklus ~25+ Min (14 Kunden), waehrend SQP-Jobs warteten.
@@ -177,9 +186,5 @@ if (leftMin() > 10 && sideDue('/tmp/sqpr-ads-last')) {
   spawnSync('node', ['ads-periodic.mjs', '4'], { stdio: 'inherit', env: process.env, timeout: Math.round(Math.max(60000, leftMin() * 60000)), killSignal: 'SIGTERM' });
   sideDone('/tmp/sqpr-ads-last');
 } else if (SIDE_GAP_MS) console.log('Ads-Block: zuletzt vor <' + process.env.SIDE_MIN_GAP_H + 'h — übersprungen.');
-// Zyklus-Signal für den Wächter: der Daemon-Heartbeat (id=1) läuft auch, wenn jeder
-// Zyklus crasht — id=2 beweist, dass Zyklen wirklich zu Ende laufen
-try {
-  await fetch(`${U}/rest/v1/worker_heartbeat?on_conflict=id`, { method: 'POST', headers: { ...H, Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ id: 2, host: 'zyklus-fertig', ts: new Date().toISOString() }) });
-} catch (e) {}
+await cycleDone();
 console.log('\nWorker fertig.');
