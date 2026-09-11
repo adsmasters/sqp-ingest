@@ -9,6 +9,13 @@ const ADS = 'https://advertising-api-eu.amazon.com';
 const sbHead = { apikey: KEY, Authorization: 'Bearer ' + KEY };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const iso = d => d.toISOString().slice(0, 10);
+// fetch mit Retry + hartem 90s-Timeout gegen haengende Sockets (siehe audit-refresh.mjs, 10.-12.08.)
+async function rfetch(url, opts = {}, tries = 4) {
+  for (let i = 0; i < tries; i++) {
+    try { return await fetch(url, { ...opts, signal: AbortSignal.timeout(90000) }); }
+    catch (e) { if (i === tries - 1) throw e; await sleep(8000 * (i + 1)); }
+  }
+}
 const DAYS = 30; // Ads-Report max 31 Tage
 const end = new Date(Date.now() - 864e5), start = new Date(Date.now() - DAYS * 864e5);
 
@@ -23,10 +30,23 @@ function H(profile) { return { 'Amazon-Advertising-API-ClientId': CID, 'Amazon-A
 async function pull(profile, reportTypeId, columns) {
   const body = { name: `${reportTypeId} ${Date.now()}`, startDate: iso(start), endDate: iso(end), configuration: { adProduct: 'SPONSORED_PRODUCTS', groupBy: reportTypeId === 'spAdvertisedProduct' ? ['advertiser'] : ['searchTerm'], columns, reportTypeId, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } };
   let cj;
-  for (let a = 0; a < 6; a++) { await freshAuth(); const c = await fetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) }); if (c.status === 429) { await sleep(30000); continue; } cj = await c.json(); if (!cj.reportId) throw new Error(reportTypeId + ' create: ' + JSON.stringify(cj).slice(0, 200)); break; }
-  let url = null; for (let i = 0; i < 90; i++) { await sleep(8000); await freshAuth(); const g = await fetch(`${ADS}/reporting/reports/${cj.reportId}`, { headers: H(profile) }); const gj = await g.json(); if (gj.status === 'COMPLETED') { url = gj.url; break; } if (gj.status === 'FAILURE') throw new Error(reportTypeId + ' FAILURE'); }
-  if (!url) throw new Error(reportTypeId + ' timeout');
-  const raw = await fetch(url); let buf = Buffer.from(await raw.arrayBuffer());
+  for (let a = 0; a < 6; a++) { await freshAuth(); const c = await rfetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) }); if (c.status === 429) { await sleep(30000); continue; } cj = await c.json(); if (!cj.reportId) throw new Error(reportTypeId + ' create: ' + JSON.stringify(cj).slice(0, 200)); break; }
+  // Instrumentiert 11.09.: jeder Client scheiterte am selben "timeout" — ob echtes
+  // Amazon-Warten oder stille 429-Drosselung war aus dem alten Log nicht zu unterscheiden.
+  // Jetzt: HTTP-429 auf dem Status-Poll wird gezaehlt statt als "pending" missgedeutet,
+  // und der Poll-Status wird periodisch mitgeloggt.
+  let url = null, rateLimited = 0;
+  for (let i = 0; i < 90; i++) {
+    await sleep(8000); await freshAuth();
+    const g = await rfetch(`${ADS}/reporting/reports/${cj.reportId}`, { headers: H(profile) });
+    if (g.status === 429) { rateLimited++; await sleep(10000); continue; }
+    const gj = await g.json();
+    if (gj.status === 'COMPLETED') { url = gj.url; break; }
+    if (gj.status === 'FAILURE') throw new Error(reportTypeId + ' FAILURE');
+    if (i % 10 === 0) console.log(`    ${reportTypeId}: Poll ${i + 1}/90, Status ${gj.status || ('HTTP ' + g.status)}, ${Math.round((i + 1) * 8)}s vergangen`);
+  }
+  if (!url) throw new Error(`${reportTypeId} timeout (${rateLimited} von 90 Polls waren HTTP 429)`);
+  const raw = await rfetch(url); let buf = Buffer.from(await raw.arrayBuffer());
   if (buf.length > 200 * 1024 * 1024) throw new Error(`${reportTypeId} Report zu gross (${Math.round(buf.length / 1048576)} MB komprimiert)`); // OOM-Schutz (Pixxprint)
   buf = zlib.gunzipSync(buf);
   if (buf.length > 800 * 1024 * 1024) throw new Error(`${reportTypeId} Report zu gross (${Math.round(buf.length / 1048576)} MB)`);
@@ -67,7 +87,10 @@ async function main() {
   if (!CID || !SEC || !RT) { console.log('Ads-Secrets fehlen (ADS_CLIENT_ID/SECRET/REFRESH_TOKEN) — Ads-Refresh übersprungen.'); return; }
   await auth();
   const r = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&ads_profile_id=not.is.null&select=name,ads_profile_id`, { headers: sbHead });
-  const clients = await r.json();
+  let clients = await r.json();
+  // Gezielter Einzellauf zum Diagnostizieren (z.B. den 12-Min-Poll-Timeout pruefen),
+  // ohne 22 Kunden abzuwarten — gleiches Muster wie ads-periodic.mjs.
+  if (process.env.ADS_ONLY_PROFILE) clients = clients.filter(c => String(c.ads_profile_id) === String(process.env.ADS_ONLY_PROFILE));
   console.log(`Ads-Refresh: ${clients.length} Kunde(n), Zeitraum ${iso(start)}..${iso(end)}`);
   for (const c of clients) { console.log(`Kunde: ${c.name} (Profil ${c.ads_profile_id})`); try { await refreshProfile(c.ads_profile_id); } catch (e) { console.log('  FEHLER', e.message); } }
   console.log('ADS-REFRESH FERTIG.');

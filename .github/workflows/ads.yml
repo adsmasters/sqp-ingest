@@ -1,6 +1,11 @@
 name: Ads Refresh (PPC-Daten)
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      only_profile:
+        description: 'Nur dieses Ads-Profil (Diagnose/Einzeltest, leer = alle Kunden)'
+        required: false
+        default: ''
   schedule:
     - cron: '30 5 * * *'   # täglich 05:30 UTC — unabhängig vom SQP-Zeitbudget
                            # (im Backfill-Worker verhungerte der Ads-Block regelmäßig)
@@ -27,6 +32,7 @@ jobs:
           ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ADS_ONLY_PROFILE: ${{ github.event.inputs.only_profile }}
       - name: Ads-Historie (Monate + Wochen)
         if: always()
         run: node ads-periodic.mjs 2 3
@@ -36,6 +42,7 @@ jobs:
           ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ADS_ONLY_PROFILE: ${{ github.event.inputs.only_profile }}
 
   # Eigener Job statt Step: ein harter Job-Timeout-Kill (siehe oben) beendet den
   # laufenden Job SOFORT und fuehrt keine weiteren if:failure()/cancelled()-Steps
