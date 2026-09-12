@@ -9,6 +9,13 @@ on:
   schedule:
     - cron: '30 5 * * *'   # täglich 05:30 UTC — unabhängig vom SQP-Zeitbudget
                            # (im Backfill-Worker verhungerte der Ads-Block regelmäßig)
+concurrency:
+  group: sqp-ads-refresh   # nicht parallel zu sich selbst (verhindert nur zwei GitHub-
+                           # Actions-Läufe gegeneinander, z.B. manueller Trigger + Schedule
+                           # überlappend — schützt NICHT vor dem Hetzner-Daemon, der
+                           # ads-refresh/ads-periodic unabhängig alle 6h ausserhalb von
+                           # GitHub Actions anstößt; dafür sind die Upserts in den beiden
+                           # Skripten selbst die eigentliche Absicherung, 11.09.)
 
 jobs:
   ads:

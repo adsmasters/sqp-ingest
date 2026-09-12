@@ -53,7 +53,12 @@ async function pull(profile, reportTypeId, columns, startDate, endDate, versuch 
   if (buf.length > 800 * 1024 * 1024) throw new Error(`${reportTypeId} Report zu gross (${Math.round(buf.length / 1048576)} MB)`);
   return JSON.parse(buf.toString('utf8'));
 }
-async function upsert(rows) { let ins = 0; for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_terms_periodic`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  INSERT', r.status, (await r.text()).slice(0, 150)); break; } } return ins; }
+// Echter Upsert statt Plain-INSERT (11.09.): der Hetzner-Daemon stoesst ads-periodic.mjs
+// unabhaengig alle 6h nochmal an — kollidiert der mit einem GitHub-Actions-Lauf auf
+// derselben (profile_id, asin, period_type, period_start, search_term), gab es bisher
+// 409 und die betroffene Periode blieb bei 0 Zeilen (Warnick's/BIOZOYG, wiederholt
+// beobachtet). on_conflict macht die Kollision zu einem harmlosen Merge.
+async function upsert(rows) { let ins = 0; for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_terms_periodic?on_conflict=profile_id,asin,period_type,period_start,search_term`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  INSERT', r.status, (await r.text()).slice(0, 150)); break; } } return ins; }
 
 async function hasPeriod(profile, type, start, table = 'ads_asin_terms_periodic') {
   const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&period_type=eq.${type}&period_start=eq.${start}&select=${table.includes('totals') ? 'asin' : 'id'}`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });

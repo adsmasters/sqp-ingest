@@ -92,9 +92,14 @@ async function writeClient(cl, advRows, stRows) {
   const rows = [...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2) }));
   await fetch(`${U}/rest/v1/ads_asin_terms?profile_id=eq.${cl.ads_profile_id}`, { method: 'DELETE', headers: sbHead });
   let ins = 0;
+  // Upsert statt Plain-INSERT (11.09.): der Hetzner-Daemon (backfill-worker.mjs) stoesst
+  // ads-refresh.mjs unabhaengig alle 6h nochmal an — kollidiert der mit diesem Lauf auf
+  // demselben Kunden, gab es bisher 409 auf (profile_id, asin, search_term) und der
+  // betroffene Kunde bekam 0 Zeilen geschrieben (Diagnose 12.09., Warnick's/Zauber der
+  // Gewürze/BIOZOYG). on_conflict macht die Kollision zu einem harmlosen Merge.
   for (let i = 0; i < rows.length; i += 1000) {
     const chunk = rows.slice(i, i + 1000);
-    const r = await fetch(`${U}/rest/v1/ads_asin_terms`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) });
+    const r = await fetch(`${U}/rest/v1/ads_asin_terms?on_conflict=profile_id,asin,search_term`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) });
     if (r.ok) ins += chunk.length; else { console.log('  INSERT', r.status, (await r.text()).slice(0, 150)); break; }
   }
   console.log(`${cl.name}: ${advRows.length} adv / ${stRows.length} terms / ${agToAsins.size} adGroups -> ${ins} (ASIN×Begriff) geschrieben.`);
