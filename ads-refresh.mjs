@@ -149,7 +149,16 @@ async function main() {
         const g = await rfetch(`${ADS}/reporting/reports/${job.reportId}`, { headers: H(job.cl.ads_profile_id) });
         if (g.status === 429) { rateLimited++; await sleep(10000); continue; }
         const gj = await g.json();
-        if (gj.status === 'COMPLETED') { job.rows = await downloadReport(gj.url); job.state = 'fertig'; await writeIfReady(job.cl); }
+        if (gj.status === 'COMPLETED') {
+          // Download/Entpacken NICHT im aeusseren catch (das wuerde einen dauerhaft zu
+          // grossen Report — OOM-Schutz oben — jede Sweep-Runde bis zum Budget-Ende neu
+          // herunterladen und entpacken lassen, statt einmal aufzugeben). Ein Report, den
+          // Amazon als COMPLETED meldet, wird nicht durch Warten kleiner — hier ist jeder
+          // Fehler endgueltig fuer diesen Job.
+          try { job.rows = await downloadReport(gj.url); job.state = 'fertig'; }
+          catch (e) { job.state = 'fehler'; console.log(`${job.cl.name} ${job.rt.key}: Download-FEHLER ${e.message}`); }
+          await writeIfReady(job.cl);
+        }
         else if (gj.status === 'FAILURE') { job.state = 'fehler'; console.log(`${job.cl.name} ${job.rt.key}: Report FAILURE`); await writeIfReady(job.cl); }
       } catch (e) { console.log(`${job.cl.name} ${job.rt.key}: ${e.message} (wird erneut versucht)`); } // job bleibt 'wartet' -> naechster Sweep probiert erneut
       await sleep(700);
