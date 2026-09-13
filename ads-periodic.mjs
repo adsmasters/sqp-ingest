@@ -83,6 +83,196 @@ async function pullTotals(profile, type, p) {
   return ins;
 }
 
+// ============================================================================
+// Zwei-Phasen-Nachzug fuer den NORMALEN (nicht-TOTALS_ONLY) Lauf (13.09.).
+// Der alte Kunde-fuer-Kunde-Ablauf brauchte bis zu 10 sequenzielle Amazon-
+// Report-Wartezeiten PRO KUNDE (2 Monate + 3 Wochen x bis zu 2 Reports) und lief
+// damit ~5h, obwohl ads-refresh.mjs (gleiches Zwei-Phasen-Muster, 11.09.) laengst
+// auf ~15 Min runter war — naeherte sich erneut der 355-Min-Job-Grenze. Gleiches
+// Prinzip wie dort: ALLE Reports zuerst anfordern, dann gesammelt abholen.
+//
+// Eigene create/download-Helfer statt pull()/pullTotals() oben, damit der
+// TOTALS_ONLY-Nachzugmodus (eigener, bereits funktionierender CONC-Pool) davon
+// unberuehrt bleibt — der ist nicht das Problem und wird nicht angefasst.
+async function rfetch(url, opts = {}, tries = 4) {
+  for (let i = 0; i < tries; i++) {
+    try { return await fetch(url, { ...opts, signal: AbortSignal.timeout(90000) }); }
+    catch (e) { if (i === tries - 1) throw e; await sleep(8000 * (i + 1)); }
+  }
+}
+async function createReport(profile, reportTypeId, columns, startDate, endDate) {
+  for (let a = 0; a < 6; a++) {
+    await freshAuth();
+    const body = { name: `${reportTypeId} ${startDate}`, startDate, endDate, configuration: { adProduct: 'SPONSORED_PRODUCTS', groupBy: reportTypeId === 'spAdvertisedProduct' ? ['advertiser'] : ['searchTerm'], columns, reportTypeId, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } };
+    const c = await rfetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) });
+    if (c.status === 429) { await sleep(30000); continue; }
+    const j = await c.json();
+    if (c.status === 425) { const id = String(j.detail || '').split(':').pop().trim(); if (id) return { reportId: id }; await sleep(25000); continue; }
+    if (c.status === 400) { const m = String(j.detail || '').match(/data retention start date \((\d{4}-\d{2}-\d{2})\)/); if (m && m[1] > startDate) { startDate = m[1]; if (startDate > endDate) return { empty: true }; continue; } }
+    if (!j.reportId) throw new Error(`${reportTypeId} create ${c.status}: ${JSON.stringify(j).slice(0, 160)}`);
+    return { reportId: j.reportId };
+  }
+  throw new Error(`${reportTypeId} create: zu viele Versuche`);
+}
+async function downloadReport(url) {
+  const raw = await rfetch(url); let buf = Buffer.from(await raw.arrayBuffer());
+  if (buf.length > 200 * 1024 * 1024) throw new Error(`Report zu gross (${Math.round(buf.length / 1048576)} MB komprimiert)`);
+  buf = zlib.gunzipSync(buf);
+  if (buf.length > 800 * 1024 * 1024) throw new Error(`Report zu gross (${Math.round(buf.length / 1048576)} MB)`);
+  return JSON.parse(buf.toString('utf8'));
+}
+function jobLabel(job) {
+  if (job.type === 'sharedAdv') return 'gemeinsamer Anzeigengruppen-Report';
+  return job.periodType === 'WEEK' ? `Woche ${job.period.start}` : job.period.start;
+}
+function buildAgToAsins(rows) {
+  const agToAsins = new Map();
+  for (const r of rows) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Map()); const m = agToAsins.get(k); m.set(r.advertisedAsin, (m.get(r.advertisedAsin) || 0) + 1000 * (+r.clicks || 0) + (+r.impressions || 0) + 1); }
+  return agToAsins;
+}
+async function finalizeTotals(job) {
+  const { cl, periodType, period } = job;
+  const profile = String(cl.ads_profile_id);
+  const agg = new Map();
+  for (const r of job.rows) { const a = r.advertisedAsin; if (!a) continue; let e = agg.get(a); if (!e) { e = { profile_id: profile, asin: a, period_type: periodType, period_start: period.start, impressions: 0, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(a, e); } e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; }
+  await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&period_type=eq.${periodType}&period_start=eq.${period.start}`, { method: 'DELETE', headers: sbHead });
+  const rows = [...agg.values()]; let ins = 0;
+  for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS INSERT', r.status, (await r.text()).slice(0, 150)); break; } }
+  console.log(`${cl.name} ${jobLabel(job)}: ${ins} ASIN-Totale`);
+}
+
+// Baut die vollstaendige Aufgabenliste (Kunde x Periode x Report-Art), fordert
+// alles an, holt gesammelt ab und schreibt jeden Job, sobald SEINE Abhaengig-
+// keiten bereit sind — ein Terms-Job braucht zusaetzlich den gemeinsamen
+// Anzeigengruppen-Report desselben Kunden (siehe finalizeSearchTerm).
+async function runNormalPeriodicPass(clients, ms, allWeeks) {
+  const newestMonthStart = ms.map(x => x.start).sort().slice(-1)[0];
+  const finalCutoff = iso(new Date(Date.now() - 8 * 864e5));
+  const jobs = [];
+  const sharedByClient = new Map();
+
+  for (const cl of clients) {
+    const profile = String(cl.ads_profile_id);
+    const need = [];
+    for (const m of ms) {
+      const isNewest = m.start >= newestMonthStart;
+      const needTerms = isNewest || !(await hasMonth(profile, m.start));
+      const needTotals = isNewest || !(await hasPeriod(profile, 'MONTH', m.start, 'ads_asin_totals_periodic'));
+      if (!needTerms && !needTotals) { console.log(`${cl.name} ${m.start}: schon da`); continue; }
+      need.push({ periodType: 'MONTH', period: m, needTerms, needTotals });
+    }
+    for (const w of allWeeks) {
+      const final = w.end < finalCutoff;
+      const needTerms = !final || !(await hasPeriod(profile, 'WEEK', w.start));
+      const needTotals = !final || !(await hasPeriod(profile, 'WEEK', w.start, 'ads_asin_totals_periodic'));
+      if (!needTerms && !needTotals) { console.log(`${cl.name} Woche ${w.start}: schon da`); continue; }
+      need.push({ periodType: 'WEEK', period: w, needTerms, needTotals });
+    }
+    if (!need.length) continue;
+
+    let sharedJob = null;
+    if (need.some(n => n.needTerms)) {
+      sharedJob = { type: 'sharedAdv', cl, state: 'neu' };
+      jobs.push(sharedJob);
+      sharedByClient.set(cl, sharedJob);
+    }
+    for (const n of need) {
+      if (n.needTotals) jobs.push({ type: 'totalsAdv', cl, periodType: n.periodType, period: n.period, state: 'neu' });
+      if (n.needTerms) jobs.push({ type: 'searchTerm', cl, periodType: n.periodType, period: n.period, state: 'neu', written: false });
+    }
+  }
+
+  if (!jobs.length) { console.log('Nichts zu tun — alle Perioden schon da.'); return; }
+  console.log(`${jobs.length} Report(s) werden angefordert…`);
+
+  async function finalizeSearchTerm(job) {
+    if (job.written) return;
+    const shared = sharedByClient.get(job.cl);
+    if (!shared || shared.state !== 'fertig') return; // noch nicht bereit — wird von finalizeSharedAdv nachgeholt
+    job.written = true;
+    const { cl, periodType, period, rows: st } = job;
+    const profile = String(cl.ads_profile_id);
+    if (!st.length) { console.log(`${cl.name} ${jobLabel(job)}: keine Ads-Daten`); return; }
+    const agToAsins = shared.agToAsins;
+    const agg = new Map();
+    for (const r of st) {
+      const wmap = agToAsins.get(String(r.adGroupId)); if (!wmap) continue;
+      const term = norm(r.searchTerm); if (!term) continue;
+      const wtot = [...wmap.values()].reduce((s, x) => s + x, 0) || 1;
+      for (const [asin, w] of wmap) {
+        const sh = w / wtot;
+        const k = asin + '||' + term; let e = agg.get(k);
+        if (!e) { e = { profile_id: profile, asin, period_type: periodType, period_start: period.start, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); }
+        e.clicks += (+r.clicks || 0) * sh; e.cost += (+r.cost || 0) * sh; e.purchases7d += (+r.purchases7d || 0) * sh; e.sales7d += (+r.sales7d || 0) * sh;
+      }
+    }
+    await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.${periodType}&period_start=eq.${period.start}`, { method: 'DELETE', headers: sbHead });
+    const n = await upsert([...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2) })));
+    console.log(`${cl.name} ${jobLabel(job)}: ${st.length} Terms -> ${n} Zeilen`);
+  }
+  async function finalizeSharedAdv(job) {
+    job.agToAsins = buildAgToAsins(job.rows);
+    console.log(`${job.cl.name}: ${job.agToAsins.size} Anzeigengruppen`);
+    // Terms-Jobs desselben Kunden, die schon auf ihre eigenen Daten gewartet
+    // haben, koennen jetzt sofort geschrieben werden.
+    for (const j of jobs) if (j.type === 'searchTerm' && j.cl === job.cl && j.state === 'fertig') await finalizeSearchTerm(j);
+  }
+  async function finalize(job) {
+    if (job.type === 'totalsAdv') return finalizeTotals(job);
+    if (job.type === 'sharedAdv') return finalizeSharedAdv(job);
+    return finalizeSearchTerm(job);
+  }
+
+  // Phase 1: ALLE Reports anfordern — Amazon generiert sie parallel im Hintergrund.
+  for (const job of jobs) {
+    try {
+      let reportTypeId, columns, sd, ed;
+      if (job.type === 'sharedAdv') { reportTypeId = 'spAdvertisedProduct'; columns = ['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks']; sd = iso(new Date(Date.now() - 30 * 864e5)); ed = iso(new Date(Date.now() - 864e5)); }
+      else if (job.type === 'totalsAdv') { reportTypeId = 'spAdvertisedProduct'; columns = ['advertisedAsin', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d']; sd = job.period.start; ed = job.period.end; }
+      else { reportTypeId = 'spSearchTerm'; columns = ['searchTerm', 'adGroupId', 'clicks', 'cost', 'purchases7d', 'sales7d']; sd = job.period.start; ed = job.period.end; }
+      const r = await createReport(job.cl.ads_profile_id, reportTypeId, columns, sd, ed);
+      if (r.empty) { job.state = 'fertig'; job.rows = []; } // ausserhalb Amazons Datenaufbewahrung
+      else { job.reportId = r.reportId; job.state = 'wartet'; }
+    } catch (e) { job.state = 'fehler'; console.log(`${job.cl.name} ${jobLabel(job)}: ${e.message}`); }
+    await sleep(400); // Amazon-Create-Kontingent schonen
+  }
+  for (const job of jobs) if (job.state === 'fertig') await finalize(job); // sofort-leer-Jobs verarbeiten
+
+  // Phase 2: gesammelt abholen. Wall-Clock-Budget statt Poll-Deckel je Report,
+  // damit der gesamte Job innerhalb der 355-Min-Grenze bleibt.
+  const BUDGET_MIN = +(process.env.ADS_PERIODIC_BUDGET_MIN || 200);
+  const deadline = Date.now() + BUDGET_MIN * 60000;
+  let rateLimited = 0;
+  while (jobs.some(j => j.state === 'wartet') && Date.now() < deadline) {
+    await freshAuth();
+    for (const job of jobs.filter(j => j.state === 'wartet')) {
+      try {
+        const g = await rfetch(`${ADS}/reporting/reports/${job.reportId}`, { headers: H(job.cl.ads_profile_id) });
+        if (g.status === 429) { rateLimited++; await sleep(10000); continue; }
+        const gj = await g.json();
+        if (gj.status === 'COMPLETED') {
+          try { job.rows = await downloadReport(gj.url); job.state = 'fertig'; }
+          catch (e) { job.state = 'fehler'; console.log(`${job.cl.name} ${jobLabel(job)}: Download-FEHLER ${e.message}`); }
+          if (job.state === 'fertig') await finalize(job);
+        } else if (gj.status === 'FAILURE') { job.state = 'fehler'; console.log(`${job.cl.name} ${jobLabel(job)}: Report FAILURE`); }
+      } catch (e) { console.log(`${job.cl.name} ${jobLabel(job)}: ${e.message} (wird erneut versucht)`); }
+      await sleep(700);
+    }
+    if (jobs.some(j => j.state === 'wartet')) await sleep(15000);
+  }
+  for (const job of jobs.filter(j => j.state === 'wartet')) { job.state = 'fehler'; console.log(`${job.cl.name} ${jobLabel(job)}: Budget erreicht (${BUDGET_MIN} Min) — noch nicht fertig`); }
+
+  for (const job of jobs) {
+    if (job.type === 'totalsAdv' && job.state === 'fehler') console.log(`${job.cl.name} ${jobLabel(job)}: ASIN-Totale übersprungen — alte Werte bleiben stehen.`);
+    if (job.type === 'searchTerm' && !job.written) {
+      const shared = sharedByClient.get(job.cl);
+      const reason = job.state === 'fehler' ? 'Report fehlgeschlagen' : (shared && shared.state === 'fehler' ? 'gemeinsamer Anzeigengruppen-Report fehlgeschlagen' : 'unbekannt');
+      console.log(`${job.cl.name} ${jobLabel(job)}: Terms übersprungen (${reason}) — alte Zeilen bleiben stehen.`);
+    }
+  }
+  console.log(`(${rateLimited} Polls ueber den ganzen Lauf waren HTTP 429)`);
+}
+
 async function main() {
   await auth();
   const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&ads_profile_id=not.is.null&select=name,ads_profile_id`, { headers: sbHead });
@@ -134,59 +324,7 @@ async function main() {
     console.log(`\nTOTALS-NACHZUG FERTIG: ${ok} Perioden neu geladen.`);
     return;
   }
-  for (const cl of clients) {
-    const profile = String(cl.ads_profile_id);
-    console.log(`Kunde: ${cl.name} (Profil ${profile})`);
-    let agToAsins;
-    for (const m of ms) {
-      try {
-        // Vergangene Monate überspringen, wenn schon vorhanden (aktueller/letzter Monat wird aktualisiert)
-        const isNewest = m.start >= ms.map(x => x.start).sort().slice(-1)[0]; // Reihenfolge kann umgedreht sein
-        const needTerms = !TOTALS_ONLY && (isNewest || !(await hasMonth(profile, m.start)));
-        const needTotals = isNewest || !(await hasPeriod(profile, 'MONTH', m.start, 'ads_asin_totals_periodic'));
-        if (!needTerms && !needTotals) { console.log(`  ${m.start}: schon da`); continue; }
-        if (needTotals) { try { const n = await pullTotals(profile, 'MONTH', m); console.log(`  ${m.start}: ${n} ASIN-Totale`); } catch (e) { console.log(`  ${m.start}: TOTALS-FEHLER ${e.message} -> weiter`); } }
-        if (!needTerms) continue;
-        if (!agToAsins) {
-          // Gewicht je ASIN in der Anzeigengruppe (Klicks, dahinter Impressionen) — Vollkopie
-          // auf jede ASIN überzählte Spend um Faktor N; gewichtete Aufteilung hält die Summen (12.08.)
-          const adv = await pull(profile, 'spAdvertisedProduct', ['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks'], iso(new Date(Date.now() - 30 * 864e5)), iso(new Date(Date.now() - 864e5)));
-          agToAsins = new Map(); for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Map()); const mm = agToAsins.get(k); mm.set(r.advertisedAsin, (mm.get(r.advertisedAsin) || 0) + 1000 * (+r.clicks || 0) + (+r.impressions || 0) + 1); }
-          console.log(`  ${agToAsins.size} Anzeigengruppen`);
-        }
-        const st = await pull(profile, 'spSearchTerm', ['searchTerm', 'adGroupId', 'clicks', 'cost', 'purchases7d', 'sales7d'], m.start, m.end);
-        if (!st.length) { console.log(`  ${m.start}: keine Ads-Daten`); continue; }
-        const agg = new Map();
-        for (const r of st) { const wmap = agToAsins.get(String(r.adGroupId)); if (!wmap) continue; const term = norm(r.searchTerm); if (!term) continue; const wtot = [...wmap.values()].reduce((s, x) => s + x, 0) || 1; for (const [asin, w] of wmap) { const sh = w / wtot; const k = asin + '||' + term; let e = agg.get(k); if (!e) { e = { profile_id: profile, asin, period_type: 'MONTH', period_start: m.start, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); } e.clicks += (+r.clicks || 0) * sh; e.cost += (+r.cost || 0) * sh; e.purchases7d += (+r.purchases7d || 0) * sh; e.sales7d += (+r.sales7d || 0) * sh; } }
-        await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.MONTH&period_start=eq.${m.start}`, { method: 'DELETE', headers: sbHead });
-        const n = await upsert([...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2) })));
-        console.log(`  ${m.start}: ${st.length} Terms -> ${n} Zeilen`);
-      } catch (e) { console.log(`  ${m.start}: FEHLER ${e.message} -> weiter`); }
-    }
-    // Letzte N Wochen: echte Ad-Werte je Woche (statt 30-Tage-Näherung in der Wochenansicht).
-    // Wochen, die vor >8 Tagen endeten, sind final (7-Tage-Attribution) -> überspringen wenn vorhanden.
-    for (const w of weeksList(NW)) {
-      try {
-        const final = w.end < iso(new Date(Date.now() - 8 * 864e5));
-        const needTerms = !TOTALS_ONLY && (!final || !(await hasPeriod(profile, 'WEEK', w.start)));
-        const needTotals = !final || !(await hasPeriod(profile, 'WEEK', w.start, 'ads_asin_totals_periodic'));
-        if (!needTerms && !needTotals) { console.log(`  Woche ${w.start}: schon da`); continue; }
-        if (needTotals) { try { const n = await pullTotals(profile, 'WEEK', w); console.log(`  Woche ${w.start}: ${n} ASIN-Totale`); } catch (e) { console.log(`  Woche ${w.start}: TOTALS-FEHLER ${e.message} -> weiter`); } }
-        if (!needTerms) continue;
-        if (!agToAsins) {
-          const adv = await pull(profile, 'spAdvertisedProduct', ['campaignId', 'adGroupId', 'advertisedAsin', 'impressions', 'clicks'], iso(new Date(Date.now() - 30 * 864e5)), iso(new Date(Date.now() - 864e5)));
-          agToAsins = new Map(); for (const r of adv) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Map()); const mm = agToAsins.get(k); mm.set(r.advertisedAsin, (mm.get(r.advertisedAsin) || 0) + 1000 * (+r.clicks || 0) + (+r.impressions || 0) + 1); }
-        }
-        const st = await pull(profile, 'spSearchTerm', ['searchTerm', 'adGroupId', 'clicks', 'cost', 'purchases7d', 'sales7d'], w.start, w.end);
-        if (!st.length) { console.log(`  Woche ${w.start}: keine Ads-Daten`); continue; }
-        const agg = new Map();
-        for (const r of st) { const wmap = agToAsins.get(String(r.adGroupId)); if (!wmap) continue; const term = norm(r.searchTerm); if (!term) continue; const wtot = [...wmap.values()].reduce((s, x) => s + x, 0) || 1; for (const [asin, wg] of wmap) { const sh = wg / wtot; const k = asin + '||' + term; let e = agg.get(k); if (!e) { e = { profile_id: profile, asin, period_type: 'WEEK', period_start: w.start, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); } e.clicks += (+r.clicks || 0) * sh; e.cost += (+r.cost || 0) * sh; e.purchases7d += (+r.purchases7d || 0) * sh; e.sales7d += (+r.sales7d || 0) * sh; } }
-        await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.WEEK&period_start=eq.${w.start}`, { method: 'DELETE', headers: sbHead });
-        const n = await upsert([...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2) })));
-        console.log(`  Woche ${w.start}: ${st.length} Terms -> ${n} Zeilen`);
-      } catch (e) { console.log(`  Woche ${w.start}: FEHLER ${e.message} -> weiter`); }
-    }
-  }
+  await runNormalPeriodicPass(clients, ms, weeksList(NW));
   console.log('FERTIG.');
 }
 main().catch(e => { console.error('FEHLER', e.message); process.exit(1); });
