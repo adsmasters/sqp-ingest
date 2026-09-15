@@ -209,7 +209,10 @@ async function purgeExcludedAsins(cl, excluded) {
       for (const table of ['ads_asin_terms_periodic', 'ads_asin_totals_periodic']) {
         try {
           const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&asin=in.(${inList})&select=asin`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });
-          const n = +((r.headers.get('content-range') || '0/0').split('/')[1]) || 0;
+          if (!r.ok) { console.log(`${cl.name}: [DRY RUN] ${table} — Zaehlung HTTP ${r.status} (Batch ${i / 100 + 1}) — ${(await r.text()).slice(0, 150)}`); continue; }
+          const cr = r.headers.get('content-range');
+          if (!cr) { console.log(`${cl.name}: [DRY RUN] ${table} — kein content-range-Header (Batch ${i / 100 + 1}) — Zahl unten ist NICHT verlaesslich.`); continue; }
+          const n = +(cr.split('/')[1]) || 0;
           console.log(`${cl.name}: [DRY RUN] ${table} — wuerde ${n} Zeilen loeschen (Batch ${i / 100 + 1}, ${batch.length} ASINs).`);
         } catch (e) { console.log(`${cl.name}: [DRY RUN] Zaehl-FEHLER (${table}) ${e.message}`); }
       }
