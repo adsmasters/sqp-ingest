@@ -73,10 +73,10 @@ async function hasAnyTotals(profile) {
 // Exakte Ad-Werte je ASIN & Periode aus dem Advertised-Product-Bericht -> ads_asin_totals_periodic.
 // Der Suchbegriffsbericht kennt keine ASIN: Anzeigengruppen mit mehreren ASINs bekamen ihren
 // KOMPLETTEN Spend auf jede ASIN dupliziert (ABACUS 5L/20L identisch, Stichprobe 12.08.).
-async function pullTotals(profile, type, p) {
+async function pullTotals(profile, type, p, topAsins = null) {
   const adv = await pull(profile, 'spAdvertisedProduct', ['advertisedAsin', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'], p.start, p.end);
   const agg = new Map();
-  for (const r of adv) { const a = r.advertisedAsin; if (!a) continue; let e = agg.get(a); if (!e) { e = { profile_id: profile, asin: a, period_type: type, period_start: p.start, impressions: 0, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(a, e); } e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; }
+  for (const r of adv) { const a = r.advertisedAsin; if (!a) continue; if (topAsins && !topAsins.has(normAsin(a))) continue; let e = agg.get(a); if (!e) { e = { profile_id: profile, asin: a, period_type: type, period_start: p.start, impressions: 0, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(a, e); } e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; }
   await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&period_type=eq.${type}&period_start=eq.${p.start}`, { method: 'DELETE', headers: sbHead });
   const rows = [...agg.values()]; let ins = 0;
   for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS INSERT', r.status, (await r.text()).slice(0, 150)); break; } }
@@ -130,15 +130,103 @@ function buildAgToAsins(rows) {
   for (const r of rows) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Map()); const m = agToAsins.get(k); m.set(r.advertisedAsin, (m.get(r.advertisedAsin) || 0) + 1000 * (+r.clicks || 0) + (+r.impressions || 0) + 1); }
   return agToAsins;
 }
-async function finalizeTotals(job) {
+async function finalizeTotals(job, topAsinsByClient) {
   const { cl, periodType, period } = job;
   const profile = String(cl.ads_profile_id);
+  const topAsins = topAsinsByClient.get(cl);
   const agg = new Map();
-  for (const r of job.rows) { const a = r.advertisedAsin; if (!a) continue; let e = agg.get(a); if (!e) { e = { profile_id: profile, asin: a, period_type: periodType, period_start: period.start, impressions: 0, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(a, e); } e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; }
+  for (const r of job.rows) { const a = r.advertisedAsin; if (!a) continue; if (topAsins && !topAsins.has(normAsin(a))) continue; let e = agg.get(a); if (!e) { e = { profile_id: profile, asin: a, period_type: periodType, period_start: period.start, impressions: 0, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(a, e); } e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; }
   await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&period_type=eq.${periodType}&period_start=eq.${period.start}`, { method: 'DELETE', headers: sbHead });
   const rows = [...agg.values()]; let ins = 0;
   for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS INSERT', r.status, (await r.text()).slice(0, 150)); break; } }
   console.log(`${cl.name} ${jobLabel(job)}: ${ins} ASIN-Totale`);
+}
+
+// ASIN-Deckel (13.09., Kundenwunsch): pro Kunde nur die Top-N ASINs nach ECHTEM
+// Produktumsatz (asin_sales_traffic, NICHT ad-attribuierter Umsatz — vom Kunden
+// explizit so gewuenscht) behalten. BIOZOYG allein (1500+ ASINs) macht ~77% der
+// Tabellengroesse aus; ein Top-100-Deckel reduziert seine Zeilen um ~92.6%
+// (validiert per SQL vor Implementierung). asin_sales_traffic ist ueber spid
+// verknuepft, nicht ueber ads_profile_id — daher cl.spid statt cl.ads_profile_id.
+//
+// Zwei Korrekturen nach Selbstpruefung (14.09.), bevor das je live lief:
+// 1) Paginierung: diese Supabase-Instanz deckelt unpaginierte Antworten auf 1000
+//    Zeilen (siehe ads-history.js/ads-totals.js) — Warnick's (4070 Zeilen) und
+//    BIOZOYG (1600 Zeilen) ueberschreiten das, waeren also still abgeschnitten
+//    und mit einer FALSCHEN Top-100 gelandet, ohne dass es aufgefallen waere.
+// 2) Markt-Filter: mehrere Kunden teilen sich EIN spid ueber mehrere Marktplatz-
+//    Zeilen (z.B. MGF-DE/FR/ES/IT, je 195 Zeilen — ueber dem Deckel-Schwellwert).
+//    Ohne marketplace-Filter bekaemen alle vier dieselbe, ueber alle vier Maerkte
+//    gemischte Rangliste — ein ASIN, das nur in FR gut verkauft, koennte so aus
+//    MGF-FRs Top-100 fallen, weil die anderen drei Maerkte es "verduennen".
+const normAsin = s => String(s || '').trim().toUpperCase();
+async function topAsinsFor(spid, marketplace, n = 100) {
+  try {
+    const mkt = (marketplace || 'DE').toUpperCase();
+    const url = `${U}/rest/v1/asin_sales_traffic?spid=eq.${spid}&marketplace=eq.${mkt}&select=asin,sales`;
+    const first = await fetch(url, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-999' } });
+    if (!first.ok) { console.log(`  ASIN-Deckel: asin_sales_traffic HTTP ${first.status} — kein Deckel fuer dieses spid/Markt (fail-open).`); return { top: null, excluded: [] }; }
+    const total = +((first.headers.get('content-range') || '0/0').split('/')[1]) || 0;
+    const rows = await first.json();
+    for (let f = 1000; f < total; f += 1000) {
+      const r = await fetch(url, { headers: { ...sbHead, Range: `${f}-${f + 999}` } });
+      if (r.ok) rows.push(...(await r.json()));
+    }
+    const bySales = new Map();
+    for (const row of rows) { const a = normAsin(row.asin); if (!a) continue; bySales.set(a, (bySales.get(a) || 0) + (+row.sales || 0)); }
+    if (bySales.size <= n) return { top: null, excluded: [] }; // schon <= n ASINs — Deckel waere ein No-Op
+    const ranked = [...bySales.entries()].sort((a, b) => b[1] - a[1]);
+    if (DECKEL_DRY_RUN) {
+      const top15 = ranked.slice(0, 15).map(([a, s]) => `${a} (${s.toFixed(2)})`).join(', ');
+      const boundary = ranked.slice(n - 3, n + 3).map(([a, s], idx) => `#${n - 3 + idx + 1} ${a} (${s.toFixed(2)})`).join(', ');
+      console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: Top-15 nach Umsatz: ${top15}`);
+      console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: Grenzbereich (#${n - 2}-#${n + 3}): ${boundary}`);
+    }
+    return { top: new Set(ranked.slice(0, n).map(([asin]) => asin)), excluded: ranked.slice(n).map(([asin]) => asin) };
+  } catch (e) { console.log(`  ASIN-Deckel: FEHLER ${e.message} — kein Deckel fuer dieses spid/Markt (fail-open).`); return { top: null, excluded: [] }; }
+}
+
+// Loescht bestehende Zeilen fuer ASINs ausserhalb der Top-100 — sowohl beim ersten
+// Lauf nach diesem Deploy (rueckwirkende Bereinigung, vom Kunden gewuenscht) als
+// auch laufend (ein ASIN, das aus den Top-100 faellt, wird beim naechsten Lauf
+// entfernt). In 100er-Batches per "asin=in.(...)" statt einzeln — bei BIOZOYGs
+// ~1500 auszuschliessenden ASINs waeren sonst tausende Einzel-DELETEs pro Lauf,
+// auch wenn laengst nichts mehr zu loeschen ist. profile_id bleibt der fuehrende,
+// indexierte Filter, die IN-Liste ist auf 100 Werte begrenzt.
+//
+// ASIN_DECKEL_DRY_RUN=1 (15.09., Test vor dem echten Deploy): fuehrt exakt dieselbe
+// profile_id+asin-Abfrage aus wie das echte DELETE, zaehlt aber nur (Prefer count=exact,
+// Range 0-0) statt zu loeschen — zeigt die echten Zeilenzahlen pro Tabelle und die
+// betroffenen ASINs, ohne dass auch nur eine Zeile angefasst wird.
+const DECKEL_DRY_RUN = /^(1|true|yes)$/i.test(process.env.ASIN_DECKEL_DRY_RUN || '');
+async function purgeExcludedAsins(cl, excluded) {
+  if (!excluded.length) return;
+  const profile = String(cl.ads_profile_id);
+  if (DECKEL_DRY_RUN) {
+    for (let i = 0; i < excluded.length; i += 100) {
+      const batch = excluded.slice(i, i + 100);
+      const inList = batch.join(',');
+      for (const table of ['ads_asin_terms_periodic', 'ads_asin_totals_periodic']) {
+        try {
+          const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&asin=in.(${inList})&select=asin`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });
+          const n = +((r.headers.get('content-range') || '0/0').split('/')[1]) || 0;
+          console.log(`${cl.name}: [DRY RUN] ${table} — wuerde ${n} Zeilen loeschen (Batch ${i / 100 + 1}, ${batch.length} ASINs).`);
+        } catch (e) { console.log(`${cl.name}: [DRY RUN] Zaehl-FEHLER (${table}) ${e.message}`); }
+      }
+    }
+    console.log(`${cl.name}: [DRY RUN] insgesamt ${excluded.length} ASINs ausserhalb Top-100 wuerden entfernt: ${excluded.slice(0, 15).join(', ')}${excluded.length > 15 ? ', ...' : ''}`);
+    return;
+  }
+  for (let i = 0; i < excluded.length; i += 100) {
+    const inList = excluded.slice(i, i + 100).join(',');
+    for (const table of ['ads_asin_terms_periodic', 'ads_asin_totals_periodic']) {
+      try {
+        const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&asin=in.(${inList})`, { method: 'DELETE', headers: sbHead });
+        if (!r.ok) console.log(`${cl.name}: ASIN-Deckel-DELETE (${table}) HTTP ${r.status}`);
+      } catch (e) { console.log(`${cl.name}: ASIN-Deckel-DELETE FEHLER (${table}) ${e.message}`); }
+    }
+  }
+  console.log(`${cl.name}: bis zu ${excluded.length} ASINs ausserhalb Top-100 (nach Produktumsatz) entfernt.`);
 }
 
 // Baut die vollstaendige Aufgabenliste (Kunde x Periode x Report-Art), fordert
@@ -150,9 +238,15 @@ async function runNormalPeriodicPass(clients, ms, allWeeks) {
   const finalCutoff = iso(new Date(Date.now() - 8 * 864e5));
   const jobs = [];
   const sharedByClient = new Map();
+  const topAsinsByClient = new Map();
 
   for (const cl of clients) {
     const profile = String(cl.ads_profile_id);
+    // ASIN-Deckel: Top-100-nach-Umsatz bestimmen und alles andere sofort entfernen,
+    // bevor ueberhaupt geplant wird, was neu zu holen ist.
+    const { top, excluded } = await topAsinsFor(cl.spid, cl.marketplace);
+    topAsinsByClient.set(cl, top);
+    await purgeExcludedAsins(cl, excluded);
     const need = [];
     for (const m of ms) {
       const isNewest = m.start >= newestMonthStart;
@@ -194,12 +288,14 @@ async function runNormalPeriodicPass(clients, ms, allWeeks) {
     const profile = String(cl.ads_profile_id);
     if (!st.length) { console.log(`${cl.name} ${jobLabel(job)}: keine Ads-Daten`); return; }
     const agToAsins = shared.agToAsins;
+    const topAsins = topAsinsByClient.get(cl);
     const agg = new Map();
     for (const r of st) {
       const wmap = agToAsins.get(String(r.adGroupId)); if (!wmap) continue;
       const term = norm(r.searchTerm); if (!term) continue;
       const wtot = [...wmap.values()].reduce((s, x) => s + x, 0) || 1;
       for (const [asin, w] of wmap) {
+        if (topAsins && !topAsins.has(normAsin(asin))) continue; // ASIN-Deckel
         const sh = w / wtot;
         const k = asin + '||' + term; let e = agg.get(k);
         if (!e) { e = { profile_id: profile, asin, period_type: periodType, period_start: period.start, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); }
@@ -218,7 +314,7 @@ async function runNormalPeriodicPass(clients, ms, allWeeks) {
     for (const j of jobs) if (j.type === 'searchTerm' && j.cl === job.cl && j.state === 'fertig') await finalizeSearchTerm(j);
   }
   async function finalize(job) {
-    if (job.type === 'totalsAdv') return finalizeTotals(job);
+    if (job.type === 'totalsAdv') return finalizeTotals(job, topAsinsByClient);
     if (job.type === 'sharedAdv') return finalizeSharedAdv(job);
     return finalizeSearchTerm(job);
   }
@@ -275,7 +371,7 @@ async function runNormalPeriodicPass(clients, ms, allWeeks) {
 
 async function main() {
   await auth();
-  const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&ads_profile_id=not.is.null&select=name,ads_profile_id`, { headers: sbHead });
+  const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&ads_profile_id=not.is.null&select=name,spid,ads_profile_id,marketplace`, { headers: sbHead });
   let clients = await cr.json();
   // Gezielter Einzellauf (z.B. Nachzug fuer einen Kunden): ADS_ONLY_PROFILE=<profile_id>
   if (process.env.ADS_ONLY_PROFILE) clients = clients.filter(c => String(c.ads_profile_id) === String(process.env.ADS_ONLY_PROFILE));
@@ -302,6 +398,12 @@ async function main() {
     // haetten die letzten Kunden stundenlang weiter falsche Werte gezeigt (12.08.).
     const wl = weeksList(NW).reverse(); // neueste Woche zuerst
     const perioden = [...ms.map(m => ({ type: 'MONTH', p: m })), ...wl.map(w => ({ type: 'WEEK', p: w }))];
+    // ASIN-Deckel gilt auch hier: einmal pro Kunde vorab bestimmen (nicht pro Task —
+    // ein Kunde hat hier bis zu NM+NW Tasks, die sich alle dieselbe Top-100-Menge teilen),
+    // sonst wuerde dieser Pfad Zeilen fuer ausgeschlossene ASINs zurueckschreiben, die
+    // der normale Lauf gerade erst entfernt hat.
+    const topAsinsByProfile = new Map();
+    for (const cl of clients) { const { top } = await topAsinsFor(cl.spid, cl.marketplace); topAsinsByProfile.set(String(cl.ads_profile_id), top); }
     const tasks = [];
     for (const per of perioden) {
       for (const cl of clients) tasks.push({ profile: String(cl.ads_profile_id), name: cl.name, type: per.type, p: per.p });
@@ -315,7 +417,7 @@ async function main() {
         const label = `${t.name} ${t.type} ${t.p.start}`;
         try {
           if (await hasPeriod(t.profile, t.type, t.p.start, 'ads_asin_totals_periodic')) { done++; console.log(`[${done}/${tasks.length}] ${label}: schon da`); continue; }
-          const n = await pullTotals(t.profile, t.type, t.p);
+          const n = await pullTotals(t.profile, t.type, t.p, topAsinsByProfile.get(t.profile));
           done++; ok++;
           console.log(`[${done}/${tasks.length}] ${label}: ${n} ASIN-Totale`);
         } catch (e) { done++; console.log(`[${done}/${tasks.length}] ${label}: FEHLER ${e.message}`); }
