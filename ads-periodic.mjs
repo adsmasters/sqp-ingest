@@ -208,12 +208,18 @@ async function purgeExcludedAsins(cl, excluded) {
       const inList = batch.join(',');
       for (const table of ['ads_asin_terms_periodic', 'ads_asin_totals_periodic']) {
         try {
-          const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&asin=in.(${inList})&select=asin`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });
+          // count=exact zwingt Postgres zu einem vollen Aggregat ueber alle Treffer und
+          // lief auf ads_asin_terms_periodic in 57014 (statement timeout) — EXPLAIN (ohne
+          // ANALYZE) auf denselben Filter zeigte dagegen einen guenstigen Index-Scan
+          // (ads_asin_terms_periodic_profile_id_asin_period_type_period__key, cost ~1963).
+          // count=planned liefert genau diese Planer-Schaetzung, ohne die Zeilen wirklich
+          // zu zaehlen — bleibt also guenstig, unabhaengig von der Tabellengroesse.
+          const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&asin=in.(${inList})&select=asin`, { headers: { ...sbHead, Prefer: 'count=planned', Range: '0-0' } });
           if (!r.ok) { console.log(`${cl.name}: [DRY RUN] ${table} — Zaehlung HTTP ${r.status} (Batch ${i / 100 + 1}) — ${(await r.text()).slice(0, 150)}`); continue; }
           const cr = r.headers.get('content-range');
           if (!cr) { console.log(`${cl.name}: [DRY RUN] ${table} — kein content-range-Header (Batch ${i / 100 + 1}) — Zahl unten ist NICHT verlaesslich.`); continue; }
           const n = +(cr.split('/')[1]) || 0;
-          console.log(`${cl.name}: [DRY RUN] ${table} — wuerde ${n} Zeilen loeschen (Batch ${i / 100 + 1}, ${batch.length} ASINs).`);
+          console.log(`${cl.name}: [DRY RUN] ${table} — wuerde ca. ${n} Zeilen loeschen (Planer-Schaetzung, Batch ${i / 100 + 1}, ${batch.length} ASINs).`);
         } catch (e) { console.log(`${cl.name}: [DRY RUN] Zaehl-FEHLER (${table}) ${e.message}`); }
       }
     }
