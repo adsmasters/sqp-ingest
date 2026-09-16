@@ -50,7 +50,12 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           ADS_ONLY_PROFILE: ${{ github.event.inputs.only_profile }}
       - name: Ads-Historie (Monate + Wochen)
-        if: always()
+        # Nur manuell, bis der ASIN-Deckel-Bug (57014 statement timeout beim Loeschen
+        # ausgeschlossener ASINs, seit 15.09. in Arbeit) sauber behoben ist — der
+        # taegliche Cron-Lauf wuerde sonst denselben Fehler unbeaufsichtigt fuer alle
+        # 22 Kunden wiederholen. ads-refresh.mjs (oben) ist davon nicht betroffen und
+        # laeuft weiter normal taeglich, damit die Ads-Daten nicht wieder veralten.
+        if: always() && github.event_name == 'workflow_dispatch'
         run: node ads-periodic.mjs 2 3
         env:
           ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
