@@ -170,7 +170,12 @@ async function topAsinsFor(spid, marketplace, n = 100) {
     const rows = await first.json();
     for (let f = 1000; f < total; f += 1000) {
       const r = await fetch(url, { headers: { ...sbHead, Range: `${f}-${f + 999}` } });
-      if (r.ok) rows.push(...(await r.json()));
+      // Frueher: fehlgeschlagene Folgeseite wurde still uebersprungen -> unvollstaendige
+      // Zeilen, dadurch faelschlich niedrig gerankte ASINs waeren geloescht worden, ohne
+      // dass irgendwo ein Fehler aufgetaucht waere. Jetzt: jede Seite muss gelingen, sonst
+      // kompletter Fail-Open (kein Deckel) statt einer auf falschen Daten basierenden Rangliste.
+      if (!r.ok) { console.log(`  ASIN-Deckel: asin_sales_traffic Seite ${f}-${f + 999} HTTP ${r.status} — kein Deckel fuer dieses spid/Markt (fail-open, unvollstaendige Daten waeren sonst falsch gerankt).`); return { top: null, excluded: [] }; }
+      rows.push(...(await r.json()));
     }
     const bySales = new Map();
     for (const row of rows) { const a = normAsin(row.asin); if (!a) continue; bySales.set(a, (bySales.get(a) || 0) + (+row.sales || 0)); }
