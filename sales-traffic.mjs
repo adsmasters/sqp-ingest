@@ -50,13 +50,16 @@ async function runClient(cl) {
   const agg = {};
   for (const r of (j.salesAndTrafficByAsin || [])) {
     const a = r.childAsin || r.parentAsin; if (!a) continue;
-    if (!agg[a]) agg[a] = { sales: 0, units: 0, sessions: 0 };
+    if (!agg[a]) agg[a] = { sales: 0, units: 0, sessions: 0, parentAsin: null };
     agg[a].sales += (r.salesByAsin && r.salesByAsin.orderedProductSales && r.salesByAsin.orderedProductSales.amount) || 0;
     agg[a].units += (r.salesByAsin && r.salesByAsin.unitsOrdered) || 0;
     agg[a].sessions += (r.trafficByAsin && r.trafficByAsin.sessions) || 0;
+    // parentAsin ist je Tages-Zeile identisch fuer dieselbe childAsin — einmal reicht,
+    // aber ueberschreiben ist harmlos (15.09., fuer Top-25-Parent-ASIN-Anforderung).
+    if (r.parentAsin) agg[a].parentAsin = r.parentAsin;
   }
   const mktCC = (cl.marketplace || 'DE').toUpperCase();
-  const rows = Object.entries(agg).map(([asin, v]) => ({ spid: cl.spid, asin, days: DAYS, marketplace: mktCC, sales: +v.sales.toFixed(2), units: v.units, sessions: v.sessions, updated_at: new Date().toISOString() }));
+  const rows = Object.entries(agg).map(([asin, v]) => ({ spid: cl.spid, asin, days: DAYS, marketplace: mktCC, sales: +v.sales.toFixed(2), units: v.units, sessions: v.sessions, parent_asin: v.parentAsin, updated_at: new Date().toISOString() }));
   for (let i = 0; i < rows.length; i += 500) {
     const up = await fetch(`${U}/rest/v1/asin_sales_traffic?on_conflict=spid,asin,days,marketplace`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows.slice(i, i + 500)) });
     if (!up.ok) { console.log(`  ${cl.name}: UPSERT ${up.status} ${(await up.text()).slice(0, 120)}`); return; }
@@ -66,7 +69,9 @@ async function runClient(cl) {
 
 async function main() {
   const cr = await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&spid=not.is.null&select=name,spid,marketplace`, { headers: sbHead });
-  const clients = await cr.json();
+  let clients = await cr.json();
+  // Gezielter Einzellauf (z.B. Backfill von parent_asin fuer einen Kunden): SALES_ONLY_SPID=<spid>
+  if (process.env.SALES_ONLY_SPID) clients = clients.filter(c => c.spid === process.env.SALES_ONLY_SPID);
   // Jeder (Seller × Marktplatz) einzeln (PK spid,asin,days,marketplace). Die Create-Quota
   // gilt JE Seller-Konto — verschiedene Seller laufen deshalb parallel (max 3), innerhalb
   // eines Sellers sequenziell mit Abstand. Rein sequenziell dauerte der Rundlauf länger

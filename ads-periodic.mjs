@@ -160,10 +160,47 @@ async function finalizeTotals(job, topAsinsByClient) {
 //    gemischte Rangliste — ein ASIN, das nur in FR gut verkauft, koennte so aus
 //    MGF-FRs Top-100 fallen, weil die anderen drei Maerkte es "verduennen".
 const normAsin = s => String(s || '').trim().toUpperCase();
-async function topAsinsFor(spid, marketplace, n = 100) {
+
+// Manuell gepinnte ASINs (15.09., Kundenwunsch: neue Produkteinfuehrungen sollen nicht
+// vom Deckel erfasst werden, obwohl sie anfangs kaum/keinen Umsatz haben). Eigene, kleine
+// Tabelle ads_asin_manual_keep(profile_id, asin) — muss per SQL im Supabase-Dashboard
+// angelegt werden (siehe Migration). Fail-open: existiert die Tabelle noch nicht oder
+// schlaegt die Abfrage fehl, einfach leere Menge -> Deckel-Logik unveraendert.
+async function manualKeepFor(profile) {
+  try {
+    const r = await fetch(`${U}/rest/v1/ads_asin_manual_keep?profile_id=eq.${profile}&select=asin`, { headers: sbHead });
+    if (!r.ok) return new Set();
+    const rows = await r.json();
+    return new Set(rows.map(x => normAsin(x.asin)));
+  } catch (e) { return new Set(); }
+}
+
+// ASIN-Deckel (13.09., Kundenwunsch, erweitert 15.09.): pro Kunde ASINs behalten, die
+// IRGENDEINES von drei Kriterien erfuellen (Union, nicht ersetzt):
+//   1) Top-100 nach ECHTEM Produktumsatz (asin_sales_traffic, nicht ad-attribuiert) —
+//      die urspruengliche Regel.
+//   2) Kind-ASINs der Top-25 PARENT-ASINs nach summiertem Umsatz ueber alle Kinder
+//      (neue Anforderung eines zweiten Tools) — ein Parent ohne eigene parent_asin-
+//      Zeile (kein Varianten-Produkt) ist sein eigener Parent (Self-Parent-Fallback).
+//   3) Manuell gepinnte ASINs (ads_asin_manual_keep) — z.B. neue Produkteinfuehrungen
+//      ohne nennenswerten Umsatz, die trotzdem nicht geloescht/ausgefiltert werden sollen.
+// asin_sales_traffic ist ueber spid verknuepft, nicht ueber ads_profile_id.
+//
+// Korrekturen nach Selbstpruefung (14./15.09.), bevor das je live lief:
+// 1) Paginierung: diese Supabase-Instanz deckelt unpaginierte Antworten auf 1000
+//    Zeilen (siehe ads-history.js/ads-totals.js) — Warnick's (4070 Zeilen) und
+//    BIOZOYG (1600 Zeilen) ueberschreiten das, waeren also still abgeschnitten
+//    und mit einer FALSCHEN Top-100 gelandet, ohne dass es aufgefallen waere.
+// 2) Markt-Filter: mehrere Kunden teilen sich EIN spid ueber mehrere Marktplatz-
+//    Zeilen (z.B. MGF-DE/FR/ES/IT, je 195 Zeilen — ueber dem Deckel-Schwellwert).
+//    Ohne marketplace-Filter bekaemen alle vier dieselbe, ueber alle vier Maerkte
+//    gemischte Rangliste — ein ASIN, das nur in FR gut verkauft, koennte so aus
+//    MGF-FRs Top-100 fallen, weil die anderen drei Maerkte es "verduennen".
+async function topAsinsFor(cl, n = 100, parentN = 25) {
+  const spid = cl.spid, marketplace = cl.marketplace, profile = String(cl.ads_profile_id);
   try {
     const mkt = (marketplace || 'DE').toUpperCase();
-    const url = `${U}/rest/v1/asin_sales_traffic?spid=eq.${spid}&marketplace=eq.${mkt}&select=asin,sales`;
+    const url = `${U}/rest/v1/asin_sales_traffic?spid=eq.${spid}&marketplace=eq.${mkt}&select=asin,sales,parent_asin`;
     const first = await fetch(url, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-999' } });
     if (!first.ok) { console.log(`  ASIN-Deckel: asin_sales_traffic HTTP ${first.status} — kein Deckel fuer dieses spid/Markt (fail-open).`); return { top: null, excluded: [] }; }
     const total = +((first.headers.get('content-range') || '0/0').split('/')[1]) || 0;
@@ -177,17 +214,38 @@ async function topAsinsFor(spid, marketplace, n = 100) {
       if (!r.ok) { console.log(`  ASIN-Deckel: asin_sales_traffic Seite ${f}-${f + 999} HTTP ${r.status} — kein Deckel fuer dieses spid/Markt (fail-open, unvollstaendige Daten waeren sonst falsch gerankt).`); return { top: null, excluded: [] }; }
       rows.push(...(await r.json()));
     }
-    const bySales = new Map();
-    for (const row of rows) { const a = normAsin(row.asin); if (!a) continue; bySales.set(a, (bySales.get(a) || 0) + (+row.sales || 0)); }
-    if (bySales.size <= n) return { top: null, excluded: [] }; // schon <= n ASINs — Deckel waere ein No-Op
+    const bySales = new Map(); // childAsin -> summierter Umsatz
+    const parentOf = new Map(); // childAsin -> parent_asin (oder sich selbst, falls keins)
+    for (const row of rows) {
+      const a = normAsin(row.asin); if (!a) continue;
+      bySales.set(a, (bySales.get(a) || 0) + (+row.sales || 0));
+      const p = normAsin(row.parent_asin) || a;
+      parentOf.set(a, p);
+    }
+    const manualKeep = await manualKeepFor(profile);
+    if (bySales.size <= n) return { top: null, excluded: [] }; // schon <= n ASINs — Deckel waere ein No-Op (Top-25-Parent/manuell aendern daran nichts)
     const ranked = [...bySales.entries()].sort((a, b) => b[1] - a[1]);
+    const top100 = new Set(ranked.slice(0, n).map(([asin]) => asin));
+
+    const byParentSales = new Map();
+    for (const [asin, sales] of bySales) { const p = parentOf.get(asin); byParentSales.set(p, (byParentSales.get(p) || 0) + sales); }
+    const parentRanked = [...byParentSales.entries()].sort((a, b) => b[1] - a[1]);
+    const top25Parents = new Set(parentRanked.slice(0, parentN).map(([p]) => p));
+    const keepFromParents = new Set();
+    for (const [asin, p] of parentOf) if (top25Parents.has(p)) keepFromParents.add(asin);
+
+    const top = new Set([...top100, ...keepFromParents, ...manualKeep]);
+    const excluded = ranked.filter(([asin]) => !top.has(asin)).map(([asin]) => asin);
+
     if (DECKEL_DRY_RUN) {
       const top15 = ranked.slice(0, 15).map(([a, s]) => `${a} (${s.toFixed(2)})`).join(', ');
       const boundary = ranked.slice(n - 3, n + 3).map(([a, s], idx) => `#${n - 3 + idx + 1} ${a} (${s.toFixed(2)})`).join(', ');
       console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: Top-15 nach Umsatz: ${top15}`);
       console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: Grenzbereich (#${n - 2}-#${n + 3}): ${boundary}`);
+      console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: ${byParentSales.size} Parent-Gruppen, Top-${parentN} davon bringen ${keepFromParents.size} Kind-ASINs zusaetzlich zu Top-${n} (${[...keepFromParents].filter(a => !top100.has(a)).length} davon NEU ueber Top-${n} hinaus).`);
+      console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: ${manualKeep.size} manuell gepinnte ASIN(s), davon ${[...manualKeep].filter(a => !top100.has(a) && !keepFromParents.has(a)).length} zusaetzlich ueber Top-${n}/Top-${parentN}-Parents hinaus.`);
     }
-    return { top: new Set(ranked.slice(0, n).map(([asin]) => asin)), excluded: ranked.slice(n).map(([asin]) => asin) };
+    return { top, excluded };
   } catch (e) { console.log(`  ASIN-Deckel: FEHLER ${e.message} — kein Deckel fuer dieses spid/Markt (fail-open).`); return { top: null, excluded: [] }; }
 }
 
@@ -279,7 +337,7 @@ async function runNormalPeriodicPass(clients, ms, allWeeks) {
     const profile = String(cl.ads_profile_id);
     // ASIN-Deckel: Top-100-nach-Umsatz bestimmen und alles andere sofort entfernen,
     // bevor ueberhaupt geplant wird, was neu zu holen ist.
-    const { top, excluded } = await topAsinsFor(cl.spid, cl.marketplace);
+    const { top, excluded } = await topAsinsFor(cl);
     topAsinsByClient.set(cl, top);
     await purgeExcludedAsins(cl, excluded);
     const need = [];
@@ -438,7 +496,7 @@ async function main() {
     // sonst wuerde dieser Pfad Zeilen fuer ausgeschlossene ASINs zurueckschreiben, die
     // der normale Lauf gerade erst entfernt hat.
     const topAsinsByProfile = new Map();
-    for (const cl of clients) { const { top } = await topAsinsFor(cl.spid, cl.marketplace); topAsinsByProfile.set(String(cl.ads_profile_id), top); }
+    for (const cl of clients) { const { top } = await topAsinsFor(cl); topAsinsByProfile.set(String(cl.ads_profile_id), top); }
     const tasks = [];
     for (const per of perioden) {
       for (const cl of clients) tasks.push({ profile: String(cl.ads_profile_id), name: cl.name, type: per.type, p: per.p });

@@ -3,7 +3,12 @@ name: Tagesdaten (Audit + Sales&Traffic)
 # Audit (Ads-Agentur-Quota) und Sales&Traffic (SP-API-Quota je Seller) sind unabhängig —
 # sequenziell sprengte die Summe das Timeout (Lauf vom 10.08. bei 335 Min gecancelt).
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      only_spid:
+        description: 'Nur dieses SP-API Seller-Konto (spid) fuer Sales&Traffic — Diagnose/Einzeltest, leer = alle Kunden'
+        required: false
+        default: ''
   schedule:
     - cron: '0 2 * * *'     # 02:00 UTC — fertig bevor der Backfill um 04:30 startet
 concurrency:
@@ -47,6 +52,7 @@ jobs:
           SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SALES_ONLY_SPID: ${{ github.event.inputs.only_spid }}
       - name: Slack-Alert bei Fehlschlag
         if: failure() || cancelled()
         env:
