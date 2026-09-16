@@ -204,12 +204,20 @@ async function topAsinsFor(spid, marketplace, n = 100) {
 // Range 0-0) statt zu loeschen — zeigt die echten Zeilenzahlen pro Tabelle und die
 // betroffenen ASINs, ohne dass auch nur eine Zeile angefasst wird.
 const DECKEL_DRY_RUN = /^(1|true|yes)$/i.test(process.env.ASIN_DECKEL_DRY_RUN || '');
+// War fest 100: der erste scharfe Lauf zeigte 57014 (statement timeout) fuer JEDEN
+// Batch auf ads_asin_terms_periodic, auch nach Prefer: return=minimal — der Planer
+// hatte die Treffermenge fuer 100 ASINs auf ~574 Zeilen geschaetzt (EXPLAIN, 15.09.),
+// tatsaechlich sind es bei BIOZOYGs Durchschnitt (~30M Zeilen / ~1500 ASINs) eher
+// ~20.000 Zeilen PRO ASIN — die Statistiken fuer diese Tabelle sind offenbar stark
+// veraltet. Kleinere, konfigurierbare Batches statt eines fixen Werts, um empirisch
+// eine Groesse zu finden, die innerhalb des Timeouts bleibt.
+const DECKEL_BATCH = Math.max(1, +(process.env.ASIN_DECKEL_BATCH || 100));
 async function purgeExcludedAsins(cl, excluded) {
   if (!excluded.length) return;
   const profile = String(cl.ads_profile_id);
   if (DECKEL_DRY_RUN) {
-    for (let i = 0; i < excluded.length; i += 100) {
-      const batch = excluded.slice(i, i + 100);
+    for (let i = 0; i < excluded.length; i += DECKEL_BATCH) {
+      const batch = excluded.slice(i, i + DECKEL_BATCH);
       const inList = batch.join(',');
       for (const table of ['ads_asin_terms_periodic', 'ads_asin_totals_periodic']) {
         try {
@@ -219,12 +227,14 @@ async function purgeExcludedAsins(cl, excluded) {
           // (ads_asin_terms_periodic_profile_id_asin_period_type_period__key, cost ~1963).
           // count=planned liefert genau diese Planer-Schaetzung, ohne die Zeilen wirklich
           // zu zaehlen — bleibt also guenstig, unabhaengig von der Tabellengroesse.
+          const t0 = Date.now();
           const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&asin=in.(${inList})&select=asin`, { headers: { ...sbHead, Prefer: 'count=planned', Range: '0-0' } });
-          if (!r.ok) { console.log(`${cl.name}: [DRY RUN] ${table} — Zaehlung HTTP ${r.status} (Batch ${i / 100 + 1}) — ${(await r.text()).slice(0, 150)}`); continue; }
+          const ms = Date.now() - t0;
+          if (!r.ok) { console.log(`${cl.name}: [DRY RUN] ${table} — Zaehlung HTTP ${r.status} (Batch ${Math.floor(i / DECKEL_BATCH) + 1}, ${ms}ms) — ${(await r.text()).slice(0, 150)}`); continue; }
           const cr = r.headers.get('content-range');
-          if (!cr) { console.log(`${cl.name}: [DRY RUN] ${table} — kein content-range-Header (Batch ${i / 100 + 1}) — Zahl unten ist NICHT verlaesslich.`); continue; }
+          if (!cr) { console.log(`${cl.name}: [DRY RUN] ${table} — kein content-range-Header (Batch ${Math.floor(i / DECKEL_BATCH) + 1}) — Zahl unten ist NICHT verlaesslich.`); continue; }
           const n = +(cr.split('/')[1]) || 0;
-          console.log(`${cl.name}: [DRY RUN] ${table} — wuerde ca. ${n} Zeilen loeschen (Planer-Schaetzung, Batch ${i / 100 + 1}, ${batch.length} ASINs).`);
+          console.log(`${cl.name}: [DRY RUN] ${table} — wuerde ca. ${n} Zeilen loeschen (Planer-Schaetzung, Batch ${Math.floor(i / DECKEL_BATCH) + 1}, ${batch.length} ASINs, ${ms}ms).`);
         } catch (e) { console.log(`${cl.name}: [DRY RUN] Zaehl-FEHLER (${table}) ${e.message}`); }
       }
     }
@@ -232,18 +242,22 @@ async function purgeExcludedAsins(cl, excluded) {
     return;
   }
   let anyFailed = false;
-  for (let i = 0; i < excluded.length; i += 100) {
-    const inList = excluded.slice(i, i + 100).join(',');
+  for (let i = 0; i < excluded.length; i += DECKEL_BATCH) {
+    const batchNo = Math.floor(i / DECKEL_BATCH) + 1;
+    const inList = excluded.slice(i, i + DECKEL_BATCH).join(',');
     for (const table of ['ads_asin_terms_periodic', 'ads_asin_totals_periodic']) {
       try {
-        // Prefer: return=minimal (15.09., nach 500ern in Produktion): ohne dieses Prefer
-        // liefert PostgREST bei DELETE per Default die geloeschten Zeilen als JSON zurueck —
-        // bei ~900k-1M Treffern pro 100er-ASIN-Batch (ads_asin_terms_periodic) musste Postgres
-        // erst ALLE geloeschten Zeilen serialisieren, das loeste denselben 57014-Timeout aus
-        // wie zuvor bei count=exact. Ein reines EXPLAIN auf dasselbe DELETE (ohne RETURNING)
-        // zeigte dagegen einen billigen Index-Scan — genau dieser Unterschied.
+        // Prefer: return=minimal allein reichte NICHT (15.09.): 57014 blieb bestehen.
+        // Ursache offenbar veraltete Tabellenstatistik — EXPLAIN schaetzte fuer 100 ASINs
+        // nur ~574 Treffer, tatsaechlich eher ~20.000 Zeilen PRO ASIN bei BIOZOYGs Schnitt
+        // (~30M Zeilen / ~1500 ASINs). Ein 100er-Batch loescht also real eher ~1-2 Mio.
+        // Zeilen statt der vom Planer angenommenen Handvoll — echte Arbeit, kein Artefakt
+        // von PostgREST. DECKEL_BATCH kleiner setzen, bis ein Wert ohne Timeout gefunden ist.
+        const t0 = Date.now();
         const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&asin=in.(${inList})`, { method: 'DELETE', headers: { ...sbHead, Prefer: 'return=minimal' } });
-        if (!r.ok) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-DELETE (${table}) HTTP ${r.status} — ${(await r.text()).slice(0, 150)}`); }
+        const ms = Date.now() - t0;
+        if (!r.ok) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-DELETE (${table}) HTTP ${r.status} (Batch ${batchNo}, ${ms}ms) — ${(await r.text()).slice(0, 150)}`); }
+        else console.log(`${cl.name}: ASIN-Deckel-DELETE (${table}) OK (Batch ${batchNo}, ${ms}ms).`);
       } catch (e) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-DELETE FEHLER (${table}) ${e.message}`); }
     }
   }

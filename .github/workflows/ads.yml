@@ -11,6 +11,10 @@ on:
         required: false
         type: boolean
         default: false
+      asin_cap_batch_size:
+        description: 'ASINs pro Loesch-Batch (leer = 100). Bei 57014-Timeout kleiner setzen, z.B. 10.'
+        required: false
+        default: ''
   schedule:
     - cron: '30 5 * * *'   # täglich 05:30 UTC — unabhängig vom SQP-Zeitbudget
                            # (im Backfill-Worker verhungerte der Ads-Block regelmäßig)
@@ -56,6 +60,7 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           ADS_ONLY_PROFILE: ${{ github.event.inputs.only_profile }}
           ASIN_DECKEL_DRY_RUN: ${{ github.event.inputs.dry_run_asin_cap }}
+          ASIN_DECKEL_BATCH: ${{ github.event.inputs.asin_cap_batch_size }}
 
   # Eigener Job statt Step: ein harter Job-Timeout-Kill (siehe oben) beendet den
   # laufenden Job SOFORT und fuehrt keine weiteren if:failure()/cancelled()-Steps
