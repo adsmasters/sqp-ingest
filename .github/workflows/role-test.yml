@@ -1,0 +1,28 @@
+name: SP-API Rollen-Test (read-only)
+# Diagnose (16.09.2026): welche SP-API-Bereiche sind mit den bestehenden Kunden-Autorisierungen
+# erreichbar? Schreibt nichts. Grundlage fuer das automatische Account-Check-Briefing.
+on:
+  workflow_dispatch:
+    inputs:
+      spid:
+        description: 'SP-API Seller-Konto (spid, aus sqp_clients)'
+        required: true
+      mkt:
+        description: 'Marketplace-Kuerzel (DE/FR/IT/ES/UK/NL)'
+        required: false
+        default: 'DE'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node role-test.mjs "${{ inputs.spid }}" "${{ inputs.mkt }}"
+        env:
+          SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
+          SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
