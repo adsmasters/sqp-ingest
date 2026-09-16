@@ -231,16 +231,23 @@ async function purgeExcludedAsins(cl, excluded) {
     console.log(`${cl.name}: [DRY RUN] insgesamt ${excluded.length} ASINs ausserhalb Top-100 wuerden entfernt: ${excluded.slice(0, 15).join(', ')}${excluded.length > 15 ? ', ...' : ''}`);
     return;
   }
+  let anyFailed = false;
   for (let i = 0; i < excluded.length; i += 100) {
     const inList = excluded.slice(i, i + 100).join(',');
     for (const table of ['ads_asin_terms_periodic', 'ads_asin_totals_periodic']) {
       try {
-        const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&asin=in.(${inList})`, { method: 'DELETE', headers: sbHead });
-        if (!r.ok) console.log(`${cl.name}: ASIN-Deckel-DELETE (${table}) HTTP ${r.status}`);
-      } catch (e) { console.log(`${cl.name}: ASIN-Deckel-DELETE FEHLER (${table}) ${e.message}`); }
+        // Prefer: return=minimal (15.09., nach 500ern in Produktion): ohne dieses Prefer
+        // liefert PostgREST bei DELETE per Default die geloeschten Zeilen als JSON zurueck —
+        // bei ~900k-1M Treffern pro 100er-ASIN-Batch (ads_asin_terms_periodic) musste Postgres
+        // erst ALLE geloeschten Zeilen serialisieren, das loeste denselben 57014-Timeout aus
+        // wie zuvor bei count=exact. Ein reines EXPLAIN auf dasselbe DELETE (ohne RETURNING)
+        // zeigte dagegen einen billigen Index-Scan — genau dieser Unterschied.
+        const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&asin=in.(${inList})`, { method: 'DELETE', headers: { ...sbHead, Prefer: 'return=minimal' } });
+        if (!r.ok) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-DELETE (${table}) HTTP ${r.status} — ${(await r.text()).slice(0, 150)}`); }
+      } catch (e) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-DELETE FEHLER (${table}) ${e.message}`); }
     }
   }
-  console.log(`${cl.name}: bis zu ${excluded.length} ASINs ausserhalb Top-100 (nach Produktumsatz) entfernt.`);
+  console.log(`${cl.name}: bis zu ${excluded.length} ASINs ausserhalb Top-100 (nach Produktumsatz) ${anyFailed ? 'entfernt (mit Fehlern — siehe oben, alte Zeilen bleiben fuer fehlgeschlagene Batches stehen)' : 'entfernt'}.`);
 }
 
 // Baut die vollstaendige Aufgabenliste (Kunde x Periode x Report-Art), fordert
