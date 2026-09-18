@@ -175,32 +175,7 @@ async function manualKeepFor(profile) {
   } catch (e) { return new Set(); }
 }
 
-// Verwaiste ASINs (18.09., Fund bei BIOZOYG): ASINs mit Ads-Daten (ads_asin_terms_periodic/
-// ads_asin_totals_periodic) aber OHNE JEDE Zeile in asin_sales_traffic wurden bisher vom
-// Deckel gar nicht erfasst — die Rangliste kennt nur ASINs, die in asin_sales_traffic
-// auftauchen, also wurden solche ASINs versehentlich fuer immer behalten, statt bewusst
-// eine Entscheidung zu treffen. Bei BIOZOYG betraf das 72 ASINs mit teils 20.000+ Zeilen
-// (durch den gewichteten Suchbegriff-Split ueber grosse Anzeigengruppen), aber 0€ Umsatz,
-// 0 Ad-Käufen und ~0€ Ad-Spend — de facto Karteileichen. Jetzt: als "kein Nachweis eines
-// echten Verkaufs" behandelt und ausgeschlossen, ausser manuell gepinnt (z.B. eine echte
-// Neueinfuehrung ohne Verkaufsdaten noch — genau dafuer existiert ads_asin_manual_keep).
-// distinct_asins_for_profile() ist eine RPC-Funktion (separate Migration, wie
-// purge_excluded_asins) statt eines rohen PostgREST-SELECT: "SELECT DISTINCT asin" ueber
-// die volle Tabelle liesse sich sonst nur durch Abholen ALLER Zeilen client-seitig
-// nachbilden — bei BIOZOYGs ~9,7 Mio. Zeilen (nach der Bereinigung) unbrauchbar.
-async function orphanAsinsFor(profile, bySales, manualKeep) {
-  try {
-    const r = await fetch(`${U}/rest/v1/rpc/distinct_asins_for_profile`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_profile_id: profile }) });
-    if (!r.ok) { console.log(`  ASIN-Deckel: verwaiste-ASIN-Pruefung HTTP ${r.status} — uebersprungen (fail-open, keine zusaetzlichen Ausschluesse).`); return []; }
-    const rows = await r.json();
-    const known = new Set([...bySales.keys(), ...manualKeep]);
-    const orphans = new Set();
-    for (const row of rows) { const a = normAsin(row.asin); if (a && !known.has(a)) orphans.add(a); }
-    return [...orphans];
-  } catch (e) { console.log(`  ASIN-Deckel: verwaiste-ASIN-Pruefung FEHLER ${e.message} — uebersprungen (fail-open, keine zusaetzlichen Ausschluesse).`); return []; }
-}
-
-// ASIN-Deckel (13.09., Kundenwunsch, erweitert 15./18.09.): pro Kunde ASINs behalten, die
+// ASIN-Deckel (13.09., Kundenwunsch, erweitert 15.09.): pro Kunde ASINs behalten, die
 // IRGENDEINES von drei Kriterien erfuellen (Union, nicht ersetzt):
 //   1) Top-100 nach ECHTEM Produktumsatz (asin_sales_traffic, nicht ad-attribuiert) —
 //      die urspruengliche Regel.
@@ -209,8 +184,6 @@ async function orphanAsinsFor(profile, bySales, manualKeep) {
 //      Zeile (kein Varianten-Produkt) ist sein eigener Parent (Self-Parent-Fallback).
 //   3) Manuell gepinnte ASINs (ads_asin_manual_keep) — z.B. neue Produkteinfuehrungen
 //      ohne nennenswerten Umsatz, die trotzdem nicht geloescht/ausgefiltert werden sollen.
-// Ausgeschlossen werden zusaetzlich ASINs ganz OHNE asin_sales_traffic-Zeile (siehe
-// orphanAsinsFor oben) — auch wenn Kriterium 1 fuer den Kunden ein No-Op waere.
 // asin_sales_traffic ist ueber spid verknuepft, nicht ueber ads_profile_id.
 //
 // Korrekturen nach Selbstpruefung (14./15.09.), bevor das je live lief:
@@ -250,14 +223,7 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
       parentOf.set(a, p);
     }
     const manualKeep = await manualKeepFor(profile);
-    const orphans = await orphanAsinsFor(profile, bySales, manualKeep);
-    if (bySales.size <= n) {
-      // schon <= n ASINs — der Top-100/Top-25-Parent-Deckel selbst waere ein No-Op, aber
-      // verwaiste ASINs (siehe orphanAsinsFor) sollen trotzdem raus, wenn es welche gibt.
-      if (!orphans.length) return { top: null, excluded: [] };
-      const top = new Set([...bySales.keys(), ...manualKeep]);
-      return { top, excluded: orphans };
-    }
+    if (bySales.size <= n) return { top: null, excluded: [] }; // schon <= n ASINs — Deckel waere ein No-Op (Top-25-Parent/manuell aendern daran nichts)
     const ranked = [...bySales.entries()].sort((a, b) => b[1] - a[1]);
     const top100 = new Set(ranked.slice(0, n).map(([asin]) => asin));
 
@@ -269,7 +235,7 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
     for (const [asin, p] of parentOf) if (top25Parents.has(p)) keepFromParents.add(asin);
 
     const top = new Set([...top100, ...keepFromParents, ...manualKeep]);
-    const excluded = ranked.filter(([asin]) => !top.has(asin)).map(([asin]) => asin).concat(orphans);
+    const excluded = ranked.filter(([asin]) => !top.has(asin)).map(([asin]) => asin);
 
     if (DECKEL_DRY_RUN) {
       const top15 = ranked.slice(0, 15).map(([a, s]) => `${a} (${s.toFixed(2)})`).join(', ');
