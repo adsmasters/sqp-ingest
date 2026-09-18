@@ -252,10 +252,9 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
 // Loescht bestehende Zeilen fuer ASINs ausserhalb der Top-100 — sowohl beim ersten
 // Lauf nach diesem Deploy (rueckwirkende Bereinigung, vom Kunden gewuenscht) als
 // auch laufend (ein ASIN, das aus den Top-100 faellt, wird beim naechsten Lauf
-// entfernt). In 100er-Batches per "asin=in.(...)" statt einzeln — bei BIOZOYGs
-// ~1500 auszuschliessenden ASINs waeren sonst tausende Einzel-DELETEs pro Lauf,
-// auch wenn laengst nichts mehr zu loeschen ist. profile_id bleibt der fuehrende,
-// indexierte Filter, die IN-Liste ist auf 100 Werte begrenzt.
+// entfernt). Batches per RPC-Aufruf purge_excluded_asins() statt eines rohen
+// PostgREST-DELETE (siehe Begruendung bei DECKEL_BATCH unten) — profile_id bleibt
+// der fuehrende, indexierte Filter innerhalb der Funktion.
 //
 // ASIN_DECKEL_DRY_RUN=1 (15.09., Test vor dem echten Deploy): fuehrt exakt dieselbe
 // profile_id+asin-Abfrage aus wie das echte DELETE, zaehlt aber nur (Prefer count=exact,
@@ -263,13 +262,20 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
 // betroffenen ASINs, ohne dass auch nur eine Zeile angefasst wird.
 const DECKEL_DRY_RUN = /^(1|true|yes)$/i.test(process.env.ASIN_DECKEL_DRY_RUN || '');
 // War fest 100: der erste scharfe Lauf zeigte 57014 (statement timeout) fuer JEDEN
-// Batch auf ads_asin_terms_periodic, auch nach Prefer: return=minimal — der Planer
-// hatte die Treffermenge fuer 100 ASINs auf ~574 Zeilen geschaetzt (EXPLAIN, 15.09.),
-// tatsaechlich sind es bei BIOZOYGs Durchschnitt (~30M Zeilen / ~1500 ASINs) eher
-// ~20.000 Zeilen PRO ASIN — die Statistiken fuer diese Tabelle sind offenbar stark
-// veraltet. Kleinere, konfigurierbare Batches statt eines fixen Werts, um empirisch
-// eine Groesse zu finden, die innerhalb des Timeouts bleibt.
-const DECKEL_BATCH = Math.max(1, +(process.env.ASIN_DECKEL_BATCH || 100));
+// Batch auf ads_asin_terms_periodic — Ursache letztlich zweifach (18.09. final geklaert):
+// 1) veraltete Tabellenstatistik liess PostgREST/den Planer ~574 Treffer je 100 ASINs
+//    schaetzen, real sind es ~20.000 Zeilen PRO ASIN bei BIOZOYGs Schnitt.
+// 2) Nach VACUUM ANALYZE (korrekte Statistik) waehlte der Planer fuer den PostgREST-
+//    DELETE-Pfad einen Seq Scan ueber die GESAMTE Tabelle statt Index-Scans je ASIN —
+//    kostet (rechnerisch) sogar mehr, aber auf dieser Instanz (AWS t4g.micro, burstable)
+//    real langsamer als der Index-Pfad. purge_excluded_asins() (Postgres-Funktion, per
+//    RPC aufgerufen statt eines rohen DELETE) erzwingt `enable_seqscan = off` plus einen
+//    hoeheren statement_timeout innerhalb der Funktion — beides ueber PostgREST-Header
+//    nicht moeglich. Batch-Groesse 1 ist die einzige empirisch bestaetigt zuverlaessige
+//    Groesse auf dieser Instanz (auch 50 mit erzwungenem Index-Scan scheiterte noch nach
+//    10 Minuten) — fuer die laufende Pflegeregel (typ. wenige neu herausfallende ASINs
+//    pro Lauf) reicht das, groessere Werte nur nach eigenem Test erhoehen.
+const DECKEL_BATCH = Math.max(1, +(process.env.ASIN_DECKEL_BATCH || 1));
 async function purgeExcludedAsins(cl, excluded) {
   if (!excluded.length) return;
   const profile = String(cl.ads_profile_id);
@@ -302,22 +308,22 @@ async function purgeExcludedAsins(cl, excluded) {
   let anyFailed = false;
   for (let i = 0; i < excluded.length; i += DECKEL_BATCH) {
     const batchNo = Math.floor(i / DECKEL_BATCH) + 1;
-    const inList = excluded.slice(i, i + DECKEL_BATCH).join(',');
-    for (const table of ['ads_asin_terms_periodic', 'ads_asin_totals_periodic']) {
-      try {
-        // Prefer: return=minimal allein reichte NICHT (15.09.): 57014 blieb bestehen.
-        // Ursache offenbar veraltete Tabellenstatistik — EXPLAIN schaetzte fuer 100 ASINs
-        // nur ~574 Treffer, tatsaechlich eher ~20.000 Zeilen PRO ASIN bei BIOZOYGs Schnitt
-        // (~30M Zeilen / ~1500 ASINs). Ein 100er-Batch loescht also real eher ~1-2 Mio.
-        // Zeilen statt der vom Planer angenommenen Handvoll — echte Arbeit, kein Artefakt
-        // von PostgREST. DECKEL_BATCH kleiner setzen, bis ein Wert ohne Timeout gefunden ist.
-        const t0 = Date.now();
-        const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&asin=in.(${inList})`, { method: 'DELETE', headers: { ...sbHead, Prefer: 'return=minimal' } });
-        const ms = Date.now() - t0;
-        if (!r.ok) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-DELETE (${table}) HTTP ${r.status} (Batch ${batchNo}, ${ms}ms) — ${(await r.text()).slice(0, 150)}`); }
-        else console.log(`${cl.name}: ASIN-Deckel-DELETE (${table}) OK (Batch ${batchNo}, ${ms}ms).`);
-      } catch (e) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-DELETE FEHLER (${table}) ${e.message}`); }
-    }
+    const batch = excluded.slice(i, i + DECKEL_BATCH);
+    try {
+      // purge_excluded_asins() (Postgres-Funktion, siehe Migration) statt rohem DELETE
+      // ueber PostgREST — setzt intern enable_seqscan=off + einen hoeheren
+      // statement_timeout, was ueber normale PostgREST-Header nicht moeglich ist.
+      // Ohne das waehlte der Planer nach VACUUM ANALYZE einen Seq Scan ueber die
+      // gesamte Tabelle statt Index-Scans je ASIN — auf dieser Instanz (t4g.micro)
+      // real langsamer, obwohl rechnerisch "billiger" (18.09., nach stundenlanger
+      // Fehlersuche empirisch bestaetigt: nur Batch=1 mit erzwungenem Index-Scan
+      // lief zuverlaessig).
+      const t0 = Date.now();
+      const r = await fetch(`${U}/rest/v1/rpc/purge_excluded_asins`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_profile_id: profile, p_asins: batch }) });
+      const ms = Date.now() - t0;
+      if (!r.ok) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-RPC HTTP ${r.status} (Batch ${batchNo}, ${batch.length} ASINs, ${ms}ms) — ${(await r.text()).slice(0, 150)}`); }
+      else console.log(`${cl.name}: ASIN-Deckel-RPC OK (Batch ${batchNo}, ${batch.length} ASINs, ${ms}ms).`);
+    } catch (e) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-RPC FEHLER (Batch ${batchNo}) ${e.message}`); }
   }
   console.log(`${cl.name}: bis zu ${excluded.length} ASINs ausserhalb Top-100 (nach Produktumsatz) ${anyFailed ? 'entfernt (mit Fehlern — siehe oben, alte Zeilen bleiben fuer fehlgeschlagene Batches stehen)' : 'entfernt'}.`);
 }
