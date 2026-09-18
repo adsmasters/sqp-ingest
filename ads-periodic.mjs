@@ -175,29 +175,31 @@ async function manualKeepFor(profile) {
   } catch (e) { return new Set(); }
 }
 
-// Verwaiste ASINs (18.09., Fund bei BIOZOYG): ASINs mit Ads-Daten (ads_asin_terms_periodic/
-// ads_asin_totals_periodic) aber OHNE JEDE Zeile in asin_sales_traffic wurden bisher vom
-// Deckel gar nicht erfasst — die Rangliste kennt nur ASINs, die in asin_sales_traffic
-// auftauchen, also wurden solche ASINs versehentlich fuer immer behalten, statt bewusst
-// eine Entscheidung zu treffen. Bei BIOZOYG betraf das 72 ASINs mit teils 20.000+ Zeilen
-// (durch den gewichteten Suchbegriff-Split ueber grosse Anzeigengruppen), aber 0€ Umsatz,
-// 0 Ad-Käufen und ~0€ Ad-Spend — de facto Karteileichen. Jetzt: als "kein Nachweis eines
-// echten Verkaufs" behandelt und ausgeschlossen, ausser manuell gepinnt (z.B. eine echte
-// Neueinfuehrung ohne Verkaufsdaten noch — genau dafuer existiert ads_asin_manual_keep).
+// ASINs, die AKTUELL irgendeine Zeile in ads_asin_terms_periodic/ads_asin_totals_periodic
+// haben (18.09.). Zwei Verwendungen:
+// 1) Verwaiste ASINs finden — ASINs mit Ads-Daten aber OHNE JEDE Zeile in asin_sales_traffic
+//    wurden bisher vom Deckel gar nicht erfasst (die Rangliste kennt nur ASINs aus
+//    asin_sales_traffic), blieben also versehentlich fuer immer erhalten. Bei BIOZOYG
+//    betraf das 72 ASINs mit teils 20.000+ Zeilen (durch den gewichteten Suchbegriff-Split
+//    ueber grosse Anzeigengruppen), aber 0€ Umsatz, 0 Ad-Käufen, ~0€ Ad-Spend — de facto
+//    Karteileichen. Jetzt: ausgeschlossen, ausser manuell gepinnt.
+// 2) "excluded" auf ASINs eingrenzen, die tatsaechlich noch etwas zu loeschen haben — ohne
+//    das versucht die Standing-Rule JEDEN Lauf ALLE ~1200+ Ausschluesse erneut zu loeschen,
+//    auch laengst geloeschte (No-Op, aber bei DECKEL_BATCH=1 sind das 1000+ sequenzielle
+//    RPC-Aufrufe pro Lauf). Fund vom 18.09.: genau das liess die neuen, echten Loeschungen
+//    (die 72 Karteileichen, ganz hinten in der Liste) auf dieser Instanz fehlschlagen, weil
+//    die vorherigen ~1150 No-Op-Aufrufe die Instanz schon strapaziert hatten.
 // distinct_asins_for_profile() ist eine RPC-Funktion (separate Migration, wie
 // purge_excluded_asins) statt eines rohen PostgREST-SELECT: "SELECT DISTINCT asin" ueber
 // die volle Tabelle liesse sich sonst nur durch Abholen ALLER Zeilen client-seitig
 // nachbilden — bei BIOZOYGs ~9,7 Mio. Zeilen (nach der Bereinigung) unbrauchbar.
-async function orphanAsinsFor(profile, bySales, manualKeep) {
+async function presentAsinsFor(profile) {
   try {
     const r = await fetch(`${U}/rest/v1/rpc/distinct_asins_for_profile`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_profile_id: profile }) });
-    if (!r.ok) { console.log(`  ASIN-Deckel: verwaiste-ASIN-Pruefung HTTP ${r.status} — uebersprungen (fail-open, keine zusaetzlichen Ausschluesse).`); return []; }
+    if (!r.ok) { console.log(`  ASIN-Deckel: distinct_asins_for_profile HTTP ${r.status} — ueberspringe verwaiste-ASIN-Pruefung + Eingrenzung auf tatsaechlich vorhandene ASINs (fail-open).`); return null; }
     const rows = await r.json();
-    const known = new Set([...bySales.keys(), ...manualKeep]);
-    const orphans = new Set();
-    for (const row of rows) { const a = normAsin(row.asin); if (a && !known.has(a)) orphans.add(a); }
-    return [...orphans];
-  } catch (e) { console.log(`  ASIN-Deckel: verwaiste-ASIN-Pruefung FEHLER ${e.message} — uebersprungen (fail-open, keine zusaetzlichen Ausschluesse).`); return []; }
+    return new Set(rows.map(row => normAsin(row.asin)).filter(Boolean));
+  } catch (e) { console.log(`  ASIN-Deckel: distinct_asins_for_profile FEHLER ${e.message} — fail-open.`); return null; }
 }
 
 // ASIN-Deckel (13.09., Kundenwunsch, erweitert 15./18.09.): pro Kunde ASINs behalten, die
@@ -250,10 +252,11 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
       parentOf.set(a, p);
     }
     const manualKeep = await manualKeepFor(profile);
-    const orphans = await orphanAsinsFor(profile, bySales, manualKeep);
+    const present = await presentAsinsFor(profile); // null = Abfrage fehlgeschlagen (fail-open unten)
+    const orphans = present ? [...present].filter(a => !bySales.has(a) && !manualKeep.has(a)) : [];
     if (bySales.size <= n) {
       // schon <= n ASINs — der Top-100/Top-25-Parent-Deckel selbst waere ein No-Op, aber
-      // verwaiste ASINs (siehe orphanAsinsFor) sollen trotzdem raus, wenn es welche gibt.
+      // verwaiste ASINs sollen trotzdem raus, wenn es welche gibt.
       if (!orphans.length) return { top: null, excluded: [] };
       const top = new Set([...bySales.keys(), ...manualKeep]);
       return { top, excluded: orphans };
@@ -269,7 +272,11 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
     for (const [asin, p] of parentOf) if (top25Parents.has(p)) keepFromParents.add(asin);
 
     const top = new Set([...top100, ...keepFromParents, ...manualKeep]);
-    const excluded = ranked.filter(([asin]) => !top.has(asin)).map(([asin]) => asin).concat(orphans);
+    let excluded = ranked.filter(([asin]) => !top.has(asin)).map(([asin]) => asin).concat(orphans);
+    // Auf ASINs eingrenzen, die tatsaechlich noch etwas zu loeschen haben — sonst versucht
+    // JEDER Lauf ALLE ~1200+ Ausschluesse erneut (siehe presentAsinsFor oben). Fail-open:
+    // wenn present nicht bestimmt werden konnte, ungefiltert lassen (altes Verhalten).
+    if (present) excluded = excluded.filter(a => present.has(a));
 
     if (DECKEL_DRY_RUN) {
       const top15 = ranked.slice(0, 15).map(([a, s]) => `${a} (${s.toFixed(2)})`).join(', ');
