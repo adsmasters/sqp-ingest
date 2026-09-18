@@ -306,6 +306,15 @@ async function purgeExcludedAsins(cl, excluded) {
     return;
   }
   let anyFailed = false;
+  // Bei DECKEL_BATCH=1 (siehe oben) eine Log-Zeile PRO ASIN — bei tausenden ausgeschlossenen
+  // ASINs (z.B. beim ersten scharfen Lauf nach einem Ruecksstand) sprengt das die Log-Groesse.
+  // Sammel-Log statt Einzelzeile pro Erfolg (20.09.): einzelne auffaellig langsame Batches
+  // (das genaue Lock-Contention-Signal vom 18.09. — ein Batch, der die ganze statement_timeout-
+  // Zeit verbraucht) werden trotzdem SOFORT gemeldet statt in der Sammelzeile zu verschwinden;
+  // Fehler bleiben ohnehin einzeln und sofort sichtbar (selten, immer relevant).
+  let ok = 0, sumMs = 0, maxMs = 0;
+  const LOG_EVERY = 100;
+  const OUTLIER_MS = 3000;
   for (let i = 0; i < excluded.length; i += DECKEL_BATCH) {
     const batchNo = Math.floor(i / DECKEL_BATCH) + 1;
     const batch = excluded.slice(i, i + DECKEL_BATCH);
@@ -321,11 +330,13 @@ async function purgeExcludedAsins(cl, excluded) {
       const t0 = Date.now();
       const r = await fetch(`${U}/rest/v1/rpc/purge_excluded_asins`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_profile_id: profile, p_asins: batch }) });
       const ms = Date.now() - t0;
-      if (!r.ok) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-RPC HTTP ${r.status} (Batch ${batchNo}, ${batch.length} ASINs, ${ms}ms) — ${(await r.text()).slice(0, 150)}`); }
-      else console.log(`${cl.name}: ASIN-Deckel-RPC OK (Batch ${batchNo}, ${batch.length} ASINs, ${ms}ms).`);
+      if (!r.ok) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-RPC HTTP ${r.status} (Batch ${batchNo}, ${batch.length} ASINs, ${ms}ms) — ${(await r.text()).slice(0, 150)}`); continue; }
+      ok++; sumMs += ms; if (ms > maxMs) maxMs = ms;
+      if (ms > OUTLIER_MS) console.log(`${cl.name}: ASIN-Deckel-RPC OK, aber auffaellig langsam (Batch ${batchNo}, ${batch.length} ASINs, ${ms}ms).`);
+      else if (ok % LOG_EVERY === 0) console.log(`${cl.name}: ASIN-Deckel-RPC ${ok}/${excluded.length} erledigt (Schnitt ${Math.round(sumMs / ok)}ms, max ${maxMs}ms).`);
     } catch (e) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-RPC FEHLER (Batch ${batchNo}) ${e.message}`); }
   }
-  console.log(`${cl.name}: bis zu ${excluded.length} ASINs ausserhalb Top-100 (nach Produktumsatz) ${anyFailed ? 'entfernt (mit Fehlern — siehe oben, alte Zeilen bleiben fuer fehlgeschlagene Batches stehen)' : 'entfernt'}.`);
+  console.log(`${cl.name}: bis zu ${excluded.length} ASINs ausserhalb Top-100 (nach Produktumsatz) ${anyFailed ? 'entfernt (mit Fehlern — siehe oben, alte Zeilen bleiben fuer fehlgeschlagene Batches stehen)' : 'entfernt'}${ok ? ` (Schnitt ${Math.round(sumMs / ok)}ms, max ${maxMs}ms je Batch)` : ''}.`);
 }
 
 // Baut die vollstaendige Aufgabenliste (Kunde x Periode x Report-Art), fordert
