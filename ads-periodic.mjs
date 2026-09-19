@@ -77,9 +77,16 @@ async function pullTotals(profile, type, p, topAsins = null) {
   const adv = await pull(profile, 'spAdvertisedProduct', ['advertisedAsin', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'], p.start, p.end);
   const agg = new Map();
   for (const r of adv) { const a = r.advertisedAsin; if (!a) continue; if (topAsins && !topAsins.has(normAsin(a))) continue; let e = agg.get(a); if (!e) { e = { profile_id: profile, asin: a, period_type: type, period_start: p.start, impressions: 0, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(a, e); } e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; }
-  await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&period_type=eq.${type}&period_start=eq.${p.start}`, { method: 'DELETE', headers: sbHead });
-  const rows = [...agg.values()]; let ins = 0;
-  for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS INSERT', r.status, (await r.text()).slice(0, 150)); break; } }
+  // Reihenfolge bewusst getauscht (20.09., nach Datenverlust im Produktionslauf vom 18.09. —
+  // dort traf dasselbe Muster finalizeSearchTerm, siehe Kommentar dort): erst schreiben (jetzt
+  // per Upsert statt Plain-INSERT, sonst 409 fuer laengst vorhandene ASINs), danach nur bei
+  // vollem Erfolg alte Zeilen ueber ingested_at aufraeumen — vorher stand das DELETE VOR dem
+  // INSERT, ein 57014 im ersten Chunk liess die Periode komplett leer statt befuellt zurueck.
+  const runTs = new Date().toISOString();
+  const rows = [...agg.values()].map(e => ({ ...e, ingested_at: runTs })); let ins = 0;
+  for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic?on_conflict=profile_id,asin,period_type,period_start`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS UPSERT', r.status, (await r.text()).slice(0, 150)); break; } }
+  if (ins === rows.length) await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&period_type=eq.${type}&period_start=eq.${p.start}&ingested_at=lt.${encodeURIComponent(runTs)}`, { method: 'DELETE', headers: sbHead });
+  else console.log(`  TOTALS: nur ${ins}/${rows.length} Zeilen geschrieben — Aufraeumen alter Zeilen uebersprungen.`);
   return ins;
 }
 
@@ -136,10 +143,14 @@ async function finalizeTotals(job, topAsinsByClient) {
   const topAsins = topAsinsByClient.get(cl);
   const agg = new Map();
   for (const r of job.rows) { const a = r.advertisedAsin; if (!a) continue; if (topAsins && !topAsins.has(normAsin(a))) continue; let e = agg.get(a); if (!e) { e = { profile_id: profile, asin: a, period_type: periodType, period_start: period.start, impressions: 0, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(a, e); } e.impressions += +r.impressions || 0; e.clicks += +r.clicks || 0; e.cost += +r.cost || 0; e.purchases7d += +r.purchases7d || 0; e.sales7d += +r.sales7d || 0; }
-  await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&period_type=eq.${periodType}&period_start=eq.${period.start}`, { method: 'DELETE', headers: sbHead });
-  const rows = [...agg.values()]; let ins = 0;
-  for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS INSERT', r.status, (await r.text()).slice(0, 150)); break; } }
-  console.log(`${cl.name} ${jobLabel(job)}: ${ins} ASIN-Totale`);
+  // Reihenfolge bewusst getauscht (20.09.) — siehe Kommentar in pullTotals()/finalizeSearchTerm:
+  // erst schreiben (Upsert statt Plain-INSERT), danach nur bei vollem Erfolg alte Zeilen
+  // ueber ingested_at aufraeumen, statt vorher blind zu loeschen.
+  const runTs = new Date().toISOString();
+  const rows = [...agg.values()].map(e => ({ ...e, ingested_at: runTs })); let ins = 0;
+  for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic?on_conflict=profile_id,asin,period_type,period_start`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS UPSERT', r.status, (await r.text()).slice(0, 150)); break; } }
+  if (ins === rows.length) await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&period_type=eq.${periodType}&period_start=eq.${period.start}&ingested_at=lt.${encodeURIComponent(runTs)}`, { method: 'DELETE', headers: sbHead });
+  console.log(`${cl.name} ${jobLabel(job)}: ${ins} ASIN-Totale${ins < rows.length ? ` (von ${rows.length}, unvollstaendig — Aufraeumen uebersprungen)` : ''}`);
 }
 
 // ASIN-Deckel (13.09., Kundenwunsch): pro Kunde nur die Top-N ASINs nach ECHTEM
@@ -412,9 +423,22 @@ async function runNormalPeriodicPass(clients, ms, allWeeks) {
         e.clicks += (+r.clicks || 0) * sh; e.cost += (+r.cost || 0) * sh; e.purchases7d += (+r.purchases7d || 0) * sh; e.sales7d += (+r.sales7d || 0) * sh;
       }
     }
-    await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.${periodType}&period_start=eq.${period.start}`, { method: 'DELETE', headers: sbHead });
-    const n = await upsert([...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2) })));
-    console.log(`${cl.name} ${jobLabel(job)}: ${st.length} Terms -> ${n} Zeilen`);
+    // Reihenfolge bewusst getauscht (20.09., nach Datenverlust im Produktionslauf vom 18.09.):
+    // erst schreiben, danach erst — und nur bei vollem Erfolg — alte Zeilen aufraeumen. Vorher
+    // stand hier ein DELETE VOR dem upsert(); schlug dessen erster Chunk mit 57014 fehl (break()
+    // in upsert()), war die Periode schon geloescht und blieb komplett leer statt wie zuvor
+    // befuellt (10 Kunden / 17 Perioden betroffen im 18.09.-Lauf). ingested_at wird bei jedem
+    // Schreiben (Insert wie Merge-Update) auf "jetzt" gesetzt, damit das DELETE danach nur noch
+    // wirklich veraltete (diesmal NICHT geschriebene) Zeilen trifft.
+    const runTs = new Date().toISOString();
+    const rows = [...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2), ingested_at: runTs }));
+    const n = await upsert(rows);
+    if (n === rows.length) {
+      await fetch(`${U}/rest/v1/ads_asin_terms_periodic?profile_id=eq.${profile}&period_type=eq.${periodType}&period_start=eq.${period.start}&ingested_at=lt.${encodeURIComponent(runTs)}`, { method: 'DELETE', headers: sbHead });
+      console.log(`${cl.name} ${jobLabel(job)}: ${st.length} Terms -> ${n} Zeilen`);
+    } else {
+      console.log(`${cl.name} ${jobLabel(job)}: ${st.length} Terms -> ${n}/${rows.length} Zeilen geschrieben (unvollstaendig — alte Zeilen bleiben stehen, Aufraeumen uebersprungen).`);
+    }
   }
   async function finalizeSharedAdv(job) {
     job.agToAsins = buildAgToAsins(job.rows);
