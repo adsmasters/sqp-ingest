@@ -331,31 +331,48 @@ async function purgeExcludedAsins(cl, excluded) {
   // (das genaue Lock-Contention-Signal vom 18.09. — ein Batch, der die ganze statement_timeout-
   // Zeit verbraucht) werden trotzdem SOFORT gemeldet statt in der Sammelzeile zu verschwinden;
   // Fehler bleiben ohnehin einzeln und sofort sichtbar (selten, immer relevant).
-  let ok = 0, sumMs = 0, maxMs = 0;
+  let ok = 0, sumMs = 0, maxMs = 0, retried = 0;
   const LOG_EVERY = 100;
   const OUTLIER_MS = 3000;
+  // Bis zu 2 sofortige Wiederholungen pro Batch (20.09.): die 57014-Ausfaelle hier sind
+  // transiente Lock-Contention (~0.4% der Batches, nie derselbe ASIN zweimal), kein
+  // strukturelles Problem — ein kurzer Retry im selben Lauf faengt das meiste davon ab,
+  // statt bis zum naechsten Lauf auf die Selbstheilung ueber "excluded" zu warten (siehe
+  // Kommentar unten zu anyFailed). DECKEL_BATCH/enable_seqscan bleiben unveraendert.
+  const RETRIES = 2;
   for (let i = 0; i < excluded.length; i += DECKEL_BATCH) {
     const batchNo = Math.floor(i / DECKEL_BATCH) + 1;
     const batch = excluded.slice(i, i + DECKEL_BATCH);
-    try {
-      // purge_excluded_asins() (Postgres-Funktion, siehe Migration) statt rohem DELETE
-      // ueber PostgREST — setzt intern enable_seqscan=off + einen hoeheren
-      // statement_timeout, was ueber normale PostgREST-Header nicht moeglich ist.
-      // Ohne das waehlte der Planer nach VACUUM ANALYZE einen Seq Scan ueber die
-      // gesamte Tabelle statt Index-Scans je ASIN — auf dieser Instanz (t4g.micro)
-      // real langsamer, obwohl rechnerisch "billiger" (18.09., nach stundenlanger
-      // Fehlersuche empirisch bestaetigt: nur Batch=1 mit erzwungenem Index-Scan
-      // lief zuverlaessig).
-      const t0 = Date.now();
-      const r = await fetch(`${U}/rest/v1/rpc/purge_excluded_asins`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_profile_id: profile, p_asins: batch }) });
-      const ms = Date.now() - t0;
-      if (!r.ok) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-RPC HTTP ${r.status} (Batch ${batchNo}, ${batch.length} ASINs, ${ms}ms) — ${(await r.text()).slice(0, 150)}`); continue; }
-      ok++; sumMs += ms; if (ms > maxMs) maxMs = ms;
-      if (ms > OUTLIER_MS) console.log(`${cl.name}: ASIN-Deckel-RPC OK, aber auffaellig langsam (Batch ${batchNo}, ${batch.length} ASINs, ${ms}ms).`);
-      else if (ok % LOG_EVERY === 0) console.log(`${cl.name}: ASIN-Deckel-RPC ${ok}/${excluded.length} erledigt (Schnitt ${Math.round(sumMs / ok)}ms, max ${maxMs}ms).`);
-    } catch (e) { anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-RPC FEHLER (Batch ${batchNo}) ${e.message}`); }
+    for (let attempt = 0; ; attempt++) {
+      try {
+        // purge_excluded_asins() (Postgres-Funktion, siehe Migration) statt rohem DELETE
+        // ueber PostgREST — setzt intern enable_seqscan=off + einen hoeheren
+        // statement_timeout, was ueber normale PostgREST-Header nicht moeglich ist.
+        // Ohne das waehlte der Planer nach VACUUM ANALYZE einen Seq Scan ueber die
+        // gesamte Tabelle statt Index-Scans je ASIN — auf dieser Instanz (t4g.micro)
+        // real langsamer, obwohl rechnerisch "billiger" (18.09., nach stundenlanger
+        // Fehlersuche empirisch bestaetigt: nur Batch=1 mit erzwungenem Index-Scan
+        // lief zuverlaessig).
+        const t0 = Date.now();
+        const r = await fetch(`${U}/rest/v1/rpc/purge_excluded_asins`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_profile_id: profile, p_asins: batch }) });
+        const ms = Date.now() - t0;
+        if (!r.ok) {
+          if (attempt < RETRIES) { retried++; await sleep(1500); continue; }
+          anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-RPC HTTP ${r.status} (Batch ${batchNo}, ${batch.length} ASINs, ${ms}ms, nach ${attempt + 1} Versuchen) — ${(await r.text()).slice(0, 150)}`);
+          break;
+        }
+        ok++; sumMs += ms; if (ms > maxMs) maxMs = ms;
+        if (ms > OUTLIER_MS) console.log(`${cl.name}: ASIN-Deckel-RPC OK, aber auffaellig langsam (Batch ${batchNo}, ${batch.length} ASINs, ${ms}ms${attempt ? `, nach ${attempt} Retry(s)` : ''}).`);
+        else if (ok % LOG_EVERY === 0) console.log(`${cl.name}: ASIN-Deckel-RPC ${ok}/${excluded.length} erledigt (Schnitt ${Math.round(sumMs / ok)}ms, max ${maxMs}ms${retried ? `, ${retried} Retry(s) bisher` : ''}).`);
+        break;
+      } catch (e) {
+        if (attempt < RETRIES) { retried++; await sleep(1500); continue; }
+        anyFailed = true; console.log(`${cl.name}: ASIN-Deckel-RPC FEHLER (Batch ${batchNo}, nach ${attempt + 1} Versuchen) ${e.message}`);
+        break;
+      }
+    }
   }
-  console.log(`${cl.name}: bis zu ${excluded.length} ASINs ausserhalb Top-100 (nach Produktumsatz) ${anyFailed ? 'entfernt (mit Fehlern — siehe oben, alte Zeilen bleiben fuer fehlgeschlagene Batches stehen)' : 'entfernt'}${ok ? ` (Schnitt ${Math.round(sumMs / ok)}ms, max ${maxMs}ms je Batch)` : ''}.`);
+  console.log(`${cl.name}: bis zu ${excluded.length} ASINs ausserhalb Top-100 (nach Produktumsatz) ${anyFailed ? 'entfernt (mit Fehlern — siehe oben, alte Zeilen bleiben fuer fehlgeschlagene Batches stehen)' : 'entfernt'}${ok ? ` (Schnitt ${Math.round(sumMs / ok)}ms, max ${maxMs}ms je Batch${retried ? `, ${retried} Retry(s) insgesamt` : ''})` : ''}.`);
 }
 
 // Baut die vollstaendige Aufgabenliste (Kunde x Periode x Report-Art), fordert
