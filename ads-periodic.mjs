@@ -58,7 +58,15 @@ async function pull(profile, reportTypeId, columns, startDate, endDate, versuch 
 // derselben (profile_id, asin, period_type, period_start, search_term), gab es bisher
 // 409 und die betroffene Periode blieb bei 0 Zeilen (Warnick's/BIOZOYG, wiederholt
 // beobachtet). on_conflict macht die Kollision zu einem harmlosen Merge.
-async function upsert(rows) { let ins = 0; for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_terms_periodic?on_conflict=profile_id,asin,period_type,period_start,search_term`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  INSERT', r.status, (await r.text()).slice(0, 150)); break; } } return ins; }
+// Chunk-Groesse 1000 -> 200 (20.09.): jede PostgREST-Anfrage laeuft ueber die Rolle
+// "authenticator" (fixer Login unabhaengig von anon/service_role), deren statement_timeout
+// von 8s fuer die GESAMTE Anfrage gilt und sich — anders als bei purge_excluded_asins()
+// vermutet — NICHT durch ein SET LOCAL innerhalb einer Funktion verlaengern laesst
+// (Postgres armiert das Timeout einmal zu Beginn des aeusseren Statements). Ein 8s-Timeout
+// bei einem 1000-Zeilen-Chunk loeschte im Produktionslauf vom 18.09. 17 Perioden komplett
+// (siehe Kommentar bei finalizeSearchTerm); kleinere Chunks senken die Wahrscheinlichkeit,
+// dass ein einzelner Chunk unter Last ueber 8s braucht, auf Kosten von mehr Round-Trips.
+async function upsert(rows) { let ins = 0; for (let i = 0; i < rows.length; i += 200) { const chunk = rows.slice(i, i + 200); const r = await fetch(`${U}/rest/v1/ads_asin_terms_periodic?on_conflict=profile_id,asin,period_type,period_start,search_term`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  INSERT', r.status, (await r.text()).slice(0, 150)); break; } } return ins; }
 
 async function hasPeriod(profile, type, start, table = 'ads_asin_terms_periodic') {
   const r = await fetch(`${U}/rest/v1/${table}?profile_id=eq.${profile}&period_type=eq.${type}&period_start=eq.${start}&select=${table.includes('totals') ? 'asin' : 'id'}`, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-0' } });
@@ -84,7 +92,7 @@ async function pullTotals(profile, type, p, topAsins = null) {
   // INSERT, ein 57014 im ersten Chunk liess die Periode komplett leer statt befuellt zurueck.
   const runTs = new Date().toISOString();
   const rows = [...agg.values()].map(e => ({ ...e, ingested_at: runTs })); let ins = 0;
-  for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic?on_conflict=profile_id,asin,period_type,period_start`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS UPSERT', r.status, (await r.text()).slice(0, 150)); break; } }
+  for (let i = 0; i < rows.length; i += 200) { const chunk = rows.slice(i, i + 200); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic?on_conflict=profile_id,asin,period_type,period_start`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS UPSERT', r.status, (await r.text()).slice(0, 150)); break; } }
   if (ins === rows.length) await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&period_type=eq.${type}&period_start=eq.${p.start}&ingested_at=lt.${encodeURIComponent(runTs)}`, { method: 'DELETE', headers: sbHead });
   else console.log(`  TOTALS: nur ${ins}/${rows.length} Zeilen geschrieben — Aufraeumen alter Zeilen uebersprungen.`);
   return ins;
@@ -148,7 +156,7 @@ async function finalizeTotals(job, topAsinsByClient) {
   // ueber ingested_at aufraeumen, statt vorher blind zu loeschen.
   const runTs = new Date().toISOString();
   const rows = [...agg.values()].map(e => ({ ...e, ingested_at: runTs })); let ins = 0;
-  for (let i = 0; i < rows.length; i += 1000) { const chunk = rows.slice(i, i + 1000); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic?on_conflict=profile_id,asin,period_type,period_start`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS UPSERT', r.status, (await r.text()).slice(0, 150)); break; } }
+  for (let i = 0; i < rows.length; i += 200) { const chunk = rows.slice(i, i + 200); const r = await fetch(`${U}/rest/v1/ads_asin_totals_periodic?on_conflict=profile_id,asin,period_type,period_start`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) }); if (r.ok) ins += chunk.length; else { console.log('  TOTALS UPSERT', r.status, (await r.text()).slice(0, 150)); break; } }
   if (ins === rows.length) await fetch(`${U}/rest/v1/ads_asin_totals_periodic?profile_id=eq.${profile}&period_type=eq.${periodType}&period_start=eq.${period.start}&ingested_at=lt.${encodeURIComponent(runTs)}`, { method: 'DELETE', headers: sbHead });
   console.log(`${cl.name} ${jobLabel(job)}: ${ins} ASIN-Totale${ins < rows.length ? ` (von ${rows.length}, unvollstaendig — Aufraeumen uebersprungen)` : ''}`);
 }
