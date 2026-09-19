@@ -182,16 +182,20 @@ const normAsin = s => String(s || '').trim().toUpperCase();
 
 // Manuell gepinnte ASINs (15.09., Kundenwunsch: neue Produkteinfuehrungen sollen nicht
 // vom Deckel erfasst werden, obwohl sie anfangs kaum/keinen Umsatz haben). Eigene, kleine
-// Tabelle ads_asin_manual_keep(profile_id, asin) — muss per SQL im Supabase-Dashboard
-// angelegt werden (siehe Migration). Fail-open: existiert die Tabelle noch nicht oder
-// schlaegt die Abfrage fehl, einfach leere Menge -> Deckel-Logik unveraendert.
+// Tabelle ads_asin_manual_keep(profile_id, asin, asin_type) — Migration siehe
+// adsmasters-platform/apps/sqpr-tool/supabase/migrations/. Fail-open: existiert die Tabelle
+// noch nicht oder schlaegt die Abfrage fehl, einfach leere Mengen -> Deckel-Logik unveraendert.
+// asin_type (20.09., SQPR-Tool-UI): 'asin' pinnt genau diese ASIN, 'parent_asin' pinnt eine
+// ganze Parent-Gruppe (alle aktuellen Kind-ASINs dieses Parents) — siehe topAsinsFor().
 async function manualKeepFor(profile) {
   try {
-    const r = await fetch(`${U}/rest/v1/ads_asin_manual_keep?profile_id=eq.${profile}&select=asin`, { headers: sbHead });
-    if (!r.ok) return new Set();
+    const r = await fetch(`${U}/rest/v1/ads_asin_manual_keep?profile_id=eq.${profile}&select=asin,asin_type`, { headers: sbHead });
+    if (!r.ok) return { asins: new Set(), parents: new Set() };
     const rows = await r.json();
-    return new Set(rows.map(x => normAsin(x.asin)));
-  } catch (e) { return new Set(); }
+    const asins = new Set(), parents = new Set();
+    for (const row of rows) (row.asin_type === 'parent_asin' ? parents : asins).add(normAsin(row.asin));
+    return { asins, parents };
+  } catch (e) { return { asins: new Set(), parents: new Set() }; }
 }
 
 // ASIN-Deckel (13.09., Kundenwunsch, erweitert 15.09.): pro Kunde ASINs behalten, die
@@ -253,7 +257,13 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
     const keepFromParents = new Set();
     for (const [asin, p] of parentOf) if (top25Parents.has(p)) keepFromParents.add(asin);
 
-    const top = new Set([...top100, ...keepFromParents, ...manualKeep]);
+    // Manuell gepinnte Parent-ASINs (20.09.) auf ihre AKTUELLEN Kind-ASINs ausweiten —
+    // dieselbe parentOf-Zuordnung wie oben, nur gegen die manuell gepinnten Parents statt
+    // der Top-25-Parents gefiltert.
+    const manualKeepViaParent = new Set();
+    for (const [asin, p] of parentOf) if (manualKeep.parents.has(p)) manualKeepViaParent.add(asin);
+
+    const top = new Set([...top100, ...keepFromParents, ...manualKeep.asins, ...manualKeepViaParent]);
     const excluded = ranked.filter(([asin]) => !top.has(asin)).map(([asin]) => asin);
 
     if (DECKEL_DRY_RUN) {
@@ -262,7 +272,7 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
       console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: Top-15 nach Umsatz: ${top15}`);
       console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: Grenzbereich (#${n - 2}-#${n + 3}): ${boundary}`);
       console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: ${byParentSales.size} Parent-Gruppen, Top-${parentN} davon bringen ${keepFromParents.size} Kind-ASINs zusaetzlich zu Top-${n} (${[...keepFromParents].filter(a => !top100.has(a)).length} davon NEU ueber Top-${n} hinaus).`);
-      console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: ${manualKeep.size} manuell gepinnte ASIN(s), davon ${[...manualKeep].filter(a => !top100.has(a) && !keepFromParents.has(a)).length} zusaetzlich ueber Top-${n}/Top-${parentN}-Parents hinaus.`);
+      console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: ${manualKeep.asins.size} manuell gepinnte ASIN(s) + ${manualKeep.parents.size} gepinnte Parent-ASIN(s) (-> ${manualKeepViaParent.size} Kind-ASINs), davon ${[...manualKeep.asins, ...manualKeepViaParent].filter(a => !top100.has(a) && !keepFromParents.has(a)).length} zusaetzlich ueber Top-${n}/Top-${parentN}-Parents hinaus.`);
     }
     return { top, excluded };
   } catch (e) { console.log(`  ASIN-Deckel: FEHLER ${e.message} — kein Deckel fuer dieses spid/Markt (fail-open).`); return { top: null, excluded: [] }; }
