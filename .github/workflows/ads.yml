@@ -67,6 +67,17 @@ jobs:
           ADS_ONLY_PROFILE: ${{ github.event.inputs.only_profile }}
           ASIN_DECKEL_DRY_RUN: ${{ github.event.inputs.dry_run_asin_cap }}
           ASIN_DECKEL_BATCH: ${{ github.event.inputs.asin_cap_batch_size }}
+          # 20.09., externe Review: der ASIN-Deckel ist bewusst fail-open — ein andauernder
+          # Fehler wuerde sonst beliebig lange unbemerkt bleiben, weil der Prozess trotzdem
+          # exit 0 meldet und der separate alert-on-failure-Job unten NICHT greift. Eigene,
+          # direkte Slack-Meldung aus ads-periodic.mjs selbst (siehe alertFailOpenIfAny()),
+          # unabhaengig vom Prozess-Exit-Code.
+          # Plain English: this line just makes the Slack address available to the script
+          # itself. It was already used below by the "the whole job crashed" alert, but that
+          # alert never fires for a fail-open (the script still exits successfully on
+          # purpose) — so without this line, the new alert code in ads-periodic.mjs would
+          # have nowhere to send its message and would just quietly log instead.
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
   # Eigener Job statt Step: ein harter Job-Timeout-Kill (siehe oben) beendet den
   # laufenden Job SOFORT und fuehrt keine weiteren if:failure()/cancelled()-Steps

@@ -180,6 +180,39 @@ async function finalizeTotals(job, topAsinsByClient) {
 //    MGF-FRs Top-100 fallen, weil die anderen drei Maerkte es "verduennen".
 const normAsin = s => String(s || '').trim().toUpperCase();
 
+// Fail-Open-Meldung an Slack (20.09., externe Review — Finding: der Watchdog erkennt nur
+// einen Prozess, der komplett fehlschlaegt (exit != 0) — der ASIN-Deckel ist aber bewusst
+// fail-open gebaut (siehe manualKeepFor()/topAsinsFor() unten): ein andauernder Fehler
+// (rotierter Service-Key, umbenannte Tabelle, RLS-Regression) wuerde den Deckel + Schutz
+// manuell gepinnter ASINs beliebig lange komplett abschalten, waehrend der Prozess weiterhin
+// exit 0 meldet und CI/Slack gruen bleiben — genau das Bloat-Problem (BIOZOYG etc.), das
+// dieses Feature ueberhaupt erst loesen sollte, koennte so unbemerkt zurueckkommen. Eigene,
+// gebuendelte Meldung statt pro Client einzeln (ein systemischer Fehler betrifft typischerweise
+// ALLE Clients in einem Lauf, nicht nur einen) — separat vom bestehenden alert-on-failure-Job
+// in ads.yml, der nur bei einem nicht-erfolgreichen Prozess-Exit greift.
+// Plain-English summary: the ASIN-cap logic below is built to "fail open" — if it can't
+// confirm the data it needs, it does NOTHING to that client's data rather than guess and
+// risk deleting something it shouldn't. That's the safe choice, but it used to be invisible:
+// it only printed a line to the run's log, and your Slack alerts only fire when the whole
+// script crashes. If a fail-open kept happening every single day (say, because a password
+// was rotated somewhere), the cleanup system could stay silently switched off for weeks with
+// every dashboard still green. These three pieces fix that: every time a fail-open happens,
+// we remember it (recordFailOpen), and at the very end of the run, if anything was recorded,
+// we send ONE Slack message listing every client + reason (alertFailOpenIfAny) — separate
+// from the existing "the whole job crashed" alert. If Slack isn't configured, it just logs
+// instead of erroring out.
+const failOpenEvents = [];
+function recordFailOpen(cl, reason) { failOpenEvents.push(`${cl.name}: ${reason}`); }
+async function alertFailOpenIfAny() {
+  if (!failOpenEvents.length) return;
+  const text = `⚠️ *ASIN-Deckel Fail-Open* (${failOpenEvents.length}x diesen Lauf) — Deckel/Schutz manuell gepinnter ASINs war fuer diese Kunden AUS:\n• ${failOpenEvents.join('\n• ')}`;
+  console.log(text);
+  const webhook = process.env.SLACK_WEBHOOK_URL;
+  if (!webhook) { console.log('(Kein SLACK_WEBHOOK_URL-Secret — nur im Log gemeldet.)'); return; }
+  try { const r = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }); if (!r.ok) console.log('Slack-POST fuer Fail-Open-Meldung fehlgeschlagen: HTTP ' + r.status); }
+  catch (e) { console.log('Slack-POST fuer Fail-Open-Meldung fehlgeschlagen: ' + e.message); }
+}
+
 // Manuell gepinnte ASINs (15.09., Kundenwunsch: neue Produkteinfuehrungen sollen nicht
 // vom Deckel erfasst werden, obwohl sie anfangs kaum/keinen Umsatz haben). Eigene, kleine
 // Tabelle ads_asin_manual_keep(profile_id, asin, asin_type) — Migration siehe
@@ -187,15 +220,61 @@ const normAsin = s => String(s || '').trim().toUpperCase();
 // noch nicht oder schlaegt die Abfrage fehl, einfach leere Mengen -> Deckel-Logik unveraendert.
 // asin_type (20.09., SQPR-Tool-UI): 'asin' pinnt genau diese ASIN, 'parent_asin' pinnt eine
 // ganze Parent-Gruppe (alle aktuellen Kind-ASINs dieses Parents) — siehe topAsinsFor().
+// Rueckgabewert null (statt leerer Mengen) bei jedem Fehlschlag (20.09., 3-fache externe
+// Review — Finding: die Rueckgabe leerer Mengen wurde von topAsinsFor() nicht von "es gibt
+// wirklich keine Pins" unterschieden. Ein transienter Fehler HIER liess topAsinsFor() ganz
+// normal weiterrechnen und purgeExcludedAsins() ausfuehren — es purgte also genau die ASINs,
+// die dieses Feature eigentlich schuetzen soll. topAsinsFor() muss auf null pruefen und dann
+// SEINERSEITS fail-open gehen (kein Deckel diesen Lauf fuer diesen Kunden), statt die Pins
+// stillschweigend als "keine" zu behandeln.
+// Plain-English summary: this loads the list of ASINs a staff member has manually
+// "pinned" for one client via the Tracked-ASINs page, so they get kept even if they'd
+// otherwise fall outside the top-100/top-25-parent cap below (e.g. a brand-new product
+// with no sales yet). It fetches in pages of 1000 (Supabase silently caps a single
+// request at 1000 rows, so without paging a client with lots of pins would quietly lose
+// some) and always in the same sorted order (so paging in twice never skips or repeats a
+// row). If ANYTHING about that fetch fails — even on page 2 of 5 — this returns `null`,
+// not "we checked and found nothing." That distinction matters a lot: the caller
+// (topAsinsFor, below) needs to tell "genuinely no pins" apart from "we couldn't check,"
+// because treating a failed check as "no pins" would make the cap logic go ahead and
+// delete the very ASINs this feature exists to protect.
 async function manualKeepFor(profile) {
   try {
-    const r = await fetch(`${U}/rest/v1/ads_asin_manual_keep?profile_id=eq.${profile}&select=asin,asin_type`, { headers: sbHead });
-    if (!r.ok) return { asins: new Set(), parents: new Set() };
-    const rows = await r.json();
-    const asins = new Set(), parents = new Set();
-    for (const row of rows) (row.asin_type === 'parent_asin' ? parents : asins).add(normAsin(row.asin));
-    return { asins, parents };
-  } catch (e) { return { asins: new Set(), parents: new Set() }; }
+    // Paginiert wie asin_sales_traffic in topAsinsFor() (20.09., externe Review): dieselbe
+    // Supabase-Instanz deckelt jede unpaginierte REST-Antwort auf 1000 Zeilen — ohne das
+    // waeren Pins jenseits der ersten 1000 fuer einen Kunden mit vielen manuellen Eintraegen
+    // still unsichtbar geblieben, ohne jede Fehlermeldung.
+    // order=asin.asc (20.09., 3-fache externe Review): dieselbe Paginierungs-Instabilitaet
+    // wie bei asin_sales_traffic oben — ohne stabile Sortierung ueber mehrere Range-Anfragen
+    // hinweg koennten Pins uebersprungen oder doppelt geliefert werden.
+    const url = `${U}/rest/v1/ads_asin_manual_keep?profile_id=eq.${profile}&select=asin,asin_type,child_asins&order=asin.asc`;
+    const first = await fetch(url, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-999' } });
+    if (!first.ok) { console.log(`  Manuelle Pins: HTTP ${first.status} — Deckel faellt fuer diesen Kunden diesen Lauf komplett aus (fail-open).`); return null; }
+    const total = +((first.headers.get('content-range') || '0/0').split('/')[1]) || 0;
+    const rows = await first.json();
+    for (let f = 1000; f < total; f += 1000) {
+      const r = await fetch(url, { headers: { ...sbHead, Range: `${f}-${f + 999}` } });
+      if (!r.ok) { console.log(`  Manuelle Pins: Seite ${f}-${f + 999} HTTP ${r.status} — Deckel faellt fuer diesen Kunden diesen Lauf komplett aus (fail-open).`); return null; }
+      rows.push(...(await r.json()));
+    }
+    const asins = new Set(), parents = new Set(), staticChildren = new Set();
+    for (const row of rows) {
+      if (row.asin_type === 'parent_asin') {
+        parents.add(normAsin(row.asin));
+        // Beim Pinnen via SQPR-Tool-UI live bei Amazon bestaetigte Kind-ASINs (20.09.,
+        // externe Review — Finding 1): parentOf unten kennt eine Kind-ASIN erst, sobald
+        // sie eine Zeile in asin_sales_traffic hat (also schon Sitzungen/Umsatz hatte) —
+        // eine ganz neue Familie ohne jede Aktivitaet blieb dadurch bis zu ~1-2 Tage
+        // ungeschuetzt. Diese Liste ergaenzt (nicht ersetzt) die dynamische Ableitung,
+        // damit der Schutz sofort ab dem Pin-Zeitpunkt gilt, nicht erst nachdem
+        // asin_sales_traffic aufgeholt hat.
+        for (const c of row.child_asins || []) staticChildren.add(normAsin(c));
+      } else {
+        asins.add(normAsin(row.asin));
+      }
+    }
+    return { asins, parents, staticChildren };
+  } catch (e) { console.log(`  Manuelle Pins: FEHLER ${e.message} — Deckel faellt fuer diesen Kunden diesen Lauf komplett aus (fail-open).`); return null; }
 }
 
 // ASIN-Deckel (13.09., Kundenwunsch, erweitert 15.09.): pro Kunde ASINs behalten, die
@@ -219,13 +298,38 @@ async function manualKeepFor(profile) {
 //    Ohne marketplace-Filter bekaemen alle vier dieselbe, ueber alle vier Maerkte
 //    gemischte Rangliste — ein ASIN, das nur in FR gut verkauft, koennte so aus
 //    MGF-FRs Top-100 fallen, weil die anderen drei Maerkte es "verduennen".
+// Plain-English summary: works out, for one client, the full set of ASINs allowed to
+// keep their ad-history data this run. An ASIN survives if ANY of these are true:
+//   1. It's in the top 100 by real product sales for that client.
+//   2. It belongs to a "family" (parent ASIN + its variants) whose combined sales rank
+//      in the top 25 families — even if this particular variant alone wouldn't make the cut.
+//   3. It (or its whole family) was manually pinned by staff via the Tracked-ASINs page.
+// Everything else comes back in `excluded`, which the caller then deletes.
+// This function is fail-open at four separate points (each returns {top: null, excluded: []}
+// meaning "don't touch anything for this client this run"): if the sales-data fetch fails
+// (on the first page or any later page), if the manual-pins lookup fails, or if anything
+// else throws unexpectedly. Every one of those four cases also calls recordFailOpen() so it
+// surfaces in the batched Slack alert described above, instead of only sitting in a log file.
 async function topAsinsFor(cl, n = 100, parentN = 25) {
   const spid = cl.spid, marketplace = cl.marketplace, profile = String(cl.ads_profile_id);
   try {
     const mkt = (marketplace || 'DE').toUpperCase();
-    const url = `${U}/rest/v1/asin_sales_traffic?spid=eq.${spid}&marketplace=eq.${mkt}&select=asin,sales,parent_asin`;
+    // order=asin.asc (20.09., externe Review): ohne explizite Sortierung ist die Reihenfolge
+    // ueber mehrere einzelne Range-Anfragen hinweg nicht garantiert stabil — koennte Zeilen
+    // je Seite ueberspringen oder doppelt liefern und die Top-N-Rangliste fuer genau die
+    // grossen Konten verfaelschen, die diese Paginierung ueberhaupt erst durchlaufen
+    // (spid,asin,marketplace ist laut sales-traffic.mjs's on_conflict eindeutig, also
+    // reicht asin allein als stabiler Sortierschluessel).
+    // days=eq.30 (20.09., externe Review): sales-traffic.mjs's on_conflict-Ziel ist
+    // tatsaechlich (spid,asin,days,marketplace) — vier Spalten, nicht drei — und der
+    // Kommentar unten ("eindeutig") galt nur, WEIL heute jeder Aufruf mit demselben
+    // Tageswert (30, siehe daily-data.yml) laeuft. Ohne diesen Filter wuerde ein
+    // zukuenftiger Aufruf mit einem anderen Tageswert JEDE ASIN doppelt zaehlen (zwei
+    // Zeilen pro ASIN summiert statt einer), die Top-100/Top-25-Parent-Rangliste verfaelschen
+    // und damit falsch entscheiden, welche echten Ad-Verlaufsdaten geloescht werden.
+    const url = `${U}/rest/v1/asin_sales_traffic?spid=eq.${spid}&marketplace=eq.${mkt}&days=eq.30&select=asin,sales,parent_asin&order=asin.asc`;
     const first = await fetch(url, { headers: { ...sbHead, Prefer: 'count=exact', Range: '0-999' } });
-    if (!first.ok) { console.log(`  ASIN-Deckel: asin_sales_traffic HTTP ${first.status} — kein Deckel fuer dieses spid/Markt (fail-open).`); return { top: null, excluded: [] }; }
+    if (!first.ok) { const msg = `asin_sales_traffic HTTP ${first.status} — kein Deckel fuer dieses spid/Markt (fail-open).`; console.log(`  ASIN-Deckel: ${msg}`); recordFailOpen(cl, msg); return { top: null, excluded: [] }; }
     const total = +((first.headers.get('content-range') || '0/0').split('/')[1]) || 0;
     const rows = await first.json();
     for (let f = 1000; f < total; f += 1000) {
@@ -234,7 +338,7 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
       // Zeilen, dadurch faelschlich niedrig gerankte ASINs waeren geloescht worden, ohne
       // dass irgendwo ein Fehler aufgetaucht waere. Jetzt: jede Seite muss gelingen, sonst
       // kompletter Fail-Open (kein Deckel) statt einer auf falschen Daten basierenden Rangliste.
-      if (!r.ok) { console.log(`  ASIN-Deckel: asin_sales_traffic Seite ${f}-${f + 999} HTTP ${r.status} — kein Deckel fuer dieses spid/Markt (fail-open, unvollstaendige Daten waeren sonst falsch gerankt).`); return { top: null, excluded: [] }; }
+      if (!r.ok) { const msg = `asin_sales_traffic Seite ${f}-${f + 999} HTTP ${r.status} — kein Deckel fuer dieses spid/Markt (fail-open, unvollstaendige Daten waeren sonst falsch gerankt).`; console.log(`  ASIN-Deckel: ${msg}`); recordFailOpen(cl, msg); return { top: null, excluded: [] }; }
       rows.push(...(await r.json()));
     }
     const bySales = new Map(); // childAsin -> summierter Umsatz
@@ -245,7 +349,12 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
       const p = normAsin(row.parent_asin) || a;
       parentOf.set(a, p);
     }
+    // manualKeepFor() liefert null bei jedem Fehlschlag (20.09., 3-fache externe Review) —
+    // ohne diese Pruefung wuerden ihre leeren Ersatzmengen (frueheres Verhalten) hier still als
+    // "keine manuellen Pins" durchgehen und purgeExcludedAsins() wuerde genau die ASINs
+    // loeschen, die dieses Feature eigentlich vor dem Deckel schuetzen soll.
     const manualKeep = await manualKeepFor(profile);
+    if (!manualKeep) { const msg = `manuelle Pins nicht verfuegbar — kein Deckel fuer diesen Kunden diesen Lauf (fail-open).`; console.log(`  ASIN-Deckel: ${msg}`); recordFailOpen(cl, msg); return { top: null, excluded: [] }; }
     if (bySales.size <= n) return { top: null, excluded: [] }; // schon <= n ASINs — Deckel waere ein No-Op (Top-25-Parent/manuell aendern daran nichts)
     const ranked = [...bySales.entries()].sort((a, b) => b[1] - a[1]);
     const top100 = new Set(ranked.slice(0, n).map(([asin]) => asin));
@@ -260,10 +369,14 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
     // Manuell gepinnte Parent-ASINs (20.09.) auf ihre AKTUELLEN Kind-ASINs ausweiten —
     // dieselbe parentOf-Zuordnung wie oben, nur gegen die manuell gepinnten Parents statt
     // der Top-25-Parents gefiltert.
+    // In plain English: if staff pinned a whole "Parent ASIN" family, this line finds every
+    // variant currently linked to that parent in our sales data and protects them too — same
+    // logic as the top-25-families rule two blocks up, just checked against the manually
+    // pinned parents instead of the top-25 ranking.
     const manualKeepViaParent = new Set();
     for (const [asin, p] of parentOf) if (manualKeep.parents.has(p)) manualKeepViaParent.add(asin);
 
-    const top = new Set([...top100, ...keepFromParents, ...manualKeep.asins, ...manualKeepViaParent]);
+    const top = new Set([...top100, ...keepFromParents, ...manualKeep.asins, ...manualKeepViaParent, ...manualKeep.staticChildren]);
     const excluded = ranked.filter(([asin]) => !top.has(asin)).map(([asin]) => asin);
 
     if (DECKEL_DRY_RUN) {
@@ -272,10 +385,10 @@ async function topAsinsFor(cl, n = 100, parentN = 25) {
       console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: Top-15 nach Umsatz: ${top15}`);
       console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: Grenzbereich (#${n - 2}-#${n + 3}): ${boundary}`);
       console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: ${byParentSales.size} Parent-Gruppen, Top-${parentN} davon bringen ${keepFromParents.size} Kind-ASINs zusaetzlich zu Top-${n} (${[...keepFromParents].filter(a => !top100.has(a)).length} davon NEU ueber Top-${n} hinaus).`);
-      console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: ${manualKeep.asins.size} manuell gepinnte ASIN(s) + ${manualKeep.parents.size} gepinnte Parent-ASIN(s) (-> ${manualKeepViaParent.size} Kind-ASINs), davon ${[...manualKeep.asins, ...manualKeepViaParent].filter(a => !top100.has(a) && !keepFromParents.has(a)).length} zusaetzlich ueber Top-${n}/Top-${parentN}-Parents hinaus.`);
+      console.log(`  [DRY RUN] spid=${spid} mkt=${mkt}: ${manualKeep.asins.size} manuell gepinnte ASIN(s) + ${manualKeep.parents.size} gepinnte Parent-ASIN(s) (-> ${manualKeepViaParent.size} Kind-ASINs dynamisch + ${manualKeep.staticChildren.size} statisch beim Pinnen bestaetigt), davon ${[...manualKeep.asins, ...manualKeepViaParent, ...manualKeep.staticChildren].filter(a => !top100.has(a) && !keepFromParents.has(a)).length} zusaetzlich ueber Top-${n}/Top-${parentN}-Parents hinaus.`);
     }
     return { top, excluded };
-  } catch (e) { console.log(`  ASIN-Deckel: FEHLER ${e.message} — kein Deckel fuer dieses spid/Markt (fail-open).`); return { top: null, excluded: [] }; }
+  } catch (e) { const msg = `FEHLER ${e.message} — kein Deckel fuer dieses spid/Markt (fail-open).`; console.log(`  ASIN-Deckel: ${msg}`); recordFailOpen(cl, msg); return { top: null, excluded: [] }; }
 }
 
 // Loescht bestehende Zeilen fuer ASINs ausserhalb der Top-100 — sowohl beim ersten
@@ -305,9 +418,35 @@ const DECKEL_DRY_RUN = /^(1|true|yes)$/i.test(process.env.ASIN_DECKEL_DRY_RUN ||
 //    10 Minuten) — fuer die laufende Pflegeregel (typ. wenige neu herausfallende ASINs
 //    pro Lauf) reicht das, groessere Werte nur nach eigenem Test erhoehen.
 const DECKEL_BATCH = Math.max(1, +(process.env.ASIN_DECKEL_BATCH || 1));
+// Plain-English summary: deletes the stored ad-history rows for every ASIN that
+// topAsinsFor() decided is NOT allowed to be kept for this client. Runs on every single
+// pass — the first time after this feature shipped, this cleaned up years of accumulated
+// history for excluded ASINs; on every run after that, it's a small "whatever fell out of
+// the cap since last time" tidy-up. Deletes go through a database function
+// (purge_excluded_asins), one small batch of ASINs at a time, with retries — a plain bulk
+// DELETE kept timing out on the biggest client's table, and small retried batches turned out
+// to be the reliable fix.
 async function purgeExcludedAsins(cl, excluded) {
   if (!excluded.length) return;
   const profile = String(cl.ads_profile_id);
+  // Sicherheits-Zeitstempel (20.09., externe Review): purge_excluded_asins() loeschte bisher
+  // OHNE Ruecksicht auf ingested_at — anders als jeder andere DELETE in dieser Datei (siehe
+  // pullTotals/finalizeSearchTerm), die bewusst nur Zeilen AELTER als der eigene Laufstart
+  // aufraeumen, genau um einen zeitgleichen zweiten Lauf (Hetzner-Daemon vs. GitHub-Cron —
+  // beide fahren unabhaengige Alle-Kunden-Durchlaeufe, siehe ads.yml-Kommentar zur
+  // concurrency-Gruppe) nicht die frisch geschriebenen Zeilen des jeweils anderen loeschen
+  // zu lassen. Bisher aeusserte sich das nur ueber leicht unterschiedliche excluded-Listen
+  // zwischen zwei Laeufen (asin_sales_traffic-Timing) — die Tracked-ASINs-UI macht
+  // Pin-Aenderungen jetzt aber alltaeglich statt selten per SQL, was dieses Zeitfenster
+  // deutlich haeufiger tatsaechlich trifft.
+  // In plain English: this pipeline can run from two different places at the same time —
+  // a daily GitHub job and a separate always-on process on your server, roughly every 6
+  // hours — and they don't coordinate with each other. Without this timestamp, one of them
+  // could delete rows the OTHER one just finished writing a second ago, because it doesn't
+  // know a sibling run is even happening. By only deleting rows older than "now" (captured
+  // right here, before any deleting starts), a run never deletes data written by another
+  // run that started after it did.
+  const purgeBefore = new Date().toISOString();
   if (DECKEL_DRY_RUN) {
     for (let i = 0; i < excluded.length; i += DECKEL_BATCH) {
       const batch = excluded.slice(i, i + DECKEL_BATCH);
@@ -364,7 +503,7 @@ async function purgeExcludedAsins(cl, excluded) {
         // Fehlersuche empirisch bestaetigt: nur Batch=1 mit erzwungenem Index-Scan
         // lief zuverlaessig).
         const t0 = Date.now();
-        const r = await fetch(`${U}/rest/v1/rpc/purge_excluded_asins`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_profile_id: profile, p_asins: batch }) });
+        const r = await fetch(`${U}/rest/v1/rpc/purge_excluded_asins`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_profile_id: profile, p_asins: batch, p_before: purgeBefore }) });
         const ms = Date.now() - t0;
         if (!r.ok) {
           if (attempt < RETRIES) { retried++; await sleep(1500); continue; }
@@ -593,9 +732,13 @@ async function main() {
       }
     }));
     console.log(`\nTOTALS-NACHZUG FERTIG: ${ok} Perioden neu geladen.`);
+    // Plain English: only one of these two calls ever runs per script run (this branch
+    // returns right after), so there's no risk of sending the Slack alert twice.
+    await alertFailOpenIfAny();
     return;
   }
   await runNormalPeriodicPass(clients, ms, weeksList(NW));
+  await alertFailOpenIfAny(); // same call as above, for the normal (non-catch-up) run mode
   console.log('FERTIG.');
 }
 main().catch(e => { console.error('FEHLER', e.message); process.exit(1); });
