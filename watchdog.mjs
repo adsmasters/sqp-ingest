@@ -34,7 +34,16 @@ try {
 // 2) Geplante Workflows: gab es innerhalb der Frist einen erfolgreichen Lauf?
 //    (vorher nur backfill+daily-data — ads/vendor/refresh/bid-rules konnten wochenlang
 //    still sterben, weil deren Skripte Fehler schlucken; Deep-Dive 12.08.)
-const WF_FRIST = { 'backfill.yml': 30, 'daily-data.yml': 30, 'ads.yml': 30, 'vendor.yml': 30, 'bid-rules.yml': 30, 'refresh.yml': 8 * 24 };
+// backfill.yml auf 40h angehoben (28.09.): der Cron ist auf 04:30 UTC gestellt, feuert
+// aber wegen GitHub-eigener Scheduling-Verzoegerung (dokumentiertes Verhalten bei vielen
+// parallelen Cron-Workflows in einem Repo — hier laufen 7+) real meist erst 4-6h spaeter.
+// Bei 30h Frist bleiben dafuer nur ~6h Puffer ueber dem taeglichen Turnus — reicht nicht,
+// sobald die Verzoegerung an einem Tag etwas groesser als sonst ausfaellt. Alle sichtbaren
+// Laeufe waren dabei durchgehend gruen (kein echter Ausfall, kein fehlender Tag) — nur der
+// naechste Tag hat den Alarm schon durch einen puenktlicheren Lauf wieder geloescht. 40h
+// gibt der ueblichen Verzoegerung genug Raum, ohne einen echten mehrtaegigen Ausfall zu
+// verschleiern.
+const WF_FRIST = { 'backfill.yml': 40, 'daily-data.yml': 30, 'ads.yml': 30, 'vendor.yml': 30, 'bid-rules.yml': 30, 'refresh.yml': 8 * 24 };
 for (const [wf, fristH] of Object.entries(WF_FRIST)) {
   try {
     const gh = (url) => fetch(url, { headers: { Authorization: 'Bearer ' + GH, Accept: 'application/vnd.github+json' } });
