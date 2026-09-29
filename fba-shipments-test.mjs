@@ -19,8 +19,14 @@ const at = (await t.json()).access_token; if (!at) { console.error('LWA-Token fe
 const H = { 'x-amz-access-token': at, 'Content-Type': 'application/json' };
 console.log(`Konto: ${rows[0].account_name || spid}, Marketplace ${mktKey}, Zeitraum ${start} bis ${end}`);
 
-const c = await fetch(`${SPAPI}/reports/2021-06-30/reports`, { method: 'POST', headers: H, body: JSON.stringify({ reportType: 'GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL', marketplaceIds: [mkt], dataStartTime: `${start}T00:00:00Z`, dataEndTime: `${end}T23:59:59Z` }) });
-const cj = await c.json(); console.log('Anlegen:', c.status, JSON.stringify(cj.errors || '').slice(0, 200));
+// Kontingent wird mit Sellerboard & Seller Central geteilt: bei 429 alle 10 Min erneut versuchen (max. ~5 Std).
+let cj = {};
+for (let k = 0; k < 30; k++) {
+  const c = await fetch(`${SPAPI}/reports/2021-06-30/reports`, { method: 'POST', headers: H, body: JSON.stringify({ reportType: 'GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL', marketplaceIds: [mkt], dataStartTime: `${start}T00:00:00Z`, dataEndTime: `${end}T23:59:59Z` }) });
+  cj = await c.json(); console.log(new Date().toISOString(), 'Anlegen:', c.status, JSON.stringify(cj.errors || '').slice(0, 200));
+  if (c.status !== 429) break;
+  await new Promise(r => setTimeout(r, 600000));
+}
 if (!cj.reportId) process.exit(1);
 
 let rep; for (let i = 0; i < 60; i++) {
