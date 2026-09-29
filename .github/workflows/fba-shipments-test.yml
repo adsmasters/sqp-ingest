@@ -1,0 +1,34 @@
+name: FBA-Versandbericht-Test (read-only)
+# Test 29.09.2026: liefert die SP-API den FBA-Versandbericht inkl. buyer-email (Alias)?
+# Gibt nur Zaehlwerte aus, keine Kundendaten (Repo ist oeffentlich).
+on:
+  workflow_dispatch:
+    inputs:
+      spid:
+        description: 'SP-API Seller-Konto (spid)'
+        required: true
+        default: 'AB0SPXUYQ1F1W'
+      mkt:
+        description: 'Marketplace (DE/FR/IT/ES/UK/NL)'
+        default: 'DE'
+      start:
+        description: 'Start (YYYY-MM-DD)'
+        default: '2026-01-01'
+      end:
+        description: 'Ende (YYYY-MM-DD)'
+        default: '2026-01-31'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node fba-shipments-test.mjs "${{ inputs.spid }}" "${{ inputs.mkt }}" "${{ inputs.start }}" "${{ inputs.end }}"
+        env:
+          SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
+          SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
