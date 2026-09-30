@@ -34,26 +34,23 @@ try {
 // 2) Geplante Workflows: gab es innerhalb der Frist einen erfolgreichen Lauf?
 //    (vorher nur backfill+daily-data — ads/vendor/refresh/bid-rules konnten wochenlang
 //    still sterben, weil deren Skripte Fehler schlucken; Deep-Dive 12.08.)
-// backfill.yml auf 40h angehoben (28.09.): der Cron ist auf 04:30 UTC gestellt, feuert
-// aber wegen GitHub-eigener Scheduling-Verzoegerung (dokumentiertes Verhalten bei vielen
-// parallelen Cron-Workflows in einem Repo — hier laufen 7+) real meist erst 4-6h spaeter.
-// Bei 30h Frist bleiben dafuer nur ~6h Puffer ueber dem taeglichen Turnus — reicht nicht,
-// sobald die Verzoegerung an einem Tag etwas groesser als sonst ausfaellt. Alle sichtbaren
-// Laeufe waren dabei durchgehend gruen (kein echter Ausfall, kein fehlender Tag) — nur der
-// naechste Tag hat den Alarm schon durch einen puenktlicheren Lauf wieder geloescht. 40h
-// gibt der ueblichen Verzoegerung genug Raum, ohne einen echten mehrtaegigen Ausfall zu
-// verschleiern.
-const WF_FRIST = { 'backfill.yml': 40, 'daily-data.yml': 30, 'ads.yml': 30, 'vendor.yml': 30, 'bid-rules.yml': 30, 'refresh.yml': 8 * 24 };
+const WF_FRIST = { 'backfill.yml': 30, 'daily-data.yml': 30, 'ads.yml': 30, 'vendor.yml': 30, 'bid-rules.yml': 30, 'refresh.yml': 8 * 24 };
 for (const [wf, fristH] of Object.entries(WF_FRIST)) {
   try {
     const gh = (url) => fetch(url, { headers: { Authorization: 'Bearer ' + GH, Accept: 'application/vnd.github+json' } });
-    const ok = await (await gh(`https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?status=success&per_page=1`)).json();
-    if (!ok.workflow_runs) { issues.push(`Watchdog: ${wf} nicht prüfbar (GitHub-API/Token)`); continue; }
-    const last = ok.workflow_runs[0];
+    // Ungefilterte Laufliste + Erfolg selbst herausfischen (30.09.): der frueher genutzte Filter
+    // ?status=success laeuft ueber einen Suchindex, der bei GitHub teils Tage hinterherhinkt —
+    // bid-rules.yml lief durchgehend gruen (mehrmals taeglich), der Wächter meldete trotzdem
+    // "letzter Erfolg: 22.08." (Filter-Ansicht zeigte am 30.09. nur bis 28.09.); dasselbe
+    // erklaert wohl auch die wiederkehrenden backfill.yml-Fehlalarme (alle Laeufe gruen, kein
+    // Tag fehlte). Die ungefilterte Liste ist aktuell (wird schon fuer den in_progress-Check
+    // genutzt). 30 Laeufe decken auch das haeufigste Workflow (bid-rules, ~5/Tag) ueber 30h ab.
+    const all = await (await gh(`https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?per_page=30`)).json();
+    if (!all.workflow_runs) { issues.push(`Watchdog: ${wf} nicht prüfbar (GitHub-API/Token)`); continue; }
+    const last = all.workflow_runs.find(r => r.conclusion === 'success');
     if (last && Date.now() - Date.parse(last.updated_at) <= fristH * 3600e3) continue;
     // kein frischer Erfolg: nur melden, wenn nicht gerade ein Lauf unterwegs ist (frisch eingerichteter Workflow)
-    const any = await (await gh(`https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?per_page=1`)).json();
-    const newest = any.workflow_runs && any.workflow_runs[0];
+    const newest = all.workflow_runs[0];
     if (newest && ['in_progress', 'queued'].includes(newest.status)) continue;
     issues.push(`${wf}: kein erfolgreicher Lauf in den letzten ${fristH}h${last ? ` (letzter Erfolg: ${last.updated_at.slice(0, 16)}Z)` : ''}`);
   } catch (e) { issues.push(`Watchdog: ${wf}-Läufe nicht prüfbar (${e.message})`); }
