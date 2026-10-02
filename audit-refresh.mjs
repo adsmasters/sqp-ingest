@@ -3,6 +3,8 @@
 // Die Audit-Seite laedt daraus SOFORT — kein Warten auf Amazon beim Oeffnen.
 // ENV: ADS_CLIENT_ID/SECRET/REFRESH_TOKEN, SUPABASE_URL/SERVICE_KEY
 import zlib from 'node:zlib';
+// Amazon-Business-Auswertung: identische Datei wie ppc-callback/api/_lib/audit-b2b.js (Test vergleicht byteweise)
+import { aggregateB2b, b2bBidAdjRows, buildCampaignBids } from './audit-b2b.mjs';
 const U = process.env.SUPABASE_URL, KEY = process.env.SUPABASE_SERVICE_KEY;
 const CID = process.env.ADS_CLIENT_ID, SEC = process.env.ADS_CLIENT_SECRET, RT = process.env.ADS_REFRESH_TOKEN;
 if (!U || !KEY || !CID || !SEC || !RT) { console.error('FEHLER: ENV fehlt.'); process.exit(1); }
@@ -20,6 +22,13 @@ const DEFS = {
   sb_search_terms: { adProduct: 'SPONSORED_BRANDS', reportTypeId: 'sbSearchTerm', groupBy: ['searchTerm'], columns: ['searchTerm', 'keywordText', 'matchType', 'campaignName', 'impressions', 'clicks', 'cost', 'purchases', 'sales'] },
   sd_campaigns: { adProduct: 'SPONSORED_DISPLAY', reportTypeId: 'sdCampaigns', groupBy: ['campaign'], columns: ['campaignId', 'campaignName', 'impressions', 'clicks', 'cost', 'purchases', 'sales'] },
 };
+
+// Amazon Business (B2B) = FILTER campaignSite=AmazonBusiness auf spCampaigns, groupBy ["campaignPlacement"], max. 31 Tage je Report.
+// Gleiche Definitionen wie ppc-callback/api/ads/audit-start.js; optional (Fehlschlag blockiert das Audit nicht).
+const B2B_COLS = ['campaignId', 'campaignName', 'placementClassification', 'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'];
+const b2bDef = (win, filtered) => ({ win, adProduct: 'SPONSORED_PRODUCTS', reportTypeId: 'spCampaigns', groupBy: ['campaignPlacement'], columns: B2B_COLS, ...(filtered ? { filters: [{ field: 'campaignSite', values: ['AmazonBusiness'] }] } : {}) });
+const B2B_DEFS = { b2b_cur: b2bDef('cur', true), all_cur: b2bDef('cur', false), b2b_prev: b2bDef('prev', true) };
+const dayAgo = n => new Date(Date.now() - n * 864e5).toISOString().slice(0, 10);
 
 let AT = null;
 async function token() {
@@ -43,9 +52,11 @@ async function createReports(profileId) {
   const end = new Date(Date.now() - 864e5).toISOString().slice(0, 10);
   const start = new Date(Date.now() - (DAYS + 1) * 864e5).toISOString().slice(0, 10);
   const ids = {};
-  for (const [k, d] of Object.entries(DEFS)) {
+  const WINDOWS = { cur: { start: dayAgo(30), end: dayAgo(1) }, prev: { start: dayAgo(60), end: dayAgo(31) } };
+  for (const [k, def] of Object.entries({ ...DEFS, ...B2B_DEFS })) {
+    const { win, ...d } = def; const w = win ? WINDOWS[win] : { start, end };
     for (let a = 0; a < 8; a++) {
-      const r = await rfetch(`${ADS}/reporting/reports`, { method: 'POST', headers: hdr(profileId, 'application/vnd.createasyncreportrequest.v3+json'), body: JSON.stringify({ name: `audit ${k}`, startDate: start, endDate: end, configuration: { ...d, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } }) });
+      const r = await rfetch(`${ADS}/reporting/reports`, { method: 'POST', headers: hdr(profileId, 'application/vnd.createasyncreportrequest.v3+json'), body: JSON.stringify({ name: `audit ${k}`, startDate: w.start, endDate: w.end, configuration: { ...d, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } }) });
       if (r.status === 429) { await sleep(20000); continue; }
       const j = await r.json().catch(() => ({}));
       if (r.ok && j.reportId) ids[k] = j.reportId;
@@ -61,7 +72,7 @@ async function createReports(profileId) {
   return ids;
 }
 async function waitAndDownload(profileId, ids) {
-  const data = {};
+  const data = {}; const failed = new Set();
   for (let i = 0; i < 60; i++) {
     let allDone = true;
     for (const [k, id] of Object.entries(ids)) {
@@ -69,24 +80,25 @@ async function waitAndDownload(profileId, ids) {
       const r = await rfetch(`${ADS}/reporting/reports/${id}`, { headers: hdr(profileId) });
       const j = r.ok ? await r.json() : {};
       if (j.status === 'COMPLETED' && j.url) {
-        try { data[k] = JSON.parse(zlib.gunzipSync(Buffer.from(await (await rfetch(j.url)).arrayBuffer())).toString()); }
-        catch (e) { data[k] = []; }
-      } else if (j.status === 'FAILURE') data[k] = [];
+        try { data[k] = JSON.parse(zlib.gunzipSync(Buffer.from(await (await rfetch(j.url)).arrayBuffer())).toString()); if (!Array.isArray(data[k])) { data[k] = []; failed.add(k); } }
+        catch (e) { data[k] = []; failed.add(k); }
+      } else if (j.status === 'FAILURE') { data[k] = []; failed.add(k); }
       else allDone = false;
       await sleep(1000);
     }
     if (allDone) break;
     await sleep(20000);
   }
-  for (const k of Object.keys(ids)) if (!data[k]) data[k] = [];
+  for (const k of Object.keys(ids)) if (!data[k]) { data[k] = []; failed.add(k); }
+  data.__failed = [...failed]; // unlesbar/fehlgeschlagen/nie fertig -- die B2B-Sektion wird dann "nicht verfuegbar"
   return data;
 }
 async function spEntities(profileId) {
   const map = new Map(); const vnd = 'application/vnd.spCampaign.v3+json'; let nt = null;
   for (let i = 0; i < 10; i++) {
     const body = { maxResults: 500, stateFilter: { include: ['ENABLED', 'PAUSED'] } }; if (nt) body.nextToken = nt;
-    const r = await rfetch(`${ADS}/sp/campaigns/list`, { method: 'POST', headers: { ...hdr(profileId, vnd), Accept: vnd }, body: JSON.stringify(body) });
-    if (!r.ok) break; const j = await r.json();
+    let r; try { r = await rfetch(`${ADS}/sp/campaigns/list`, { method: 'POST', headers: { ...hdr(profileId, vnd), Accept: vnd }, body: JSON.stringify(body) }); } catch (e) { map.failed = true; break; }
+    if (!r.ok) { map.failed = true; break; } const j = await r.json();
     for (const c of (j.campaigns || [])) map.set(String(c.campaignId), c);
     nt = j.nextToken; if (!nt) break;
   }
@@ -151,8 +163,10 @@ function aggregate(data, entities) {
   const sdCamps = sdC.sort((a, b) => (+b.cost || 0) - (+a.cost || 0)).slice(0, 25)
     .map(r => ({ campaign: r.campaignName, impressions: +r.impressions || 0, clicks: +r.clicks || 0, spend: +(+r.cost || 0).toFixed(2), sales: +(+r.sales || 0).toFixed(2), orders: +r.purchases || 0 }));
   // H: Top-of-Search Impression Share je SP-Kampagne
-  const isNorm = v => { const n = +v; return n <= 1 ? +(n * 100).toFixed(1) : +n.toFixed(1); };
-  const tosIs = spC.filter(r => r.topOfSearchImpressionShare != null && (+r.cost || 0) > 0)
+  // Amazon liefert topOfSearchImpressionShare bereits in PROZENT (0-100, bis 2 Nachkommastellen; Rohdaten-Messung 01.10.2026).
+  // Die frueher angenommene Umrechnung "Werte <= 1 mal 100" machte aus 0,62 % faelschlich 62 % -- identisch zu audit-fetch.js.
+  const isNorm = v => +(+v).toFixed(2);
+  const tosIs = spC.filter(r => r.topOfSearchImpressionShare != null && Number.isFinite(+r.topOfSearchImpressionShare) && (+r.cost || 0) > 0)
     .map(r => ({ campaign: r.campaignName, campaignId: String(r.campaignId), is: isNorm(r.topOfSearchImpressionShare), spend: +(+r.cost || 0).toFixed(2), sales: +(+r.sales7d || 0).toFixed(2), clicks: +r.clicks || 0 }))
     .sort((a, b) => b.spend - a.spend).slice(0, 200);
   return { ready: true, days: DAYS, failed: [], totals, formats, spTypes, placements, bidAdj: bidAdj.slice(0, 40), tosIs, spTargets, spTerms, sbTerms: sbTermRows, sdCampaigns: sdCamps, entities: entities.size, spCampaignCount: spC.length };
@@ -187,11 +201,37 @@ async function main() {
       await token(); // frisches Token je Kunde (Laeufe dauern lange, Access-Token ~60 Min)
       const ids = await createReports(cl.ads_profile_id);
       if (!Object.keys(ids).length) { console.log('  keine Reports erstellt — uebersprungen'); continue; }
-      console.log(`  ${Object.keys(ids).length}/${Object.keys(DEFS).length} Reports angefordert, warte auf Amazon…`);
+      console.log(`  ${Object.keys(ids).length}/${Object.keys(DEFS).length + Object.keys(B2B_DEFS).length} Reports angefordert, warte auf Amazon…`);
       const data = await waitAndDownload(cl.ads_profile_id, ids);
       const entities = await spEntities(cl.ads_profile_id);
       const payload = aggregate(data, entities);
-      payload.failed = Object.keys(DEFS).filter(k => !ids[k]);
+      const coreBad = [...new Set(data.__failed || [])].filter(k => DEFS[k]); // Kern-Report fehlgeschlagen/unlesbar/nie fertig
+      payload.failed = [...new Set([...Object.keys(DEFS).filter(k => !ids[k]), ...coreBad])];
+      // Amazon Business (optional): gleiche Logik wie audit-fetch.js
+      const bad = new Set(data.__failed || []);
+      const okB2b = ids.b2b_cur && ids.all_cur && !bad.has('b2b_cur') && !bad.has('all_cur');
+      const entitiesFailed = !!entities.failed; /* Kampagnenliste nicht geladen -> Gebote unbekannt (wie audit-fetch.js) */ payload.entitiesFailed = entitiesFailed;
+      payload.b2b = entitiesFailed ? { available: false, reason: 'Kampagnenliste (Gebote) konnte nicht geladen werden' } : ids.b2b_cur && ids.all_cur
+        ? aggregateB2b({ cur: okB2b ? data.b2b_cur : null, all: okB2b ? data.all_cur : null, prev: ids.b2b_prev && !bad.has('b2b_prev') ? data.b2b_prev : null, entities, windows: { cur: { start: dayAgo(30), end: dayAgo(1) }, prev: { start: dayAgo(60), end: dayAgo(31) } } })
+        : { available: false, reason: 'nicht angefordert' };
+      // B2B-Ausfall in diesem Lauf: den zuletzt guten Block nicht ueberschreiben, sondern als veraltet markiert behalten
+      if (!payload.b2b.available) {
+        try {
+          const oc = await rfetch(`${U}/rest/v1/ads_audit_cache?profile_id=eq.${cl.ads_profile_id}&days=eq.${DAYS}&select=payload`, { headers: sbHead });
+          const orows = oc.ok ? await oc.json() : [];
+          const old = orows[0] && orows[0].payload && orows[0].payload.b2b;
+          if (old && old.available) payload.b2b = { ...old, stale: true, staleReason: payload.b2b.reason || '' };
+        } catch (e) { /* Carry-over optional */ }
+      }
+      payload.campaignBids = entitiesFailed ? [] : buildCampaignBids(entities);
+      payload.bidAdj = [...payload.bidAdj, ...b2bBidAdjRows(payload.b2b.stale ? { available: false } : payload.b2b)];
+      // Groessen-Wache wie audit-fetch.js: Zeilen der grossen Listen halbieren, wenn der Cache-Eintrag > 3,5 MB wuerde
+      if (JSON.stringify(payload).length > 3500000) {
+        for (const k of ['spTerms', 'spTargets', 'sbTerms']) if (payload[k] && Array.isArray(payload[k].rows)) payload[k].rows = payload[k].rows.slice(0, Math.ceil(payload[k].rows.length / 2));
+        payload.truncated = true;
+      }
+      // Degradiertes Audit (Kern-Report fehlgeschlagen) nie cachen — wuerde ein gutes ueberschreiben (wie audit-fetch.js)
+      if (coreBad.length) { console.log(`  Kern-Report(s) fehlgeschlagen (${coreBad.join(', ')}) — Cache bleibt unveraendert`); continue; }
       const up = await rfetch(`${U}/rest/v1/ads_audit_cache?on_conflict=profile_id,days`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify({ profile_id: String(cl.ads_profile_id), days: DAYS, payload, updated_at: new Date().toISOString() }) });
       console.log(`  Cache: ${up.status} · Spend €${payload.totals.spend.toFixed(0)} · Sales €${payload.totals.sales.toFixed(0)} · Befunde ${payload.bidAdj.length}`);
       await token(); // Token-Frische fuer den naechsten Kunden
