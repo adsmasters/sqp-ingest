@@ -84,19 +84,43 @@ export function bidsOf(c) {
 }
 
 // Alle Kampagnen mit ihren 4 Geboten (ersetzt placement-list.js fuer die Oberflaeche).
-export function buildCampaignBids(entities) {
+// spRows (optional): SP-Kampagnenreport-Zeilen des gewaehlten Zeitraums -> je Kampagne "perf" (Spend/Sales/...), damit die
+// Gebote-Tabelle eine Entscheidungsgrundlage zeigt. Ohne spRows: kein perf-Feld (wie bisher).
+export function buildCampaignBids(entities, spRows) {
   const out = [];
+  let perf = null;
+  if (Array.isArray(spRows)) {
+    perf = new Map();
+    for (const r of spRows) {
+      if (!r || r.campaignId == null) continue;
+      const k = String(r.campaignId);
+      const m = perf.get(k) || { impressions: 0, clicks: 0, spend: 0, sales: 0, orders: 0 };
+      m.impressions += +r.impressions || 0;
+      m.clicks += +r.clicks || 0;
+      m.spend += +r.cost || 0;
+      m.sales += +r.sales7d || 0;
+      m.orders += +r.purchases7d || 0;
+      perf.set(k, m);
+    }
+  }
   if (!entities || typeof entities.values !== "function") return out;
   for (const c of entities.values()) {
     if (!c || c.campaignId == null) continue;
-    out.push({
+    const row = {
       campaignId: String(c.campaignId),
       name: c.name || "",
       state: c.state || "",
       strategy: (c.dynamicBidding && c.dynamicBidding.strategy) || "",
       exclusive: isExclusive(c),
       bids: bidsOf(c),
-    });
+    };
+    if (perf) {
+      const m = perf.get(String(c.campaignId));
+      row.perf = m
+        ? { impressions: m.impressions, clicks: m.clicks, spend: Math.round(m.spend * 100) / 100, sales: Math.round(m.sales * 100) / 100, orders: m.orders }
+        : { impressions: 0, clicks: 0, spend: 0, sales: 0, orders: 0 };
+    }
+    out.push(row);
     if (out.length >= B2B_RULES.maxBids) break;
   }
   return out;

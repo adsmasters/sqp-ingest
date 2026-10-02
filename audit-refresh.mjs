@@ -223,7 +223,7 @@ async function main() {
           if (old && old.available) payload.b2b = { ...old, stale: true, staleReason: payload.b2b.reason || '' };
         } catch (e) { /* Carry-over optional */ }
       }
-      payload.campaignBids = entitiesFailed ? [] : buildCampaignBids(entities);
+      payload.campaignBids = entitiesFailed ? [] : buildCampaignBids(entities, data.sp_campaigns || []);
       payload.bidAdj = [...payload.bidAdj, ...b2bBidAdjRows(payload.b2b.stale ? { available: false } : payload.b2b)];
       // Groessen-Wache wie audit-fetch.js: Zeilen der grossen Listen halbieren, wenn der Cache-Eintrag > 3,5 MB wuerde
       if (JSON.stringify(payload).length > 3500000) {
