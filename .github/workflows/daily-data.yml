@@ -25,6 +25,12 @@ jobs:
       - name: PPC-Audit vorladen (alle Kunden, 30 Tage)
         run: node audit-refresh.mjs 30
         env:
+          # Konten laufen parallel; Budget = Zeit, in der noch NEUE Konten gestartet werden. Laufende Konten werden fertig, haben aber ein eigenes Zeitlimit
+          # (AUDIT_ACCOUNT_MAX_MIN, Standard 60): Worst Case ~Budget 180 + 60 + Start/Setup < timeout-minutes 300. Der Lauf endet mit Fehler (Slack-Alarm), wenn
+          # kein Konto oder mehr als die Haelfte der gestarteten Konten aktualisiert wurde.
+          # Vorher: ein Konto nach dem anderen, 100 Min = nur ~5 von 35 Konten pro Nacht (je ~25 Min, fast nur Warten auf Amazon).
+          AUDIT_CONCURRENCY: '4'
+          AUDIT_BUDGET_MIN: '150'
           ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
           ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
           ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
