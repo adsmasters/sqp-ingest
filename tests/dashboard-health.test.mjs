@@ -2,7 +2,8 @@
 //
 //  The Ads Dashboard (separate project) runs its own daily data check and stores one result per client in
 //  adsdash_health_check (status ok | warn | alert). The watchdog must surface that in Slack with its existing alert flow:
-//   - a client whose NEWEST check is an ALERT is a problem, named with its messages;
+//   - a client whose NEWEST check is an ALERT is a problem, named with its messages — but only when the PREVIOUS daily check
+//     was an alert too. One-off alerts usually heal by themselves at the next sync; Slack must not cry wolf;
 //   - warnings alone are NOT a problem (the dashboard check warns about routine Amazon rate limits);
 //   - if no check was stored for a client in the last 30 hours (the check runs once a day), the check itself is not
 //     running: that is a problem too;
@@ -27,21 +28,37 @@ test('warnings alone are not a problem', () => {
   assert.deepEqual(dashboardHealthIssues(clients, rows, NOW), []);
 });
 
-test('an alert names the client and carries the alert messages only', () => {
-  const rows = [
-    check({
-      status: 'alert',
-      issues: [
-        { severity: 'alert', code: 'missing_days', message: '1 day(s) have no Sponsored Products data: 2026-10-01' },
-        { severity: 'warn', code: 'recent_errors', message: 'noisy warning' },
-      ],
-    }),
-  ];
+const alertRow = (over = {}) =>
+  check({
+    status: 'alert',
+    issues: [
+      { severity: 'alert', code: 'missing_days', message: '1 day(s) have no Sponsored Products data: 2026-10-01' },
+      { severity: 'warn', code: 'recent_errors', message: 'noisy warning' },
+    ],
+    ...over,
+  });
+
+test('an alert that persisted over two daily checks names the client and carries the alert messages only', () => {
+  const rows = [alertRow({ checked_at: hAgo(3) }), alertRow({ checked_at: hAgo(27) })];
   const out = dashboardHealthIssues(clients, rows, NOW);
   assert.equal(out.length, 1);
   assert.match(out[0], /Rotkäppchen/);
   assert.match(out[0], /2026-10-01/);
   assert.doesNotMatch(out[0], /noisy warning/);
+});
+
+test('a one-off alert (previous check was fine) is NOT reported yet', () => {
+  const rows = [alertRow({ checked_at: hAgo(3) }), check({ checked_at: hAgo(27), status: 'ok' })];
+  assert.deepEqual(dashboardHealthIssues(clients, rows, NOW), []);
+});
+
+test('a first-ever alert with no earlier check is NOT reported yet', () => {
+  assert.deepEqual(dashboardHealthIssues(clients, [alertRow({ checked_at: hAgo(3) })], NOW), []);
+});
+
+test('a previous WARN does not count as a persisting alert', () => {
+  const rows = [alertRow({ checked_at: hAgo(3) }), check({ checked_at: hAgo(27), status: 'warn' })];
+  assert.deepEqual(dashboardHealthIssues(clients, rows, NOW), []);
 });
 
 test('no check in the last 30 hours means the dashboard check is not running', () => {
@@ -60,7 +77,7 @@ test('a client that has never had a check is not a problem', () => {
 });
 
 test('inactive clients are ignored', () => {
-  const rows = [check({ status: 'alert', issues: [{ severity: 'alert', code: 'x', message: 'boom' }] })];
+  const rows = [alertRow({ checked_at: hAgo(3) }), alertRow({ checked_at: hAgo(27) })];
   assert.deepEqual(dashboardHealthIssues([{ id: 'c1', name: 'Old', active: false }], rows, NOW), []);
 });
 
@@ -80,6 +97,7 @@ test('each client is judged separately', () => {
   const rows = [
     check({ client_id: 'c1' }),
     check({ client_id: 'c2', status: 'alert', issues: [{ severity: 'alert', code: 'x', message: 'B is broken' }] }),
+    check({ client_id: 'c2', checked_at: hAgo(27), status: 'alert', issues: [{ severity: 'alert', code: 'x', message: 'B is broken' }] }),
   ];
   const out = dashboardHealthIssues(two, rows, NOW);
   assert.equal(out.length, 1);
