@@ -3,6 +3,7 @@
 // Lehre aus 08/2026: der Alarm-Step IM Backfill-Workflow starb mit dessen Timeout,
 // die Pipeline war eine Woche verstopft und niemand hat es gemerkt.
 // ENV: SUPABASE_URL, SUPABASE_SERVICE_KEY, SLACK_WEBHOOK_URL, GITHUB_TOKEN, GITHUB_REPOSITORY
+import { dashboardHealthIssues } from './dashboard-health.mjs';
 const U = process.env.SUPABASE_URL, KEY = process.env.SUPABASE_SERVICE_KEY;
 const SLACK = process.env.SLACK_WEBHOOK_URL, GH = process.env.GITHUB_TOKEN;
 const REPO = process.env.GITHUB_REPOSITORY || 'adsmasters/sqp-ingest';
@@ -111,6 +112,16 @@ try {
   if (stale.sqp.length) issues.push(`SQP-Daten >9 Tage alt bei: ${stale.sqp.join(', ')} (Wochen-Refresh prüfen)`);
   if (stale.ads.length) issues.push(`Ads-Daten >3 Tage alt bei: ${stale.ads.join(', ')} (Ads-Refresh prüfen)`);
 } catch (e) { issues.push(`Watchdog: Datenfrische nicht prüfbar (${e.message})`); }
+
+// 5) Ads Dashboard (eigenes Projekt): meldet nur ALARME seiner täglichen Datenprüfung (adsdash_health_check)
+//    und den Fall, dass diese Prüfung selbst >30h nicht lief. Fehlt die Tabelle noch, wird still übersprungen.
+try {
+  const [cr, hr] = await Promise.all([
+    fetch(`${U}/rest/v1/adsdash_clients?select=id,name,active`, { headers: H }),
+    fetch(`${U}/rest/v1/adsdash_health_check?select=client_id,checked_at,status,issues&order=checked_at.desc&limit=200`, { headers: H }),
+  ]);
+  if (cr.ok && hr.ok) issues.push(...dashboardHealthIssues(await cr.json(), await hr.json()));
+} catch (e) { /* optional — die Pipeline-Checks oben bleiben unberührt */ }
 
 // Melden: Probleme sofort; sonst montags 05-Uhr-Lauf als Lebenszeichen (Stille ≠ gesund)
 const sendSlack = async text => {
