@@ -2,8 +2,8 @@
 //
 //  The Ads Dashboard (separate project) runs its own daily data check and stores one result per client in
 //  adsdash_health_check (status ok | warn | alert). The watchdog must surface that in Slack with its existing alert flow:
-//   - a client whose NEWEST check is an ALERT is a problem, named with its messages — but only when the PREVIOUS daily check
-//     was an alert too. One-off alerts usually heal by themselves at the next sync; Slack must not cry wolf;
+//   - a client whose NEWEST check is an ALERT is a problem, named with its messages — but only when the check of the PREVIOUS
+//     CALENDAR DAY (UTC) was an alert too. Two checks on the same day (manual re-run, cron retry) are ONE day. One-off alerts usually heal by themselves at the next sync; Slack must not cry wolf;
 //   - warnings alone are NOT a problem (the dashboard check warns about routine Amazon rate limits);
 //   - if no check was stored for a client in the last 30 hours (the check runs once a day), the check itself is not
 //     running: that is a problem too;
@@ -54,6 +54,16 @@ test('a one-off alert (previous check was fine) is NOT reported yet', () => {
 
 test('a first-ever alert with no earlier check is NOT reported yet', () => {
   assert.deepEqual(dashboardHealthIssues(clients, [alertRow({ checked_at: hAgo(3) })], NOW), []);
+});
+
+test('two alert checks on the SAME day (manual re-run) are not two days', () => {
+  const rows = [alertRow({ checked_at: hAgo(3) }), alertRow({ checked_at: hAgo(5) })];
+  assert.deepEqual(dashboardHealthIssues(clients, rows, NOW), []);
+});
+
+test('a same-day ok re-run in between does not hide a two-day alert; the previous DAY decides', () => {
+  const rows = [alertRow({ checked_at: hAgo(3) }), alertRow({ checked_at: hAgo(5) }), alertRow({ checked_at: hAgo(27) })];
+  assert.equal(dashboardHealthIssues(clients, rows, NOW).length, 1);
 });
 
 test('a previous WARN does not count as a persisting alert', () => {

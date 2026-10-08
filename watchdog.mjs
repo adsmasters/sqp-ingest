@@ -114,14 +114,16 @@ try {
 } catch (e) { issues.push(`Watchdog: Datenfrische nicht prüfbar (${e.message})`); }
 
 // 5) Ads Dashboard (eigenes Projekt): meldet nur ALARME seiner täglichen Datenprüfung (adsdash_health_check)
-//    und den Fall, dass diese Prüfung selbst >30h nicht lief. Fehlt die Tabelle noch, wird still übersprungen.
+//    und den Fall, dass diese Prüfung selbst >30h nicht lief. Fehlt die Tabelle noch (404), wird still übersprungen; andere Lesefehler werden gemeldet.
 try {
   const [cr, hr] = await Promise.all([
     fetch(`${U}/rest/v1/adsdash_clients?select=id,name,active`, { headers: H }),
-    fetch(`${U}/rest/v1/adsdash_health_check?select=client_id,checked_at,status,issues&order=checked_at.desc&limit=200`, { headers: H }),
+    fetch(`${U}/rest/v1/adsdash_health_check?select=client_id,checked_at,status,issues&order=checked_at.desc&limit=1000`, { headers: H }),
   ]);
   if (cr.ok && hr.ok) issues.push(...dashboardHealthIssues(await cr.json(), await hr.json()));
-} catch (e) { /* optional — die Pipeline-Checks oben bleiben unberührt */ }
+  // Nur "Tabelle gibt es noch nicht" (404) ist harmlos; Rechte-/Server-Fehler dürfen nicht wie "gesund" aussehen.
+  else if (cr.ok && hr.status !== 404) issues.push(`Watchdog: Ads-Dashboard-Prüfung nicht lesbar (HTTP ${hr.status})`);
+} catch (e) { issues.push(`Watchdog: Ads-Dashboard-Prüfung nicht prüfbar (${e.message})`); }
 
 // Melden: Probleme sofort; sonst montags 05-Uhr-Lauf als Lebenszeichen (Stille ≠ gesund)
 const sendSlack = async text => {

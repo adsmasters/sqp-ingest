@@ -3,12 +3,12 @@
 // (fehlende Tage, veraltete Daten, hängende Syncs) und legt je Kunde ein Ergebnis in adsdash_health_check ab
 // (status ok | warn | alert). Der Wächter meldet nur ALARME dieser Prüfung — Warnungen (z. B. Amazon-Rate-Limits)
 // sind Routine — und den Fall, dass die Prüfung selbst nicht mehr läuft. Ein Alarm wird erst gemeldet, wenn er in zwei
-// aufeinanderfolgenden Tagesprüfungen auftrat (Schonfrist: bis dahin hatte der Sync >= 4 Läufe, ihn zu heilen).
+// aufeinanderfolgenden Tagen auftrat (Schonfrist: bis dahin hatte der Sync >= 4 Läufe, ihn zu heilen).
 // Reine Funktion, kein Netzwerk.
 const MAX_CHECK_AGE_H = 30; // Prüfung läuft 1x täglich
 
 export function dashboardHealthIssues(clients, checks, now = Date.now()) {
-  // Die zwei neuesten Ergebnisse je Kunde (neuestes zuerst)
+  // Ergebnisse je Kunde, neuestes zuerst
   const byClient = new Map();
   for (const c of checks) {
     if (!byClient.has(c.client_id)) byClient.set(c.client_id, []);
@@ -19,7 +19,11 @@ export function dashboardHealthIssues(clients, checks, now = Date.now()) {
   for (const [id, list] of byClient) {
     list.sort((a, b) => Date.parse(b.checked_at) - Date.parse(a.checked_at));
     latest.set(id, list[0]);
-    if (list[1]) previous.set(id, list[1]);
+    // "Vorherige Prüfung" = die neueste Prüfung eines früheren KALENDERTAGS (UTC). Mehrere Läufe am selben Tag
+    // (manueller Re-Run, Cron-Retry) zählen als EIN Tag — sonst wäre die Schonfrist ausgehebelt.
+    const day = x => x.checked_at.slice(0, 10);
+    const prev = list.find(x => day(x) < day(list[0]));
+    if (prev) previous.set(id, prev);
   }
   const issues = [];
   for (const client of clients) {
