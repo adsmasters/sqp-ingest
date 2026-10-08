@@ -49,6 +49,11 @@ globalThis.fetch = async (url, opts = {}) => {
       return json({ reportId: 'rep-' + (++reportN) });
     }
     // scenario: Amazon never finishes the reports
+    // scenarios (only for FAKE_STATUS_PROFILE): the status check answers an HTTP error, or Amazon reports FAILURE with a reason
+    if (method === 'GET' && p.startsWith('/reporting/reports/rep-') && process.env.FAKE_STATUS_PROFILE && String((opts.headers || {})['Amazon-Advertising-API-Scope']) === process.env.FAKE_STATUS_PROFILE) {
+      if (process.env.FAKE_STATUS_HTTP) return json({ message: 'slow down' }, +process.env.FAKE_STATUS_HTTP);
+      if (process.env.FAKE_STATUS_FAILURE) return json({ status: 'FAILURE', failureReason: process.env.FAKE_STATUS_FAILURE });
+    }
     if (/^\/reporting\/reports\/rep-\d+$/.test(p) && method === 'GET' && process.env.FAKE_PENDING === '1') return json({ status: 'PENDING' });
     if (/^\/reporting\/reports\/rep-\d+$/.test(p) && method === 'GET') return json({ status: 'COMPLETED', url: 'https://dl.fake.test/' + p.split('/').pop() });
     if (p === '/sp/campaigns/list' && method === 'POST') {

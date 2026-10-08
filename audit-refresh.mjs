@@ -90,6 +90,7 @@ async function createReports(profileId, deadline = Infinity) {
 }
 async function waitAndDownload(profileId, ids, deadline = Infinity) {
   const data = {}; const failed = new Set();
+  const why = {}; // je Report: letzter Stand bzw. Fehlergrund -- damit im Log steht, WARUM ein Konto degradiert (nur Diagnose, aendert nichts am Ablauf)
   for (let i = 0; i < 60; i++) {
     // Zeitlimit je Konto: nicht fertige Reports gelten danach als fehlgeschlagen (Konto "degraded", gespeichertes Audit bleibt)
     if (Date.now() > deadline) { console.log('  Zeitlimit je Konto erreicht — Warten auf Amazon abgebrochen'); break; }
@@ -99,18 +100,20 @@ async function waitAndDownload(profileId, ids, deadline = Infinity) {
       if (data[k]) continue;
       if (Date.now() > deadline) { allDone = false; break; } // auch INNERHALB einer Runde (jeder Aufruf kann bei schlechter Verbindung Minuten dauern)
       const r = await rfetch(`${ADS}/reporting/reports/${id}`, { headers: hdr(profileId) });
-      const j = r.ok ? await r.json() : {};
+      const j = r.ok ? await r.json().catch(() => ({})) : {};
+      why[k] = r.ok ? `Status ${j.status || 'unbekannt'}` : `Status-Abfrage HTTP ${r.status}`;
       if (j.status === 'COMPLETED' && j.url) {
-        try { data[k] = JSON.parse(zlib.gunzipSync(Buffer.from(await (await rfetch(j.url)).arrayBuffer())).toString()); if (!Array.isArray(data[k])) { data[k] = []; failed.add(k); } }
-        catch (e) { data[k] = []; failed.add(k); }
-      } else if (j.status === 'FAILURE') { data[k] = []; failed.add(k); }
+        try { data[k] = JSON.parse(zlib.gunzipSync(Buffer.from(await (await rfetch(j.url)).arrayBuffer())).toString()); if (!Array.isArray(data[k])) { data[k] = []; failed.add(k); why[k] = 'Download unlesbar (kein Array)'; } }
+        catch (e) { data[k] = []; failed.add(k); why[k] = `Download/Entpacken fehlgeschlagen: ${String(e && e.message).slice(0, 80)}`; }
+      } else if (j.status === 'FAILURE') { data[k] = []; failed.add(k); why[k] = `FAILURE${j.failureReason ? ` (${String(j.failureReason).slice(0, 100)})` : ''}`; }
       else allDone = false;
       await sleep(1000);
     }
     if (allDone) break;
     await sleep(20000);
   }
-  for (const k of Object.keys(ids)) if (!data[k]) { data[k] = []; failed.add(k); }
+  for (const k of Object.keys(ids)) if (!data[k]) { data[k] = []; failed.add(k); why[k] = `nicht fertig geworden (zuletzt: ${why[k] || 'keine Antwort'})`; }
+  if (failed.size) { console.log('  Report-Fehler:'); for (const k of failed) console.log(`    ${k}: ${why[k] || 'unbekannt'}`); } // eine Zeile je Aufruf: jede bekommt das Worker-Tag [Wn]
   data.__failed = [...failed]; // unlesbar/fehlgeschlagen/nie fertig -- die B2B-Sektion wird dann "nicht verfuegbar"
   return data;
 }

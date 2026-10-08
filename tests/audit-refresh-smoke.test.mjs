@@ -226,6 +226,28 @@ describe('review fixes', () => {
     assert.match(r.stdout, /✗ Client104: ok-reduced/);
   });
 
+  // Why did an account fail? The log used to say only "core reports failed". Each failed report now logs its own reason.
+  test('invariant: a report that Amazon marks FAILURE is logged with the reason Amazon gave', () => {
+    const r = runScenario({ FAKE_STATUS_PROFILE: '104', FAKE_STATUS_FAILURE: 'INTERNAL_ERROR boom' });
+    assert.match(r.stdout, /sp_campaigns: FAILURE [(]INTERNAL_ERROR boom[)]/);
+    assert.ok(!r.cacheWrites.includes('104'), 'still degraded, saved audit kept');
+  });
+
+  test('invariant: a status check that keeps answering an HTTP error (429) is logged with that status', () => {
+    const r = runScenario({ FAKE_STATUS_PROFILE: '104', FAKE_STATUS_HTTP: '429' });
+    assert.match(r.stdout, /sp_campaigns: .*HTTP 429/);
+  });
+
+  test('invariant: a report that never finishes is logged as not finished, with its last status', () => {
+    const r = runScenario({ FAKE_PENDING: '1' });
+    assert.match(r.stdout, /sp_campaigns: .*nicht fertig.*PENDING/);
+  });
+
+  test('invariant: healthy accounts log no report-failure lines', () => {
+    const r = runScenario({});
+    assert.doesNotMatch(r.stdout, /Report-Fehler/);
+  });
+
   test('invariant: if there is nothing to refresh at all (empty client list and no recent audits) the run FAILS instead of ending green and silent', () => {
     const r = runScenario({ FAKE_CLIENTS: '[]', FAKE_EXTRA_CACHED: '[]', FAKE_AGES: '{}' });
     assert.equal(r.status, 1);
