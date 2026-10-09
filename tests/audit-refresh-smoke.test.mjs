@@ -234,12 +234,12 @@ describe('review fixes', () => {
   });
 
   test('invariant: a status check that keeps answering an HTTP error (429) is logged with that status', () => {
-    const r = runScenario({ FAKE_STATUS_PROFILE: '104', FAKE_STATUS_HTTP: '429' });
+    const r = runScenario({ FAKE_STATUS_PROFILE: '104', FAKE_STATUS_HTTP: '429', FAKE_FAST_CLOCK: '1' }); // waiting now ends at the time limit: virtual clock
     assert.match(r.stdout, /sp_campaigns: .*HTTP 429/);
   });
 
   test('invariant: a report that never finishes is logged as not finished, with its last status', () => {
-    const r = runScenario({ FAKE_PENDING: '1' });
+    const r = runScenario({ FAKE_PENDING: '1', FAKE_FAST_CLOCK: '1' }); // waiting now ends at the time limit: virtual clock
     assert.match(r.stdout, /sp_campaigns: .*nicht fertig.*PENDING/);
   });
 
@@ -296,13 +296,51 @@ describe('review fixes', () => {
   });
 
   test('invariant: an account whose reports never finish is abandoned after its own time limit (not 60 rounds): degraded, saved audit untouched, the others unaffected', () => {
-    const slow = runScenario({ FAKE_PENDING: '1', AUDIT_ACCOUNT_MAX_MIN: '0.0015' });   // ~90 ms real time = the fake clock runs 1000x faster
-    const full = runScenario({ FAKE_PENDING: '1' });                                      // default limit: all 60 polling rounds are used
+    // DELIBERATE CHANGE (2026-10-09): this test used to compare against a run that used "all 60 polling rounds". Waiting is now bounded by the
+    // per-account TIME limit instead of a fixed round count (see the next test), so both runs use the fast virtual clock.
+    const slow = runScenario({ FAKE_PENDING: '1', FAKE_FAST_CLOCK: '1', AUDIT_ACCOUNT_MAX_MIN: '0.0015' });
+    const full = runScenario({ FAKE_PENDING: '1', FAKE_FAST_CLOCK: '1' });                 // default limit (60 min of virtual time)
     const statusGets = (x) => x.log.filter((l) => l.method === 'GET' && /\/reporting\/reports\/rep-\d+$/.test(l.url)).length;
     assert.ok(statusGets(slow) < statusGets(full) / 2, `limited run polled ${statusGets(slow)} times, unlimited ${statusGets(full)}`);
     assert.equal(slow.cacheWrites.length, 0, 'nothing is saved for accounts whose core reports never finished');
     assert.equal(slow.status, 1, 'every account degraded -> error');
     assert.match(slow.stdout, /degraded/);
+  });
+});
+
+describe('waiting for slow Amazon reports', () => {
+  // 2026-10-09: run #63 failed because every report was still PENDING after 60 status checks (~32 min) although the per-account limit is 60 min.
+  test('invariant: reports that need MORE than 60 status checks (slow Amazon) are waited for, within the per-account time limit: the account is saved', () => {
+    const r = runScenario({ FAKE_PENDING_ROUNDS: '80' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.cacheWrites.length >= 7, `accounts saved: ${r.cacheWrites.length}`);
+    assert.doesNotMatch(r.stdout, /Report-Fehler/);
+    // anchors the actual fix: single reports are polled MORE than the old 60 rounds
+    const polls = {}; for (const l of r.log) if (l.method === 'GET' && /[/]reporting[/]reports[/]rep-[0-9]+$/.test(l.url)) polls[l.url] = (polls[l.url] || 0) + 1;
+    assert.ok(Math.max(...Object.values(polls)) > 60, 'a report was polled more than 60 times');
+  });
+
+  test('invariant: waiting is still bounded: reports that never finish end at the per-account time limit, not endlessly', () => {
+    const r = runScenario({ FAKE_PENDING: '1', FAKE_FAST_CLOCK: '1' });
+    assert.match(r.stdout, /Zeitlimit je Konto erreicht/);
+    assert.match(r.stdout, /nicht fertig geworden/);
+    assert.equal(r.cacheWrites.length, 0);
+  });
+});
+
+describe('network flaps while waiting', () => {
+  // Review 2026-10-09: an exception from the status request used to escape waitAndDownload and discard the WHOLE account (all finished reports lost).
+  test('invariant: a network error on a status check (fetch throws) does not lose the account: the report is simply checked again next round', () => {
+    const r = runScenario({ FAKE_STATUS_PROFILE: '104', FAKE_STATUS_THROW_FIRST: '6' });
+    assert.ok(r.cacheWrites.includes('104'), 'the account is saved after the flap');
+    assert.doesNotMatch(r.stdout, /Client104: error/);
+  });
+
+  test('invariant: a status check that always throws ends at the time limit as a normal degraded account (with its reason), not as an uncaught error', () => {
+    const r = runScenario({ FAKE_STATUS_PROFILE: '104', FAKE_STATUS_THROW_FIRST: '1000000', FAKE_FAST_CLOCK: '1' });
+    assert.ok(!r.cacheWrites.includes('104'));
+    assert.match(r.stdout, /Client104: degraded/);
+    assert.match(r.stdout, /sp_campaigns: .*Status-Abfrage fehlgeschlagen/);
   });
 });
 

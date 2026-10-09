@@ -38,7 +38,7 @@ const B2B_DEFS = { b2b_cur: b2bDef('cur', true), all_cur: b2bDef('cur', false), 
 const dayAgo = n => new Date(Date.now() - n * 864e5).toISOString().slice(0, 10);
 
 let AT = null;
-// EIN gemeinsames Access-Token fuer alle parallelen Worker: wird erst nach 30 Min erneuert (haelt ~60 Min), parallele Aufrufer teilen sich einen Refresh
+// EIN gemeinsames Access-Token fuer alle parallelen Worker: wird erst nach 20 Min erneuert (haelt ~60 Min), parallele Aufrufer teilen sich einen Refresh
 const ensureToken = makeTokenManager({
   fetchToken: async () => {
     const t = await rfetch('https://api.amazon.co.uk/auth/o2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: RT, client_id: CID, client_secret: SEC }) });
@@ -79,7 +79,7 @@ async function createReports(profileId, deadline = Infinity) {
       if (r.ok && j.reportId) ids[k] = j.reportId;
       else if (r.status === 425) { // Duplicate — Amazon nennt die existierende Report-ID, die nehmen wir
         const m = JSON.stringify(j).match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/i);
-        if (m) ids[k] = m[0]; else console.log(`    ${k}: 425 ohne Report-ID`);
+        if (m) { ids[k] = m[0]; console.log(`    ${k}: bereits vorhandenen Report wiederverwendet (425)`); } else console.log(`    ${k}: 425 ohne Report-ID`); // Diagnose: haengender alter Report vs. langsamer neuer
       }
       else { console.log(`    ${k}: HTTP ${r.status} ${JSON.stringify(j).slice(0, 120)}`); if ([400, 403, 404].includes(r.status)) rejected[k] = r.status; }
       break;
@@ -91,7 +91,9 @@ async function createReports(profileId, deadline = Infinity) {
 async function waitAndDownload(profileId, ids, deadline = Infinity) {
   const data = {}; const failed = new Set();
   const why = {}; // je Report: letzter Stand bzw. Fehlergrund -- damit im Log steht, WARUM ein Konto degradiert (nur Diagnose, aendert nichts am Ablauf)
-  for (let i = 0; i < 60; i++) {
+  // Begrenzt durch das Zeitlimit je Konto (AUDIT_ACCOUNT_MAX_MIN, 60 Min), nicht durch eine feste Rundenzahl: 60 Runden = nur ~32 Min, und
+  // langsame Amazon-Reports (Lauf #63: 65 Reports noch PENDING) brachten Konten sonst um kurz vor fertig zum Scheitern. 1000 = reine Sicherung.
+  for (let i = 0; i < 1000; i++) {
     // Zeitlimit je Konto: nicht fertige Reports gelten danach als fehlgeschlagen (Konto "degraded", gespeichertes Audit bleibt)
     if (Date.now() > deadline) { console.log('  Zeitlimit je Konto erreicht — Warten auf Amazon abgebrochen'); break; }
     await token(); // billig (Token wird nur bei Alter >20 Min erneuert) -- ein Konto kann lange laufen, AT ist global und wird von allen Workern geteilt
@@ -99,8 +101,10 @@ async function waitAndDownload(profileId, ids, deadline = Infinity) {
     for (const [k, id] of Object.entries(ids)) {
       if (data[k]) continue;
       if (Date.now() > deadline) { allDone = false; break; } // auch INNERHALB einer Runde (jeder Aufruf kann bei schlechter Verbindung Minuten dauern)
-      const r = await rfetch(`${ADS}/reporting/reports/${id}`, { headers: hdr(profileId) });
-      const j = r.ok ? await r.json().catch(() => ({})) : {};
+      // Ein Netzfehler (rfetch wirft nach 4 Versuchen) darf nicht das ganze Konto verwerfen: der Report gilt als "noch offen", naechste Runde erneut
+      let r, j;
+      try { r = await rfetch(`${ADS}/reporting/reports/${id}`, { headers: hdr(profileId) }); j = (r.ok && await r.json().catch(() => null)) || {}; }
+      catch (e) { why[k] = `Status-Abfrage fehlgeschlagen: ${String(e && e.message).slice(0, 80)}`; allDone = false; await sleep(1000); continue; }
       why[k] = r.ok ? `Status ${j.status || 'unbekannt'}` : `Status-Abfrage HTTP ${r.status}`;
       if (j.status === 'COMPLETED' && j.url) {
         try { data[k] = JSON.parse(zlib.gunzipSync(Buffer.from(await (await rfetch(j.url)).arrayBuffer())).toString()); if (!Array.isArray(data[k])) { data[k] = []; failed.add(k); why[k] = 'Download unlesbar (kein Array)'; } }

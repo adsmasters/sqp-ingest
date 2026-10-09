@@ -11,6 +11,10 @@ const T0 = Date.now();
 // sleeps of 3 s / 20 s / 45 s become 3 / 20 / 45 ms
 const realSetTimeout = globalThis.setTimeout;
 globalThis.setTimeout = (fn, ms, ...a) => realSetTimeout(fn, Math.ceil((+ms || 0) / 1000), ...a);
+// scenario FAKE_FAST_CLOCK=1: Date.now() also runs 1000x faster, so per-account time limits (minutes) elapse in milliseconds of real time
+if (process.env.FAKE_FAST_CLOCK === '1') { const realNow = Date.now.bind(Date); Date.now = () => T0 + (realNow() - T0) * 1000; }
+const pollCount = {}; // report id -> number of status checks so far
+let throwN = 0;
 
 const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'Content-Type': 'application/json' } });
 let reportN = 0;
@@ -49,11 +53,15 @@ globalThis.fetch = async (url, opts = {}) => {
       return json({ reportId: 'rep-' + (++reportN) });
     }
     // scenario: Amazon never finishes the reports
+    // scenario FAKE_STATUS_THROW_FIRST=N (profile FAKE_STATUS_PROFILE): the first N status checks fail with a NETWORK error (fetch throws), then it works
+    if (method === 'GET' && p.startsWith('/reporting/reports/rep-') && process.env.FAKE_STATUS_THROW_FIRST && String((opts.headers || {})['Amazon-Advertising-API-Scope']) === process.env.FAKE_STATUS_PROFILE) { throwN = (throwN || 0) + 1; if (throwN <= +process.env.FAKE_STATUS_THROW_FIRST) throw new Error('network down'); }
     // scenarios (only for FAKE_STATUS_PROFILE): the status check answers an HTTP error, or Amazon reports FAILURE with a reason
     if (method === 'GET' && p.startsWith('/reporting/reports/rep-') && process.env.FAKE_STATUS_PROFILE && String((opts.headers || {})['Amazon-Advertising-API-Scope']) === process.env.FAKE_STATUS_PROFILE) {
       if (process.env.FAKE_STATUS_HTTP) return json({ message: 'slow down' }, +process.env.FAKE_STATUS_HTTP);
       if (process.env.FAKE_STATUS_FAILURE) return json({ status: 'FAILURE', failureReason: process.env.FAKE_STATUS_FAILURE });
     }
+    // scenario FAKE_PENDING_ROUNDS=N: every report stays PENDING for its first N status checks, then completes (slow Amazon)
+    if (method === 'GET' && p.startsWith('/reporting/reports/rep-') && process.env.FAKE_PENDING_ROUNDS) { const id = p.split('/').pop(); pollCount[id] = (pollCount[id] || 0) + 1; if (pollCount[id] <= +process.env.FAKE_PENDING_ROUNDS) return json({ status: 'PENDING' }); }
     if (/^\/reporting\/reports\/rep-\d+$/.test(p) && method === 'GET' && process.env.FAKE_PENDING === '1') return json({ status: 'PENDING' });
     if (/^\/reporting\/reports\/rep-\d+$/.test(p) && method === 'GET') return json({ status: 'COMPLETED', url: 'https://dl.fake.test/' + p.split('/').pop() });
     if (p === '/sp/campaigns/list' && method === 'POST') {
