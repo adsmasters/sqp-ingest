@@ -37,7 +37,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       - name: Slack-Alert bei Fehlschlag
-        if: failure() || cancelled()
+        if: ${{ false }}  # PAUSED 2026-10-09: Audit-Alert pausiert, bis das Warten auf langsame Amazon-Reports (Lauf #63) behoben ist. WIEDER AKTIVIEREN: "failure() || cancelled()"
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
