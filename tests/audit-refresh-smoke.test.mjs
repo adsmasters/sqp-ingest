@@ -328,6 +328,20 @@ describe('waiting for slow Amazon reports', () => {
   });
 });
 
+describe('report creation gives up silently on rate limits', () => {
+  // 2026-10-12: in run #65 three accounts were degraded because an SB report was never created (9/10, 8/10 requested), with NO log line saying why.
+  test('invariant: a report that could not be created because Amazon kept answering 429 is logged with that reason', () => {
+    const r = runScenario({ FAKE_FAIL_REPORT: 'sb_campaigns', FAKE_FAIL_REPORT_PROFILE: '104', FAKE_FAIL_STATUS: '429' });
+    assert.match(r.stdout, /sb_campaigns: .*429.*nicht angelegt/);
+    assert.ok(!r.cacheWrites.includes('104'), 'account stays degraded, saved audit kept');
+  });
+
+  test('invariant: healthy accounts log no such line', () => {
+    const r = runScenario({});
+    assert.doesNotMatch(r.stdout, /nicht angelegt/);
+  });
+});
+
 describe('network flaps while waiting', () => {
   // Review 2026-10-09: an exception from the status request used to escape waitAndDownload and discard the WHOLE account (all finished reports lost).
   test('invariant: a network error on a status check (fetch throws) does not lose the account: the report is simply checked again next round', () => {

@@ -71,10 +71,11 @@ async function createReports(profileId, deadline = Infinity) {
     // Zeitlimit je Konto (AUDIT_ACCOUNT_MAX_MIN): bei dauerhaftem 429 koennte das Anlegen allein ~27 Min dauern -- danach wird abgebrochen
     if (Date.now() > deadline) { console.log(`    Zeitlimit je Konto erreicht — ${k} und die übrigen Reports werden nicht mehr angefordert`); break; }
     const { win, ...d } = def; const w = win ? WINDOWS[win] : { start, end };
+    let throttled = false;
     for (let a = 0; a < 8; a++) {
       await token(); // billig (Token wird nur bei Alter >20 Min erneuert); bei langen 429-Wartezeiten darf der Token nicht ablaufen
       const r = await rfetch(`${ADS}/reporting/reports`, { method: 'POST', headers: hdr(profileId, 'application/vnd.createasyncreportrequest.v3+json'), body: JSON.stringify({ name: `audit ${k}`, startDate: w.start, endDate: w.end, configuration: { ...d, timeUnit: 'SUMMARY', format: 'GZIP_JSON' } }) });
-      if (r.status === 429) { if (Date.now() > deadline) break; await sleep(20000); continue; }
+      if (r.status === 429) { throttled = true; if (Date.now() > deadline) break; await sleep(20000); continue; }
       const j = await r.json().catch(() => ({}));
       if (r.ok && j.reportId) ids[k] = j.reportId;
       else if (r.status === 425) { // Duplicate — Amazon nennt die existierende Report-ID, die nehmen wir
@@ -84,6 +85,7 @@ async function createReports(profileId, deadline = Infinity) {
       else { console.log(`    ${k}: HTTP ${r.status} ${JSON.stringify(j).slice(0, 120)}`); if ([400, 403, 404].includes(r.status)) rejected[k] = r.status; }
       break;
     }
+    if (throttled && !ids[k]) console.log(`    ${k}: HTTP 429 (Drosselung) — nach ${8} Versuchen bzw. am Zeitlimit nicht angelegt`); // sonst fehlt der Grund im Log (Lauf #65: 9/10, 8/10 Reports ohne Hinweis)
     await sleep(3000);
   }
   return ids;
