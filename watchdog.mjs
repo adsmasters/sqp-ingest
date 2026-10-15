@@ -4,6 +4,7 @@
 // die Pipeline war eine Woche verstopft und niemand hat es gemerkt.
 // ENV: SUPABASE_URL, SUPABASE_SERVICE_KEY, SLACK_WEBHOOK_URL, GITHUB_TOKEN, GITHUB_REPOSITORY
 import { dashboardHealthIssues } from './dashboard-health.mjs';
+import { reportAlertIssues } from './report-alerts.mjs';
 const U = process.env.SUPABASE_URL, KEY = process.env.SUPABASE_SERVICE_KEY;
 const SLACK = process.env.SLACK_WEBHOOK_URL, GH = process.env.GITHUB_TOKEN;
 const REPO = process.env.GITHUB_REPOSITORY || 'adsmasters/sqp-ingest';
@@ -124,6 +125,18 @@ try {
   // Nur "Tabelle gibt es noch nicht" (404) ist harmlos; Rechte-/Server-Fehler dürfen nicht wie "gesund" aussehen.
   else if (cr.ok && hr.status !== 404) issues.push(`Watchdog: Ads-Dashboard-Prüfung nicht lesbar (HTTP ${hr.status})`);
 } catch (e) { issues.push(`Watchdog: Ads-Dashboard-Prüfung nicht prüfbar (${e.message})`); }
+
+// 6) Monatsbericht-Mails des Ads Dashboards: ungelöste Alarme (adsdash_report_alerts) sofort, und Läufe, die >24h "pending" stehen.
+//    Fehlen die Tabellen noch (404, Migration 008 nicht gelaufen), wird still übersprungen; andere Lesefehler werden gemeldet.
+try {
+  const [cr, ar, rr] = await Promise.all([
+    fetch(`${U}/rest/v1/adsdash_clients?select=id,name`, { headers: H }),
+    fetch(`${U}/rest/v1/adsdash_report_alerts?resolved_at=is.null&select=id,client_id,client_name,period,code,mode,message,resolved_at&limit=200`, { headers: H }),
+    fetch(`${U}/rest/v1/adsdash_report_runs?status=eq.pending&select=client_id,period,mode,status,status_changed_at&limit=200`, { headers: H }),
+  ]);
+  if (cr.ok && ar.ok && rr.ok) issues.push(...reportAlertIssues(await cr.json(), await ar.json(), await rr.json()));
+  else if (cr.ok && !(ar.status === 404 || rr.status === 404)) issues.push(`Watchdog: Monatsbericht-Prüfung nicht lesbar (HTTP ${ar.status}/${rr.status})`);
+} catch (e) { issues.push(`Watchdog: Monatsbericht-Prüfung nicht prüfbar (${e.message})`); }
 
 // Melden: Probleme sofort; sonst montags 05-Uhr-Lauf als Lebenszeichen (Stille ≠ gesund)
 const sendSlack = async text => {
