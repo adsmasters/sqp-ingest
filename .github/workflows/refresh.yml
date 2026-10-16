@@ -2,7 +2,12 @@ name: SQP Weekly Refresh
 on:
   schedule:
     - cron: '0 3 * * 1'   # jeden Montag 03:00 UTC
-  workflow_dispatch: {}    # zusätzlich manuell auslösbar
+  workflow_dispatch:       # zusätzlich manuell auslösbar
+    inputs:
+      only_client:
+        description: 'Nur diesen Kunden (Name exakt, z.B. "MGF - IT", oder spid) — leer = alle. Zum Nachholen nach Amazon-Timeouts.'
+        required: false
+        default: ''
 concurrency:
   group: sqp-refresh       # nur nicht parallel zu sich selbst; 429-Handling faengt
                            # seltene Ueberschneidungen mit dem Backfill ab
@@ -24,8 +29,11 @@ jobs:
           SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SQP_ONLY: ${{ github.event.inputs.only_client }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}   # Sammelmeldung bei ueberwiegend fehlgeschlagenen Reports
       - name: Produkt-Titel/SKUs aktualisieren
-        if: always()
+        # Beim Einzel-Kunden-Nachlauf ueberspringen: laeuft sonst ~20 Min fuer ALLE Kunden mit
+        if: always() && github.event.inputs.only_client == ''
         run: node asin-meta.mjs
         env:
           SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}

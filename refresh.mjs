@@ -3,13 +3,34 @@
 // überspringt ältere vorhandene Perioden. Für den wöchentlichen Cloud-Job (GitHub Actions).
 // ENV: SPAPI_CLIENT_ID, SPAPI_CLIENT_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY
 // Optional: WEEKS (Default 3), CONC (Default 4)
+//   SQP_ONLY=<Kundenname oder spid>  nur diesen Kunden refreshen (Einzel-Nachlauf nach Amazon-Timeouts)
+//   SLACK_WEBHOOK_URL                Sammelmeldung, wenn bei Kunden ueberwiegend Reports fehlschlugen
 import zlib from 'node:zlib';
+import { pathToFileURL } from 'node:url';
 const CID=process.env.SPAPI_CLIENT_ID, SEC=process.env.SPAPI_CLIENT_SECRET;
 const U=process.env.SUPABASE_URL, KEY=process.env.SUPABASE_SERVICE_KEY;
 const SPAPI='https://sellingpartnerapi-eu.amazon.com';
 const NWEEKS=+(process.env.WEEKS||3), CONC=+(process.env.CONC||4);
 const MKT_BY_CC={DE:'A1PA6795UKMFR9',FR:'A13V1IB3VIYZZH',IT:'APJ6JRA9NG5V4',ES:'A1RKKUPIHCS9HS',UK:'A1F83G8C2ARO7P',NL:'A1805IZSGTT6HS',SE:'A2NODRKZP88ZB9',PL:'A1C3SOZRARQ6R3',BE:'AMEN7PMS3EDWL'};
 const sbHead={apikey:KEY,Authorization:'Bearer '+KEY};
+
+// Einzel-Kunden-Lauf (16.10.): Amazon-Reports laufen bei einzelnen Kunden gelegentlich komplett
+// in TIMEOUT (MGF - IT, 12.10.: alle 15 Reports, 0 Zeilen — der Job blieb trotzdem "gruen").
+// Mit SQP_ONLY laesst sich so ein Kunde in Minuten statt in dem ~4h-Gesamtlauf nachholen.
+export function pickClients(clients, only){
+  const o=String(only||'').trim().toLowerCase(); if(!o) return clients;
+  return clients.filter(c=>String(c.name||'').toLowerCase()===o||String(c.spid||'').toLowerCase()===o);
+}
+// Gesundheitscheck je Kunde: ein Report gilt als fehlgeschlagen bei TIMEOUT, Create-Fehler oder
+// Ausnahme. "keine Daten (FATAL)" zaehlt NICHT mit — das ist bei laufender Woche/Monat normal.
+// Bewusst Fehlschlag-Anteil statt "weniger Zeilen als ueblich": die Zeilenzahl schwankt je Woche
+// legitim stark (siehe sqp_asin_rows), der Anteil gescheiterter Reports nicht.
+export function assessClient(s, failShare=0.5){
+  if(!s||!s.total) return null;
+  const failed=s.timeouts+s.createFails+s.exc;
+  if(failed/s.total<failShare) return null;
+  return `${failed} von ${s.total} Reports fehlgeschlagen (${s.timeouts} Timeout${s.createFails?`, ${s.createFails} Create-Fehler`:''}${s.exc?`, ${s.exc} Ausnahmen`:''}), ${s.rows} Zeilen geschrieben`;
+}
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const iso=d=>d.toISOString().slice(0,10);
 
@@ -111,13 +132,13 @@ async function refreshClient(client){
   const jobs=[]; for(let s=0;s<asins.length;s+=18){ const grp=asins.slice(s,s+18); for(const p of periods) jobs.push({batch:grp,...p}); }
   // Create-Gate (Rate-Limit) + Concurrency für Poll/Download
   let gate=Promise.resolve(); const spacedCreate=async body=>{let rel;const prev=gate;gate=new Promise(r=>rel=r);await prev;const c=await api(`/reports/2021-06-30/reports`,{method:'POST',body:JSON.stringify(body)},12);setTimeout(rel,8000);return c;};
-  let i=0,done=0,total=jobs.length;
+  let i=0,done=0,total=jobs.length; const st={total,timeouts:0,createFails:0,exc:0,rows:0};
   const worker=async()=>{ while(i<jobs.length){ const j=jobs[i++];
     try{ const body={reportType:'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',marketplaceIds:[mkt],dataStartTime:j.start+'T00:00:00Z',dataEndTime:j.end+'T00:00:00Z',reportOptions:{reportPeriod:j.period,asin:j.batch.join(' ')}};
       const c=await spacedCreate(body); const cj=c?await c.json():{}; done++;
-      if(!cj.reportId){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length}]: create fail ${c?c.status:'-'} ${JSON.stringify(cj).slice(0,120)}`);continue;}
+      if(!cj.reportId){st.createFails++;console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length}]: create fail ${c?c.status:'-'} ${JSON.stringify(cj).slice(0,120)}`);continue;}
       const pd=await pollDoc(api,cj.reportId);
-      if(!pd||pd.timeout){console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: TIMEOUT`);continue;}
+      if(!pd||pd.timeout){st.timeouts++;console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: TIMEOUT`);continue;}
       if(pd.fatal){
         // FATAL = keine Daten fuer die Anfrage; bei Batches Rest einzeln — hier nur loggen
         // (der Backfill pflegt die Leer-Vermerke; Refresh laeuft force ohne EMPTY-Logik)
@@ -129,25 +150,38 @@ async function refreshClient(client){
       for(const r of rows){ const a=String(r.asin||j.batch[0]).toUpperCase(); if(byAsin.has(a)) byAsin.get(a).push(r); }
       let n=0;
       for(const [a,rws] of byAsin) n+=await upsert(mapRows({dataByAsin:rws},spid,mkt,a,j.period,j.start),spid,mkt,a,j.period,j.start);
-      if(done%5===0||n===0) console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: ${n} Zeilen`);
-    }catch(e){done++;console.log(`  ${name} [${done}/${total}] EXC ${j.period} ${j.start}: ${e.message}`);} } };
+      st.rows+=n; if(done%5===0||n===0) console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: ${n} Zeilen`);
+    }catch(e){done++;st.exc++;console.log(`  ${name} [${done}/${total}] EXC ${j.period} ${j.start}: ${e.message}`);} } };
   await Promise.all(Array.from({length:CONC},worker));
-  console.log(`  ${name}: fertig (${total} Batch-Reports).`);
+  console.log(`  ${name}: fertig (${total} Batch-Reports).`); return st;
 }
 
 async function main(){
   const r=await fetch(`${U}/rest/v1/sqp_clients?active=eq.true&select=name,spid,marketplace,ads_profile_id`,{headers:sbHead});
-  const clients=(await r.json()).filter(c=>c.spid);
+  let clients=(await r.json()).filter(c=>c.spid);
+  const ONLY=(process.env.SQP_ONLY||'').trim();
+  if(ONLY){ clients=pickClients(clients,ONLY); if(!clients.length){ console.error(`FEHLER: SQP_ONLY="${ONLY}" passt auf keinen aktiven Kunden (Name oder spid exakt angeben).`); process.exit(1); } console.log(`Einzel-Lauf: ${clients.map(c=>c.name).join(', ')}`); }
   const CONC_CLIENTS=+(process.env.CONC_CLIENTS||3);
   console.log(`SQP-Refresh: ${clients.length} Kunde(n), ${NWEEKS} Wochen + akt./vor. Monat, ${CONC_CLIENTS} Kunden parallel.`);
   // Kunden PARALLEL: jeder Kunde hat ein eigenes Seller-Token und damit eigenes
   // SP-API-Quota — sequenziell sprengte der Lauf das Workflow-Timeout (>3h).
-  let ci=0;
+  let ci=0; const allStats=[];
   const clientWorker=async()=>{ while(ci<clients.length){ const c=clients[ci++];
     console.log(`Kunde: ${c.name} (${c.spid})`);
     // Ein Kunde darf den Lauf nicht abreissen — Fehler loggen und weiter
-    try{ await refreshClient(c); }catch(e){ console.log(`  ÜBERSPRUNGEN ${c.name}: ${e.message}`); } } };
+    try{ const st=await refreshClient(c); if(st) allStats.push({name:c.name,...st}); }catch(e){ console.log(`  ÜBERSPRUNGEN ${c.name}: ${e.message}`); } } };
   await Promise.all(Array.from({length:Math.min(CONC_CLIENTS,clients.length)||1},clientWorker));
+  // Sammelmeldung (16.10.): TIMEOUT-Reports werden oben nur geloggt, der Job endet trotzdem erfolgreich —
+  // ein Kunde ohne einen einzigen erfolgreichen Report fiel so erst nach >9 Tagen im Waechter auf.
+  const problems=allStats.map(s=>({name:s.name,msg:assessClient(s)})).filter(p=>p.msg);
+  if(problems.length){
+    const text=[`⚠️ *SQP Weekly Refresh*: bei ${problems.length} Kunde(n) schlug die Mehrzahl der Reports fehl (Amazon-Timeouts) — Daten evtl. veraltet:`,...problems.map(p=>`• ${p.name}: ${p.msg}`),'Nachholen nur fuer einen Kunden: Workflow "SQP Weekly Refresh" → Run workflow → only_client.'].join('\n');
+    console.log(text);
+    const hook=process.env.SLACK_WEBHOOK_URL;
+    if(!hook) console.log('(Kein SLACK_WEBHOOK_URL — nur im Log gemeldet.)');
+    else try{ const sr=await fetch(hook,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text}),signal:AbortSignal.timeout(30000)}); if(!sr.ok) console.log('Slack-POST fehlgeschlagen: HTTP '+sr.status); }catch(e){ console.log('Slack-POST fehlgeschlagen: '+e.message); }
+  }
   console.log('ALLES FERTIG.');
 }
-main().catch(e=>{console.error('FEHLER',e);process.exit(1);});
+// Nur bei direktem Start ausfuehren (damit pickClients/assessClient testbar importiert werden koennen)
+if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) main().catch(e=>{console.error('FEHLER',e);process.exit(1);});
