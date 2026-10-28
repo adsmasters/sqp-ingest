@@ -30,16 +30,29 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SQP_ONLY: ${{ github.event.inputs.only_client }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}   # Sammelmeldung bei ueberwiegend fehlgeschlagenen Reports
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}   # Sammelmeldung: fehlgeschlagene/abgebrochene/nicht gestartete Kunden
+          # Optional (Defaults in refresh.mjs): SQP_BREAKER=6, SQP_BUDGET_MIN=270, SQP_HARD_MIN=285, SQP_EXIT_MIN=300
       - name: Produkt-Titel/SKUs aktualisieren
         # Beim Einzel-Kunden-Nachlauf ueberspringen: laeuft sonst ~20 Min fuer ALLE Kunden mit
         if: always() && github.event.inputs.only_client == ''
+        id: meta
+        # Eigenes Limit + continue-on-error (28.10.): ein langsamer/haengender Meta-Schritt darf nicht das 345-Min-Job-Limit reissen
+        # (sonst "cancelled" => der Waechter wertet den ganzen Lauf als Fehlschlag); Fehler meldet der Slack-Hinweis unten.
+        timeout-minutes: 35
+        continue-on-error: true
         run: node asin-meta.mjs
         env:
           SPAPI_CLIENT_ID: ${{ secrets.SPAPI_CLIENT_ID }}
           SPAPI_CLIENT_SECRET: ${{ secrets.SPAPI_CLIENT_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - name: Slack-Hinweis bei asin-meta-Fehler
+        if: always() && (steps.meta.outcome == 'failure' || steps.meta.outcome == 'cancelled')
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && { echo "Kein SLACK_WEBHOOK_URL-Secret — Hinweis übersprungen."; exit 0; }
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"⚠️ *${{ github.workflow }}*: Produkt-Titel/SKUs (asin-meta) fehlgeschlagen oder nach 35 Min abgebrochen — der SQP-Refresh selbst ist durch. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"
       - name: Slack-Alert bei Fehlschlag
         if: failure() || cancelled()   # Timeout = cancelled — blieb sonst stumm (20.-27.07.)
         env:
