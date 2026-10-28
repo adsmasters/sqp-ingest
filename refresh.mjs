@@ -47,6 +47,12 @@ export function assessClient(s, failShare=0.5){
 // Daher: Circuit-Breaker je Kunde, Ausfall-Erkennung ueber mehrere Kunden, Zeitbudget fuer neue Kunden, woechentlich rotierte
 // Kundenreihenfolge (damit nicht immer dieselben hinten stehen) und eine Slack-Sammelmeldung mit den uebersprungenen Kunden.
 export const weekIndex=ms=>Math.floor(ms/(7*24*3600e3));
+// Ersetzen in sqp_asin_rows nach Regel "erst einfuegen, dann loeschen" (28.10.2026). Die Tabelle hat UNIQUE(selling_partner_id, marketplace_id, asin,
+// report_period, start_date, search_query): neue Zeilen koennen nicht neben alten stehen, daher Upsert (gleiche search_query wird in place aktualisiert,
+// die Zeilenzahl waechst nicht) und danach nur die ALTEN, vorab gelesenen Zeilen loeschen, deren search_query in den neuen Daten fehlt.
+// Ein Batch darf dieselbe search_query nicht zweimal enthalten (ein Upsert kann eine Zeile nicht doppelt treffen): die letzte gewinnt.
+export function dedupeBySearchQuery(rows){ const m=new Map(); for(const r of rows) m.set(r.search_query,r); return [...m.values()]; }
+export function staleIds(oldRows,freshRows){ const keep=new Set(freshRows.map(r=>r.search_query)); return oldRows.filter(o=>!keep.has(o.search_query)).map(o=>o.id); }
 // Zahl-Einstellung aus der Umgebung: fehlend/leer/Text/0/negativ/unendlich => Default (ein Tippfehler darf den Lauf nicht bei Minute 0 stoppen)
 export function numEnv(v,def){ const s=String(v??'').trim(); const n=s===''?NaN:Number(s); return Number.isFinite(n)&&n>0?n:def; }
 // Reihenfolge "aeltester Stand zuerst" (der Waechter meldet einen Kunden nach 9 Tagen ohne neue SQP-Zeilen): ein knappes Zeitbudget
@@ -187,11 +193,23 @@ function mapRows(data,spid,mkt,asin,period){ return (data.dataByAsin||[]).map(r=
   total_purchase_count:r.purchaseData?.totalPurchaseCount,asin_purchase_count:r.purchaseData?.asinPurchaseCount,asin_purchase_share:r.purchaseData?.asinPurchaseShare,
   asin_median_purchase_price:num(r.purchaseData?.asinMedianPurchasePrice)})).filter(x=>x.search_query&&(+x.search_query_volume||0)>=(period==="WEEK"?10:50)); } // Mini-Volumen raus
 let HARD_STOP=false; // gesetzt vom harten Stopp: ab dann werden keine neuen Reports/Kunden mehr begonnen
-let upserting=0; // laufende Schreibvorgaenge: der harte Stopp wartet darauf (kein Abbruch zwischen DELETE und POST)
+let upserting=0; // laufende Schreibvorgaenge: der harte Stopp wartet darauf (kein Abbruch mitten im Ersetzen)
 async function upsert(...a){ upserting++; try{ return await upsertRows(...a); } finally{ upserting--; } }
+const ROWS_KEY='selling_partner_id,marketplace_id,asin,report_period,start_date,search_query'; // = UNIQUE-Index von sqp_asin_rows
+async function sbOk(r,what){ if(!r.ok) throw new Error(`${what}: HTTP ${r.status} ${(await r.text()).slice(0,160)}`); return r; }
+// alle Zeilen (id, search_query) eines Slices lesen — bis zur leeren Seite, unabhaengig vom Server-max-rows
+async function readSlice(q){ const out=[];
+  for(let from=0;;){ const r=await sbOk(await fetch(`${U}/rest/v1/sqp_asin_rows?${q}&select=id,search_query&order=id.asc&limit=1000&offset=${from}`,{headers:sbHead,signal:AbortSignal.timeout(60000)}),'sqp_asin_rows lesen');
+    const page=await r.json(); if(!page.length) break; out.push(...page); from+=page.length; }
+  return out; }
 async function upsertRows(rows,spid,mkt,asin,period,start){ const q=`selling_partner_id=eq.${spid}&marketplace_id=eq.${mkt}&asin=eq.${asin}&report_period=eq.${period}&start_date=eq.${start}`;
-  await fetch(`${U}/rest/v1/sqp_asin_rows?${q}`,{method:'DELETE',headers:sbHead,signal:AbortSignal.timeout(120000)}); if(!rows.length)return 0;
-  const ins=await fetch(`${U}/rest/v1/sqp_asin_rows`,{method:'POST',headers:{...sbHead,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(rows),signal:AbortSignal.timeout(120000)}); return ins.ok?rows.length:0; }
+  const old=await readSlice(q); // 1) vorab lesen: nur DIESE ids duerfen spaeter geloescht werden
+  const at=new Date().toISOString(); // ingested_at explizit setzen: ein Upsert in place laesst die Spalte sonst unveraendert (Waechter/Reihenfolge saehen veraltete Daten)
+  const fresh=dedupeBySearchQuery(rows).map(r=>({...r,ingested_at:at}));
+  if(fresh.length) await sbOk(await fetch(`${U}/rest/v1/sqp_asin_rows?on_conflict=${ROWS_KEY}`,{method:'POST',headers:{...sbHead,'Content-Type':'application/json',Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(fresh),signal:AbortSignal.timeout(120000)}),'sqp_asin_rows upsert'); // 2) einfuegen/aktualisieren
+  const stale=staleIds(old,fresh); // 3) erst danach die ALTEN Zeilen loeschen, die es in den neuen Daten nicht mehr gibt (leere neue Daten => alles Alte, wie bisher)
+  for(let i=0;i<stale.length;i+=50) await sbOk(await fetch(`${U}/rest/v1/sqp_asin_rows?id=in.(${stale.slice(i,i+50).join(',')})`,{method:'DELETE',headers:sbHead,signal:AbortSignal.timeout(120000)}),'sqp_asin_rows alte Zeilen loeschen');
+  return fresh.length; }
 
 async function refreshClient(client){
   const {spid,marketplace,name}=client; const mkt=MKT_BY_CC[marketplace]||MKT_BY_CC.DE;
@@ -224,10 +242,12 @@ async function refreshClient(client){
       if(j.batch.length>1&&rows.length&&rows[0].asin===undefined){ console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start}: Zeilen ohne asin-Feld — Batch übersprungen (Format prüfen!)`); continue; }
       const byAsin=new Map(j.batch.map(a=>[a,[]]));
       for(const r of rows){ const a=String(r.asin||j.batch[0]).toUpperCase(); if(byAsin.has(a)) byAsin.get(a).push(r); }
-      let n=0;
-      for(const [a,rws] of byAsin){ if(HARD_STOP) break; // nach dem harten Stopp keine neuen DELETE+POST-Paare mehr beginnen (laufende werden abgewartet)
-        n+=await upsert(mapRows({dataByAsin:rws},spid,mkt,a,j.period,j.start),spid,mkt,a,j.period,j.start); }
-      st.rows+=n; if(done%5===0||n===0) console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: ${n} Zeilen`);
+      let n=0, werr=null; // jede ASIN einzeln: ein Fehler (z. B. ein 5xx) darf die uebrigen ASINs dieses Reports nicht ueberspringen
+      for(const [a,rws] of byAsin){ if(HARD_STOP) break; // nach dem harten Stopp keine neuen Ersetzen-Vorgaenge mehr beginnen (laufende werden abgewartet)
+        try{ n+=await upsert(mapRows({dataByAsin:rws},spid,mkt,a,j.period,j.start),spid,mkt,a,j.period,j.start); }catch(e){ werr=werr||e; } }
+      st.rows+=n;
+      if(werr){ st.exc++; console.log(`  ${name} [${done}/${total}] EXC ${j.period} ${j.start}: ${werr.message}`); continue; } // je Report hoechstens eine Ausnahme gezaehlt
+      if(done%5===0||n===0) console.log(`  ${name} [${done}/${total}] ${j.period} ${j.start} [${j.batch.length} ASINs]: ${n} Zeilen`);
     }catch(e){done++;st.exc++;console.log(`  ${name} [${done}/${total}] EXC ${j.period} ${j.start}: ${e.message}`);} } };
   await Promise.all(Array.from({length:CONC},worker));
   st.skipped=jobs.length-i;

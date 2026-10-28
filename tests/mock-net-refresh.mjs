@@ -12,13 +12,41 @@
 //   createMode{spid}     'hang' | '429' | '403' - creating an SQP report never succeeds
 //   ingest{spid|mkt}     newest sqp_asin_rows.ingested_at per (selling_partner_id, marketplace_id); missing = never ingested
 //   slackStatus          HTTP status of the Slack webhook
+//   sqp{dupQuery,lowVolume}  dupQuery: true | [spid]  -> every ASIN's document repeats 'query 1' a 2nd time (volume 999, score 9);
+//                        lowVolume: {spid: true | [asin]} -> searchQueryVolume 1 (mapRows filters every row => EMPTY new data)
+//   table{...}           STATEFUL in-memory sqp_asin_rows (PostgREST-on-Postgres behaviour):
+//                        seed[]        rows {selling_partner_id,marketplace_id,asin,report_period,start_date,end_date?,search_query,...values,ingested_at?,id?}
+//                        nextId        first auto id (default max(seed id)+1 / 1);  cap  server cap per GET response (default 1000)
+//                        latencyMs     virtual answer delay of every table request (state is applied on ARRIVAL, the answer comes later)
+//                        faults[]      {method:'GET'|'POST'|'DELETE', spid, asin?, nth?, status?}: HTTP 500 (state untouched) for the matching call(s)
+//                        Unique key (selling_partner_id,marketplace_id,asin,report_period,start_date,search_query): plain POST on an existing key => 409;
+//                        POST ?on_conflict=<the 6 cols> + Prefer resolution=merge-duplicates => upsert of the payload columns in place, but the SAME key twice
+//                        in ONE request => 500 'ON CONFLICT DO UPDATE command cannot affect row a second time'; id auto increasing; ingested_at default = virtual now
+//                        on INSERT (an upsert only touches the payload columns); GET filters eq / id=in.(..), select, order, limit, offset (+Range header);
+//                        DELETE without a non-empty filter => 400.
+//   FAKE_SCEN_FILE (env) path of a JSON scenario file (used instead of FAKE_SCEN; Windows env values are capped at ~32 KB)
+//   sqp{dupQuery,lowVolume}  dupQuery: true | [spid]  -> every ASIN's document repeats 'query 1' a 2nd time (volume 999, score 9);
+//                        lowVolume: {spid: true | [asin]} -> searchQueryVolume 1 (mapRows filters every row => EMPTY new data)
+//   table{...}           STATEFUL in-memory sqp_asin_rows (PostgREST-on-Postgres behaviour):
+//                        seed[]        rows {selling_partner_id,marketplace_id,asin,report_period,start_date,end_date?,search_query,...values,ingested_at?,id?}
+//                        nextId        first auto id (default max(seed id)+1 / 1);  cap  server cap per GET response (default 1000)
+//                        latencyMs     virtual answer delay of every table request (state is applied on ARRIVAL, the answer comes later)
+//                        faults[]      {method:'GET'|'POST'|'DELETE', spid, asin?, nth?, status?}: HTTP 500 (state untouched) for the matching call(s)
+//                        Unique key (selling_partner_id,marketplace_id,asin,report_period,start_date,search_query): plain POST on an existing key => 409;
+//                        POST ?on_conflict=<the 6 cols> + Prefer resolution=merge-duplicates => upsert of the payload columns in place, but the SAME key twice
+//                        in ONE request => 500 'ON CONFLICT DO UPDATE command cannot affect row a second time'; id auto increasing; ingested_at default = virtual now
+//                        on INSERT (an upsert only touches the payload columns); GET filters eq / id=in.(..), select, order, limit, offset (+Range header);
+//                        DELETE without a non-empty filter => 400.
+//   FAKE_SCEN_FILE (env) path of a JSON scenario file (used instead of FAKE_SCEN; Windows env values are capped at ~32 KB)
 // At exit the mock writes env FAKE_SUMMARY (JSON): created / rowsPosted per spid, createAttemptT (virtual seconds), slack[], unmocked[],
-// ingestQ[], clientsUrl, aborted / hungNoSignal (hung requests that were aborted by a timeout / that had NO abort signal), fakeMin.
+// ingestQ[], clientsUrl, aborted / hungNoSignal (hung requests that were aborted by a timeout / that had NO abort signal), fakeMin,
+// table {rows[],nextId} (final sqp_asin_rows, rows written by POST in this run carry _w:true), tlog[] (every sqp_asin_rows request in order: virtual ms since start,
+// method, kind, slice, status, rowsAfter = table size after the request, sliceAfter, ids / deleted / queries ...), tpeak (max table size), tstart (ISO of virtual start).
 import fs from 'node:fs';
 import zlib from 'node:zlib';
 import util from 'node:util';
 
-const SC = JSON.parse(process.env.FAKE_SCEN || '{}');
+const SC = JSON.parse(process.env.FAKE_SCEN_FILE ? fs.readFileSync(process.env.FAKE_SCEN_FILE, 'utf8') : (process.env.FAKE_SCEN || '{}'));
 const SB = process.env.SUPABASE_URL;
 const SLACK = process.env.SLACK_WEBHOOK_URL;
 const START = Date.parse(SC.start || '2026-10-28T03:00:00Z');
@@ -85,15 +113,143 @@ function listingTsv(spid) {
 }
 function sqpDoc(rec) {
   const dataByAsin = [];
-  for (const asin of rec.asins) for (let q = 1; q <= 3; q++) dataByAsin.push({ asin, startDate: rec.start, endDate: rec.end,
-    searchQueryData: { searchQuery: 'query ' + q, searchQueryScore: q, searchQueryVolume: 100 + q },
-    impressionData: { totalQueryImpressionCount: 1000, asinImpressionCount: 100, asinImpressionShare: 0.1 },
-    clickData: { totalClickCount: 100, asinClickCount: 10, asinClickShare: 0.1 },
-    cartAddData: { totalCartAddCount: 10, asinCartAddCount: 2, asinCartAddShare: 0.2 },
-    purchaseData: { totalPurchaseCount: 5, asinPurchaseCount: 1, asinPurchaseShare: 0.2, asinMedianPurchasePrice: { amount: 9.99, currencyCode: 'EUR' } } });
+  const dup = (SC.sqp || {}).dupQuery; const dupOn = dup === true || (Array.isArray(dup) && dup.includes(rec.spid));
+  const lv = ((SC.sqp || {}).lowVolume || {})[rec.spid];
+  for (const asin of rec.asins) {
+    const low = lv === true || (Array.isArray(lv) && lv.includes(asin));
+    const mk = (q, score, vol) => ({ asin, startDate: rec.start, endDate: rec.end,
+      searchQueryData: { searchQuery: 'query ' + q, searchQueryScore: score, searchQueryVolume: low ? 1 : vol },
+      impressionData: { totalQueryImpressionCount: 1000, asinImpressionCount: 100, asinImpressionShare: 0.1 },
+      clickData: { totalClickCount: 100, asinClickCount: 10, asinClickShare: 0.1 },
+      cartAddData: { totalCartAddCount: 10, asinCartAddCount: 2, asinCartAddShare: 0.2 },
+      purchaseData: { totalPurchaseCount: 5, asinPurchaseCount: 1, asinPurchaseShare: 0.2, asinMedianPurchasePrice: { amount: 9.99, currencyCode: 'EUR' } } });
+    for (let q = 1; q <= 3; q++) dataByAsin.push(mk(q, q, 100 + q));
+    if (dupOn) dataByAsin.push(mk(1, 9, 999)); // 'query 1' a 2nd time in the SAME document: the last occurrence must win
+  }
   return Buffer.from(JSON.stringify({ reportSpecification: {}, dataByAsin }));
 }
 const outcome = (spid, idx) => { const pat = ((SC.perClient || {})[spid]) ?? SC.pattern ?? 'R'; return pat[idx % pat.length]; };
+
+// ---------------------------------------------------------------- stateful sqp_asin_rows (PostgREST on Postgres)
+const TB = SC.table || {};
+const KEYCOLS = ['selling_partner_id', 'marketplace_id', 'asin', 'report_period', 'start_date', 'search_query'];
+const SLICECOLS = KEYCOLS.slice(0, 5);
+const COLS = new Set([...KEYCOLS, 'id', 'end_date', 'search_query_score', 'search_query_volume', 'total_query_impression_count', 'asin_impression_count', 'asin_impression_share',
+  'total_click_count', 'asin_click_count', 'asin_click_share', 'total_cart_add_count', 'asin_cart_add_count', 'asin_cart_add_share', 'total_purchase_count', 'asin_purchase_count',
+  'asin_purchase_share', 'asin_median_purchase_price', 'ingested_at']);
+const rowsById = new Map(); const byKey = new Map(); const bySlice = new Map(); const written = new Set();
+let nextId = TB.nextId || 1; const tlog = []; S.tpeak = 0;
+const keyOf = (r) => KEYCOLS.map((c) => r[c]).join('\u0001');
+const sliceOf = (r) => SLICECOLS.map((c) => r[c]).join('|');
+function tAdd(r) { rowsById.set(r.id, r); byKey.set(keyOf(r), r); const sk = sliceOf(r); if (!bySlice.has(sk)) bySlice.set(sk, new Set()); bySlice.get(sk).add(r); if (rowsById.size > S.tpeak) S.tpeak = rowsById.size; }
+function tDel(r) { rowsById.delete(r.id); byKey.delete(keyOf(r)); bySlice.get(sliceOf(r))?.delete(r); written.delete(r.id); }
+for (const r0 of TB.seed || []) {
+  const r = { ...r0 }; delete r._w; if (r.id == null) r.id = nextId++; else nextId = Math.max(nextId, r.id + 1);
+  if (!r.ingested_at) r.ingested_at = '2026-01-01T00:00:00.000Z';
+  if (byKey.has(keyOf(r))) throw new Error('mock: duplicate seed key ' + keyOf(r));
+  tAdd(r);
+}
+const tFault = (SC.table || {}).faults || []; const tFaultN = tFault.map(() => 0);
+const tjson = (status, message) => Object.assign(resp(status, { code: String(status), message }), { msg: message });
+const delay = (ms, signal) => new Promise((res, rej) => {
+  const h = globalThis.setTimeout(res, ms);
+  if (signal) { const f = () => { globalThis.clearTimeout(h); rej(signal.reason || new DOMException('aborted', 'AbortError')); }; if (signal.aborted) f(); else signal.addEventListener('abort', f, { once: true }); }
+});
+function parsePreds(q, e) { // PostgREST filters: <col>=eq.<v> and id=in.(a,b,c); anything else => 400
+  const preds = [];
+  for (const [k, v] of q) {
+    if (['select', 'order', 'limit', 'offset', 'on_conflict', 'columns'].includes(k)) continue;
+    if (k === 'id' && /^in\.\(.*\)$/.test(v)) { const list = v.slice(4, -1).split(',').map((x) => x.trim().replace(/^"|"$/g, '')).filter((x) => x !== ''); preds.push({ k, in: new Set(list.map(Number)), n: list.length }); }
+    else if (COLS.has(k) && /^eq\./.test(v)) preds.push({ k, eq: v.slice(3) });
+    else { e.err = `unsupported filter ${k}=${v}`; return null; }
+  }
+  return preds;
+}
+const matches = (r, preds) => preds.every((p) => p.in ? p.in.has(r.id) : String(r[p.k]) === p.eq);
+async function tableRequest(method, q, opts, signal) {
+  const e = { n: tlog.length, t: vnow - START, method, kind: '', status: 0 }; tlog.push(e);
+  let out;
+  try { out = tableApply(method, q, opts, e); }
+  catch (err) { e.status = 599; e.err = String(err && err.message); out = tjson(500, 'mock crash: ' + e.err); }
+  e.status = out.status; if (out.status >= 400) e.msg = out.msg; e.rowsAfter = rowsById.size; if (e.slice) e.sliceAfter = (bySlice.get(e.slice) || new Set()).size;
+  if (TB.latencyMs) { e.answerT = vnow - START + TB.latencyMs; await delay(TB.latencyMs, signal); }
+  return out;
+}
+function tableApply(method, q, opts, e) {
+  const preds = parsePreds(q, e); const spidP = (preds || []).find((p) => p.k === 'selling_partner_id'); const asinP = (preds || []).find((p) => p.k === 'asin');
+  const sliceFromPreds = () => { const g = (c) => (preds.find((p) => p.k === c) || {}).eq; return SLICECOLS.every((c) => g(c) !== undefined) ? SLICECOLS.map(g).join('|') : null; };
+  let body = null;
+  if (method === 'POST') { try { body = JSON.parse(String(opts.body)); } catch { e.kind = 'post'; return tjson(400, 'invalid JSON body'); } if (!Array.isArray(body)) body = [body]; }
+  // fault injection (state untouched)
+  let fSpid = spidP && spidP.eq, fAsin = asinP && asinP.eq;
+  if (method === 'POST' && body.length) { fSpid = body[0].selling_partner_id; fAsin = body[0].asin; }
+  let fRow = null;
+  if (method === 'DELETE' && preds) { const ip = preds.find((p) => p.in); if (ip) { const r = [...ip.in].map((i) => rowsById.get(i)).find(Boolean); if (r) { fRow = r; fSpid = r.selling_partner_id; fAsin = r.asin; } } }
+  for (let i = 0; i < tFault.length; i++) { const f = tFault[i];
+    if (f.method !== method || (f.spid && f.spid !== fSpid) || (f.asin && f.asin !== fAsin)) continue;
+    tFaultN[i]++; if (f.nth && tFaultN[i] !== f.nth) continue;
+    e.injected = true; e.kind = method === 'GET' ? 'get' : method === 'POST' ? 'post' : 'delete'; e.spid = fSpid; e.asin = fAsin;
+    if (method === 'GET' && preds) e.slice = sliceFromPreds() || undefined;
+    if (method === 'POST') { e.nrows = body.length; e.slice = sliceOf(body[0]); e.queries = body.map((r) => r.search_query); }
+    if (method === 'DELETE' && preds) { const ip = preds.find((p) => p.in); e.delKind = ip && preds.length === 1 ? 'ids' : 'slice'; e.reqIds = ip ? [...ip.in] : undefined; e.slice = sliceFromPreds() || (fRow ? sliceOf(fRow) : undefined); }
+    return tjson(f.status || 500, 'injected fault');
+  }
+  if (preds === null) { e.kind = method.toLowerCase(); return tjson(400, e.err); }
+  if (method === 'GET') {
+    e.kind = 'get'; e.slice = sliceFromPreds() || undefined; e.spid = fSpid; e.asin = fAsin;
+    let list = [...rowsById.values()].filter((r) => matches(r, preds));
+    const ord = q.get('order') || 'id.asc'; const [oc, od] = ord.split('.'); list.sort((a, b) => (a[oc] < b[oc] ? -1 : a[oc] > b[oc] ? 1 : a.id - b.id) * (od === 'desc' ? -1 : 1));
+    let offset = q.has('offset') ? +q.get('offset') : 0; let limit = q.has('limit') ? +q.get('limit') : Infinity;
+    const rg = hdr(opts, 'range'); const m = rg && String(rg).match(/^(\d+)-(\d+)$/);
+    if (m) { offset = q.has('offset') ? offset : +m[1]; if (!q.has('limit')) limit = +m[2] - +m[1] + 1; }
+    const cap = TB.cap || 1000; limit = Math.min(limit, cap);
+    const page = list.slice(offset, offset + limit); const sel = (q.get('select') || '*').split(',').map((x) => x.trim());
+    const outRows = page.map((r) => sel.includes('*') ? { ...r } : Object.fromEntries(sel.filter((c) => c in r).map((c) => [c, r[c]])));
+    e.offset = offset; e.limit = q.has('limit') ? +q.get('limit') : null; e.range = rg || null; e.returned = page.length; e.total = list.length; e.select = q.get('select') || '*';
+    e.ids = page.map((r) => r.id); e.queries = page.map((r) => r.search_query);
+    return resp(200, outRows);
+  }
+  if (method === 'DELETE') {
+    e.kind = 'delete';
+    if (!preds.length) return tjson(400, 'DELETE requires a WHERE clause (no filter given)');
+    const ip = preds.find((p) => p.in); if (ip && ip.n === 0) return tjson(400, 'DELETE with an empty id list');
+    const hit = [...rowsById.values()].filter((r) => matches(r, preds));
+    e.delKind = ip && preds.length === 1 ? 'ids' : (!ip && sliceFromPreds() && preds.length === 5 ? 'slice' : 'other');
+    e.nids = ip ? ip.n : 0; e.reqIds = ip ? [...ip.in] : undefined; e.slice = sliceFromPreds() || undefined;
+    e.deleted = hit.map((r) => ({ id: r.id, slice: sliceOf(r), sq: r.search_query, w: written.has(r.id) }));
+    const sl = new Set(hit.map(sliceOf)); e.slices = [...sl]; if (sl.size === 1) e.slice = e.slice || [...sl][0];
+    e.spid = e.deleted[0] ? e.deleted[0].slice.split('|')[0] : undefined; e.asin = e.deleted[0] ? e.deleted[0].slice.split('|')[2] : undefined;
+    for (const r of hit) tDel(r);
+    return resp(204);
+  }
+  if (method === 'POST') {
+    e.kind = 'post'; e.nrows = body.length; e.spid = body[0] && body[0].selling_partner_id; e.asin = body[0] && body[0].asin;
+    const prefer = String(hdr(opts, 'prefer') || ''); const merge = /resolution=merge-duplicates/.test(prefer); const ignore = /resolution=ignore-duplicates/.test(prefer);
+    const oc = q.get('on_conflict'); e.upsert = merge && !!oc; e.prefer = prefer; e.onConflict = oc || null;
+    e.queries = body.map((r) => r.search_query); e.slices = [...new Set(body.map((r) => sliceOf(r)))]; e.slice = e.slices.length === 1 ? e.slices[0] : undefined;
+    if (!body.length) return resp(201);
+    const cols = new Set(); for (const r of body) for (const c of Object.keys(r)) cols.add(c);
+    for (const c of cols) if (!COLS.has(c) || c === 'id') return tjson(400, `Could not find the '${c}' column of 'sqp_asin_rows' in the schema cache`);
+    e.cols = [...cols]; e.hasIngestedAt = cols.has('ingested_at');
+    for (const r of body) for (const c of KEYCOLS) if (r[c] === undefined || r[c] === null || r[c] === '') return tjson(400, `null value in column "${c}" violates not-null constraint`);
+    if (oc && merge && [...new Set(oc.split(',').map((x) => x.trim()))].sort().join() !== [...KEYCOLS].sort().join()) return tjson(400, 'there is no unique or exclusion constraint matching the ON CONFLICT specification');
+    const seen = new Set(); let dupInReq = false; for (const r of body) { const k = keyOf(r); if (seen.has(k)) dupInReq = true; seen.add(k); }
+    const upsert = merge && !!oc && !ignore;
+    if (upsert && dupInReq) return tjson(500, 'ON CONFLICT DO UPDATE command cannot affect row a second time');
+    if (!upsert && !ignore) { // plain insert: any key that already exists (table or same request) => unique violation, nothing is written
+      if (dupInReq || body.some((r) => byKey.has(keyOf(r)))) return tjson(409, 'duplicate key value violates unique constraint "sqp_asin_rows_key"');
+    }
+    const nowIso = new Date(vnow).toISOString(); const outRows = []; e.inserted = 0; e.updated = 0; const done = new Set();
+    for (const r of body) {
+      const k = keyOf(r); if (done.has(k)) continue; done.add(k); const ex = byKey.get(k);
+      if (ex) { if (!upsert) continue; for (const c of cols) ex[c] = r[c] === undefined ? null : r[c]; written.add(ex.id); e.updated++; outRows.push(ex); }
+      else { const nr = {}; for (const c of cols) nr[c] = r[c] === undefined ? null : r[c]; if (nr.ingested_at == null && !cols.has('ingested_at')) nr.ingested_at = nowIso; nr.id = nextId++; tAdd(nr); written.add(nr.id); e.inserted++; outRows.push(nr); }
+    }
+    bump(S.rowsPosted, body[0].selling_partner_id, body.length);
+    return /return=representation/.test(prefer) ? resp(201, outRows) : resp(201);
+  }
+  return tjson(405, 'method not supported by the mock');
+}
 
 // ---------------------------------------------------------------- fetch
 globalThis.fetch = async (url, opts = {}) => {
@@ -125,6 +281,7 @@ globalThis.fetch = async (url, opts = {}) => {
         reports.set(id, { id, spid, type: 'LIST', at: vnow, ch: lm === 'fatal' ? 'F' : lm === 'stuck' ? 'T' : 'R' });
       } else if (body.reportType === 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT') {
         (S.createAttemptT[spid] ||= []).push((vnow - START) / 1000);
+        if (body.reportOptions?.reportPeriod) ((S.sqpPeriods ||= {})[body.reportOptions.reportPeriod + '|' + String(body.dataStartTime).slice(0, 10)] = { period: body.reportOptions.reportPeriod, start: String(body.dataStartTime).slice(0, 10), end: String(body.dataEndTime).slice(0, 10) });
         const cm = (SC.createMode || {})[spid];
         if (cm === 'hang') return hang(signal, spid);
         if (cm === '429') return resp(429, { errors: [{ code: 'QuotaExceeded' }] });
@@ -161,14 +318,14 @@ globalThis.fetch = async (url, opts = {}) => {
     if (table === 'spapi_accounts' && method === 'GET') { const spid = spidQ('selling_partner_id'); return resp(200, (SC.noToken || []).includes(spid) ? [] : [{ refresh_token: 'RT-' + spid }]); }
     if (table === 'sqp_asin_rows' && method === 'GET' && q.get('select') === 'ingested_at') { // newest ingest per (selling_partner_id, marketplace_id)
       const spid = spidQ('selling_partner_id'), mk = spidQ('marketplace_id');
-      S.ingestQ.push({ url: rest, spid, mk }); const iso = (SC.ingest || {})[spid + '|' + mk];
+      S.ingestQ.push({ url: rest, spid, mk }); let iso = (SC.ingest || {})[spid + '|' + mk];
+      if (!iso) for (const r of rowsById.values()) if (r.selling_partner_id === spid && r.marketplace_id === mk && r.ingested_at && (!iso || r.ingested_at > iso)) iso = r.ingested_at;
       return resp(200, iso ? [{ ingested_at: iso }] : []);
     }
+    if (table === 'sqp_asin_rows') return tableRequest(method, q, opts, signal);
     if ((table === 'sqp_asin_meta' || table === 'asin_sales_traffic') && method === 'GET') return resp(200, []);
-    if (table === 'sqp_asin_rows' && method === 'DELETE') return resp(204);
-    if (table === 'sqp_asin_rows' && method === 'POST') { const rows = JSON.parse(String(opts.body)); bump(S.rowsPosted, rows[0].selling_partner_id, rows.length); return resp(201); }
   }
   S.unmocked.push(method + ' ' + url);
   throw new Error(`mock-net-refresh: UNMOCKED request ${method} ${url}`);
 };
-process.on('exit', () => { S.fakeMin = (vnow - START) / 60000; try { fs.writeFileSync(process.env.FAKE_SUMMARY, JSON.stringify(S)); } catch {} });
+process.on('exit', () => { S.fakeMin = (vnow - START) / 60000; S.tstart = new RealDate(START).toISOString(); S.tlog = tlog; S.table = { nextId, rows: [...rowsById.values()].sort((a, b) => a.id - b.id).map((r) => written.has(r.id) ? { ...r, _w: true } : r) }; try { fs.writeFileSync(process.env.FAKE_SUMMARY, JSON.stringify(S)); } catch {} });

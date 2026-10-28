@@ -13,7 +13,7 @@
 // Pure functions, deterministic: no network.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rotateClients, weekIndex, makeBreaker, outageDetected, budgetDecision, buildSlackText, assessClient, staleFirst, ingestKey, numEnv, breakerLimit, finishedEntry } from '../refresh.mjs';
+import { rotateClients, weekIndex, makeBreaker, outageDetected, budgetDecision, buildSlackText, assessClient, staleFirst, ingestKey, numEnv, breakerLimit, finishedEntry, dedupeBySearchQuery, staleIds } from '../refresh.mjs';
 
 const WEEK = 7 * 24 * 3600e3;
 
@@ -303,4 +303,27 @@ test('finishedEntry + outageDetected: three small fully-timed-out clients are an
   const alive = () => finishedEntry(S({ total: 5, timeouts: 4, answered: 1 }), 6);
   assert.equal(outageDetected([dead(), dead(), dead()]), true);
   assert.equal(outageDetected([dead(), alive(), dead()]), false);
+});
+
+// ---- insert-before-delete for sqp_asin_rows (28.10.2026; project rule: replace operations insert FIRST, delete SECOND) ----
+// sqp_asin_rows has UNIQUE(selling_partner_id, marketplace_id, asin, report_period, start_date, search_query), so new rows cannot be inserted
+// next to old ones; the replace is: read the old rows of the slice (id + search_query) FIRST, upsert the new rows (same search_query is
+// updated in place), and only afterwards delete the OLD rows whose search_query no longer exists in the new data (by their previously read id).
+// A batch must not contain the same search_query twice (an upsert cannot touch one row twice).
+test('dedupeBySearchQuery: one row per search_query, the LAST occurrence wins, first-appearance order kept, input untouched', () => {
+  const rows = [{ search_query: 'a', v: 1 }, { search_query: 'b', v: 2 }, { search_query: 'a', v: 3 }];
+  const copy = JSON.parse(JSON.stringify(rows));
+  assert.deepEqual(dedupeBySearchQuery(rows), [{ search_query: 'a', v: 3 }, { search_query: 'b', v: 2 }]);
+  assert.deepEqual(rows, copy, 'input must not be mutated');
+  assert.deepEqual(dedupeBySearchQuery([]), []);
+});
+test('staleIds: the ids of OLD rows whose search_query is not in the new data, and nothing else', () => {
+  const old = [{ id: 1, search_query: 'a' }, { id: 2, search_query: 'b' }, { id: 3, search_query: 'c' }];
+  assert.deepEqual(staleIds(old, [{ search_query: 'a' }, { search_query: 'c' }, { search_query: 'd' }]), [2]);
+  assert.deepEqual(staleIds(old, [{ search_query: 'a' }, { search_query: 'b' }, { search_query: 'c' }]), [], 'identical sets: nothing to delete');
+  assert.deepEqual(staleIds([], [{ search_query: 'a' }]), [], 'nothing old: nothing to delete');
+});
+test('staleIds: empty new data replaces the slice with nothing (same as before): every old id is stale', () => {
+  const old = [{ id: 7, search_query: 'x' }, { id: 8, search_query: 'y' }];
+  assert.deepEqual(staleIds(old, []), [7, 8]);
 });
