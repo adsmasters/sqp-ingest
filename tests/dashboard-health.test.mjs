@@ -95,7 +95,8 @@ test('an active client with no check result, in the dashboard for more than 48 h
   const out = dashboardHealthIssues(old, [], NOW);
   assert.equal(out.length, 1);
   assert.match(out[0], /Alt GmbH/);
-  assert.match(out[0], /2 Tage/);
+  assert.match(out[0], /2 days/);
+  assert.match(out[0], /no data-check result/i, 'the message is in English');
 });
 
 test('a client added less than 48 hours ago is not flagged yet', () => {

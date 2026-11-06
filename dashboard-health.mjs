@@ -35,7 +35,7 @@ export function dashboardHealthIssues(clients, checks, now = Date.now()) {
       // diesen Kunden nicht (oder scheitert jedes Mal). Ohne bekanntes Alter (kein created_at) wird nicht gemeldet.
       const age = now - Date.parse(client.created_at);
       if (Number.isFinite(age) && age > NEW_CLIENT_GRACE_H * 3600e3) {
-        issues.push(`Ads-Dashboard (${client.name}): seit ${Math.floor(age / 86400e3)} Tagen aktiv, aber kein Ergebnis der Datenprüfung vorhanden — Cron /api/cron/health prüfen`);
+        issues.push(`Ads-Dashboard (${client.name}): active for ${Math.floor(age / 86400e3)} days, but no data-check result exists — check the cron /api/cron/health`);
       }
       continue;
     }
