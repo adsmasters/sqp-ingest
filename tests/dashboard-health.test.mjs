@@ -7,7 +7,7 @@
 //   - warnings alone are NOT a problem (the dashboard check warns about routine Amazon rate limits);
 //   - if no check was stored for a client in the last 30 hours (the check runs once a day), the check itself is not
 //     running: that is a problem too;
-//   - an inactive client, or one that has never had a check yet, is never a problem;
+//   - an inactive client is never a problem; a client that has no check result yet is only a problem after 48 hours in the dashboard (see below);
 //   - only the newest row per client counts (an old alert that has since been resolved must not be reported).
 // Pure function, deterministic: no network.
 import { test } from 'node:test';
@@ -84,6 +84,38 @@ test('29 hours old is still fine', () => {
 
 test('a client that has never had a check is not a problem', () => {
   assert.deepEqual(dashboardHealthIssues(clients, [], NOW), []);
+});
+
+// Added 2026-11-06 (owner's decision): an ACTIVE client that has no check result at all is a problem once it has been in the dashboard for
+// 48 hours (the daily check has then had two chances to cover it; a brand-new client is not flagged). Before, "never checked" was silent,
+// so a client the daily check never reached (or that failed every time) was invisible. Age comes from adsdash_clients.created_at; a client
+// whose age is unknown (no created_at) and an inactive client are never flagged.
+test('an active client with no check result, in the dashboard for more than 48 hours, is a problem (named, with its age)', () => {
+  const old = [{ id: 'c1', name: 'Alt GmbH', active: true, created_at: hAgo(49) }];
+  const out = dashboardHealthIssues(old, [], NOW);
+  assert.equal(out.length, 1);
+  assert.match(out[0], /Alt GmbH/);
+  assert.match(out[0], /2 Tage/);
+});
+
+test('a client added less than 48 hours ago is not flagged yet', () => {
+  assert.deepEqual(dashboardHealthIssues([{ id: 'c1', name: 'Neu', active: true, created_at: hAgo(47) }], [], NOW), []);
+});
+
+test('no check result but unknown age (no created_at) or inactive: not flagged', () => {
+  assert.deepEqual(dashboardHealthIssues([{ id: 'c1', name: 'X', active: true }], [], NOW), []);
+  assert.deepEqual(dashboardHealthIssues([{ id: 'c1', name: 'X', active: true, created_at: 'not a date' }], [], NOW), []);
+  assert.deepEqual(dashboardHealthIssues([{ id: 'c1', name: 'X', active: false, created_at: hAgo(500) }], [], NOW), []);
+});
+
+test('only clients WITHOUT a check result are flagged by this rule: an old client with a fresh ok check stays silent', () => {
+  const two = [
+    { id: 'c1', name: 'Geprüft', active: true, created_at: hAgo(900) },
+    { id: 'c2', name: 'Nie geprüft', active: true, created_at: hAgo(900) },
+  ];
+  const out = dashboardHealthIssues(two, [check({ client_id: 'c1' })], NOW);
+  assert.equal(out.length, 1);
+  assert.match(out[0], /Nie geprüft/);
 });
 
 test('inactive clients are ignored', () => {

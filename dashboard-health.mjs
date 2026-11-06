@@ -6,6 +6,7 @@
 // aufeinanderfolgenden Tagen auftrat (Schonfrist: bis dahin hatte der Sync >= 4 Läufe, ihn zu heilen).
 // Reine Funktion, kein Netzwerk.
 const MAX_CHECK_AGE_H = 30; // Prüfung läuft 1x täglich
+const NEW_CLIENT_GRACE_H = 48; // ein neuer Kunde ohne Prüfergebnis wird erst nach 48 h gemeldet
 
 export function dashboardHealthIssues(clients, checks, now = Date.now()) {
   // Ergebnisse je Kunde, neuestes zuerst
@@ -29,7 +30,15 @@ export function dashboardHealthIssues(clients, checks, now = Date.now()) {
   for (const client of clients) {
     if (!client.active) continue;
     const row = latest.get(client.id);
-    if (!row) continue; // noch nie geprüft (neuer Kunde / Prüfung gerade erst eingerichtet)
+    if (!row) {
+      // Kein Prüfergebnis: bei einem neuen Kunden normal — nach 48 h (zwei Chancen der Tagesprüfung) ist es ein Problem: die Prüfung erreicht
+      // diesen Kunden nicht (oder scheitert jedes Mal). Ohne bekanntes Alter (kein created_at) wird nicht gemeldet.
+      const age = now - Date.parse(client.created_at);
+      if (Number.isFinite(age) && age > NEW_CLIENT_GRACE_H * 3600e3) {
+        issues.push(`Ads-Dashboard (${client.name}): seit ${Math.floor(age / 86400e3)} Tagen aktiv, aber kein Ergebnis der Datenprüfung vorhanden — Cron /api/cron/health prüfen`);
+      }
+      continue;
+    }
     const ageH = Math.round((now - Date.parse(row.checked_at)) / 3600e3);
     if (ageH > MAX_CHECK_AGE_H) {
       issues.push(`Ads-Dashboard (${client.name}): Datenprüfung seit ${ageH}h nicht gelaufen — Cron /api/cron/health prüfen`);

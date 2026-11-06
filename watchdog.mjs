@@ -118,7 +118,7 @@ try {
 //    und den Fall, dass diese Prüfung selbst >30h nicht lief. Fehlt die Tabelle noch (404), wird still übersprungen; andere Lesefehler werden gemeldet.
 try {
   const [cr, hr] = await Promise.all([
-    fetch(`${U}/rest/v1/adsdash_clients?select=id,name,active`, { headers: H }),
+    fetch(`${U}/rest/v1/adsdash_clients?select=id,name,active,created_at`, { headers: H }),
     fetch(`${U}/rest/v1/adsdash_health_check?select=client_id,checked_at,status,issues&order=checked_at.desc&limit=1000`, { headers: H }),
   ]);
   if (cr.ok && hr.ok) issues.push(...dashboardHealthIssues(await cr.json(), await hr.json()));
