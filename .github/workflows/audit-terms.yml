@@ -1,0 +1,50 @@
+name: Audit-Suchbegriffe (IDs vorladen)
+# Frischt NUR die SP-Suchbegriffe (inkl. Kampagnen-/Anzeigengruppen-/Keyword-IDs) in den gespeicherten PPC-Audits auf: 1 Report je Konto statt ~10.
+# Dadurch gehen "Nur aktiver Wasted Spend" und "Ausgewählte negieren" im PPC-Audit aus GESPEICHERTEN Daten, ohne dass jemand auf ein neues Audit warten muss.
+# Schreibt nur payload.spTerms (+ spTermsAsOf) der gespeicherten Zeile, ändert updated_at NICHT und überschreibt nichts, was sich zwischenzeitlich geändert hat
+# (z. B. durch das volle Audit unten). Legt keine Kampagnen/Gebote/Negatives an oder ändert sie.
+on:
+  workflow_dispatch:
+    inputs:
+      only_profile:
+        description: 'Nur dieses Ads-Profil (profileId) — Einzeltest, leer = alle Konten'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Trockenlauf: Report anfordern, aber NICHTS in den Cache schreiben (true/false)'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '30 0 * * *'    # 00:30 UTC (06:00 IST) — vor dem vollen Audit (daily-data.yml, 02:00 UTC)
+concurrency:
+  group: sqp-audit-terms
+jobs:
+  terms:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Suchbegriffe (mit IDs) in die gespeicherten Audits schreiben
+        run: node audit-terms-refresh.mjs 30
+        env:
+          # Konten laufen parallel; Budget = Zeit, in der noch NEUE Konten gestartet werden (je Konto 1 Report, Zeitlimit 30 Min).
+          # Der Lauf endet mit Fehler (Slack-Alarm), wenn kein Konto oder mehr als die Hälfte der gestarteten Konten aktualisiert wurde.
+          TERMS_CONCURRENCY: '6'
+          TERMS_BUDGET_MIN: '90'
+          ONLY_PROFILE: ${{ github.event.inputs.only_profile }}
+          TERMS_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '' }}
+          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
+          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
+          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - name: Slack-Alert bei Fehlschlag
+        if: failure() || cancelled()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && { echo "Kein SLACK_WEBHOOK_URL-Secret — Alert übersprungen."; exit 0; }
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ *${{ github.workflow }}* fehlgeschlagen — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Zum Log →>\"}" "$SLACK_WEBHOOK_URL"
