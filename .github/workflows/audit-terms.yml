@@ -21,7 +21,7 @@ concurrency:
 jobs:
   terms:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 180   # Budget 120 Min (letzte Konten starten bis dahin) + Zeitlimit 30 Min je Konto + Nachfristen
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -32,8 +32,11 @@ jobs:
         env:
           # Konten laufen parallel; Budget = Zeit, in der noch NEUE Konten gestartet werden (je Konto 1 Report, Zeitlimit 30 Min).
           # Der Lauf endet mit Fehler (Slack-Alarm), wenn kein Konto oder mehr als die Hälfte der gestarteten Konten aktualisiert wurde.
-          TERMS_CONCURRENCY: '6'
-          TERMS_BUDGET_MIN: '90'
+          # Gemessen (Trockenlauf 09.11.): 1 Konto = ~21 Min (fast nur Warten auf Amazon). Letzter volle Audit-Lauf: 62 Konten in der Warteschlange.
+          # 16 parallel = 4 Wellen a ~21 Min = ~85-110 Min fuer ALLE Konten pro Nacht. Last auf Amazon: 16 gleichzeitige Reports
+          # (das volle Audit hat bis zu ~40: 4 Konten x ~10 Reports).
+          TERMS_CONCURRENCY: '16'
+          TERMS_BUDGET_MIN: '120'
           ONLY_PROFILE: ${{ github.event.inputs.only_profile }}
           TERMS_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '' }}
           ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
