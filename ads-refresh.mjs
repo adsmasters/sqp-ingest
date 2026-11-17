@@ -67,6 +67,61 @@ async function downloadReport(url) {
   return JSON.parse(buf.toString('utf8'));
 }
 
+// Lauf-Probleme (Schreib- oder Aufraeumfehler): am Ende exit 1, damit der Workflow-Alert (ads.yml) feuert statt nur ein Log-Eintrag.
+let problems = 0;
+
+// Ein Upsert-Chunk mit 1 Wiederholung nach 5 s (auch ein Netzwerkfehler = fetch wirft zaehlt als Fehlschlag). '' = ok, sonst der Grund.
+async function postChunk(chunk) {
+  let why = '';
+  for (let a = 0; a < 2; a++) {
+    try {
+      const r = await fetch(`${U}/rest/v1/ads_asin_terms?on_conflict=profile_id,asin,search_term`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) });
+      if (r.ok) return '';
+      why = r.status + ' ' + (await r.text()).slice(0, 150);
+    } catch (e) { why = e.message; }
+    if (a === 0) await sleep(5000);
+  }
+  return why;
+}
+// Schreibt alle Zeilen in Chunks zu 500 (seit dem Umbau ist JEDE Zeile ein Update einer vorhandenen Zeile). Schlaegt ein Chunk
+// auch nach der Wiederholung fehl — typisch der 8-s-Timeout der Datenbank (57014; 1000er-Chunks haben am 18.09. in
+// ads-periodic 17 Perioden geleert) —, wird genau dieser Chunk in 100er-Stuecken wiederholt. Bricht auch das ab, stoppt das Schreiben.
+async function writeRows(rows) {
+  let ins = 0;
+  for (let i = 0; i < rows.length; i += 500) {
+    const chunk = rows.slice(i, i + 500);
+    let why = await postChunk(chunk);
+    if (!why) { ins += chunk.length; continue; }
+    for (let j = 0; j < chunk.length; j += 100) {
+      const part = chunk.slice(j, j + 100);
+      why = await postChunk(part);
+      if (why) { console.log('  INSERT', why); return ins; }
+      ins += part.length;
+    }
+  }
+  return ins;
+}
+// Aufraeumen NACH vollstaendigem Schreiben: alte Zeilen (ingested_at < runTs) ASIN fuer ASIN loeschen — jede Anfrage trifft nur
+// einen kleinen Bereich des Unique-Index (profile_id, asin, ...) und bleibt unter dem 8-s-Limit. Ein einziges DELETE fuer den ganzen
+// Kunden scheitert bei Konten mit Millionen Zeilen (ein Konto hat ~72 % der Tabelle). Danach EIN Sammel-DELETE fuer ASINs, die gar
+// nicht mehr im Bericht stehen; scheitert der (zu gross), bleiben deren Zeilen stehen — nur Log. Liefert {failed: Anzahl ASINs, rest: Grund|''}.
+async function cleanupOld(profile, asins, runTs) {
+  const T = encodeURIComponent(runTs);
+  let failed = 0;
+  for (const a of asins) {
+    try {
+      const d = await fetch(`${U}/rest/v1/ads_asin_terms?profile_id=eq.${profile}&asin=eq.${encodeURIComponent(a)}&ingested_at=lt.${T}`, { method: 'DELETE', headers: sbHead });
+      if (!d.ok) failed++;
+    } catch (e) { failed++; }
+  }
+  let rest = '';
+  try {
+    const d = await fetch(`${U}/rest/v1/ads_asin_terms?profile_id=eq.${profile}&ingested_at=lt.${T}`, { method: 'DELETE', headers: sbHead });
+    if (!d.ok) rest = String(d.status);
+  } catch (e) { rest = e.message; }
+  return { failed, rest };
+}
+
 const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 // Baut aus den zwei fertigen Rohberichten eines Kunden die (ASIN x Suchbegriff)-Zeilen
 // und schreibt sie. Wird NUR aufgerufen, wenn beide Reports wirklich vollstaendig da
@@ -89,20 +144,33 @@ async function writeClient(cl, advRows, stRows) {
       e.clicks += (+r.clicks || 0) * sh; e.cost += (+r.cost || 0) * sh; e.purchases7d += (+r.purchases7d || 0) * sh; e.sales7d += (+r.sales7d || 0) * sh;
     }
   }
-  const rows = [...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2) }));
-  await fetch(`${U}/rest/v1/ads_asin_terms?profile_id=eq.${cl.ads_profile_id}`, { method: 'DELETE', headers: sbHead });
-  let ins = 0;
+  // Reihenfolge bewusst "erst schreiben, dann aufraeumen" (CLAUDE.md-Regel 4; gleiches Muster wie
+  // ads-periodic.mjs, 20.09.): frueher stand hier ein DELETE des ganzen Kunden VOR dem Schreiben —
+  // schlug ein Chunk fehl (z.B. 57014-Timeout) oder war der Bericht leer, blieb der Kunde leer.
+  // Jede Zeile bekommt jetzt ingested_at = "jetzt" (auch beim Merge-Update einer vorhandenen Zeile),
+  // damit das DELETE danach NUR noch die alten, diesmal nicht geschriebenen Zeilen trifft.
+  const runTs = new Date().toISOString();
+  const rows = [...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2), ingested_at: runTs }));
+  if (!rows.length) { console.log(`${cl.name}: Bericht ohne verwertbare Suchbegriffe — alte Daten bleiben stehen.`); return; }
+  const t0 = Date.now();
   // Upsert statt Plain-INSERT (11.09.): der Hetzner-Daemon (backfill-worker.mjs) stoesst
   // ads-refresh.mjs unabhaengig alle 6h nochmal an — kollidiert der mit diesem Lauf auf
   // demselben Kunden, gab es bisher 409 auf (profile_id, asin, search_term) und der
   // betroffene Kunde bekam 0 Zeilen geschrieben (Diagnose 12.09., Warnick's/Zauber der
   // Gewürze/BIOZOYG). on_conflict macht die Kollision zu einem harmlosen Merge.
-  for (let i = 0; i < rows.length; i += 1000) {
-    const chunk = rows.slice(i, i + 1000);
-    const r = await fetch(`${U}/rest/v1/ads_asin_terms?on_conflict=profile_id,asin,search_term`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) });
-    if (r.ok) ins += chunk.length; else { console.log('  INSERT', r.status, (await r.text()).slice(0, 150)); break; }
+  const ins = await writeRows(rows);
+  const secs = Math.round((Date.now() - t0) / 1000);
+  console.log(`${cl.name}: ${advRows.length} adv / ${stRows.length} terms / ${agToAsins.size} adGroups -> ${ins} (ASIN×Begriff) geschrieben (${secs} s).`);
+  if (ins === rows.length) {
+    // Alles geschrieben -> jetzt NUR die alten Zeilen dieses Kunden (aelter als dieser Lauf) entfernen.
+    const asins = [...new Set(rows.map(r => r.asin))];
+    const c = await cleanupOld(cl.ads_profile_id, asins, runTs);
+    if (c.failed) { problems++; console.log(`  ${cl.name}: Aufraeumen fehlgeschlagen bei ${c.failed}/${asins.length} ASINs — neue Daten sind geschrieben, alte Zeilen bleiben bis zum naechsten Lauf.`); }
+    if (c.rest) console.log(`  ${cl.name}: Sammel-Aufraeumen (ASINs, die nicht mehr im Bericht stehen) fehlgeschlagen (${c.rest}) — Zeilen verschwundener ASINs bleiben stehen.`);
+  } else {
+    problems++;
+    console.log(`  ${cl.name}: nur ${ins}/${rows.length} Zeilen geschrieben — alte Zeilen bleiben stehen, Aufraeumen uebersprungen.`);
   }
-  console.log(`${cl.name}: ${advRows.length} adv / ${stRows.length} terms / ${agToAsins.size} adGroups -> ${ins} (ASIN×Begriff) geschrieben.`);
 }
 
 async function main() {
@@ -176,5 +244,6 @@ async function main() {
   for (const cl of clients) await writeIfReady(cl);
 
   console.log(`ADS-REFRESH FERTIG. (${rateLimited} Polls ueber den ganzen Lauf waren HTTP 429)`);
+  if (problems) { console.log(`ADS-REFRESH: ${problems} Kunde(n) mit Schreib-/Aufraeumproblem — Lauf wird als FEHLGESCHLAGEN gemeldet (exit 1), damit der Alert feuert.`); process.exitCode = 1; }
 }
 main().catch(e => { console.error('FEHLER', e.message); process.exit(1); });

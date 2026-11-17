@@ -5,6 +5,7 @@
 // ENV: SUPABASE_URL, SUPABASE_SERVICE_KEY, SLACK_WEBHOOK_URL, GITHUB_TOKEN, GITHUB_REPOSITORY
 import { dashboardHealthIssues } from './dashboard-health.mjs';
 import { reportAlertIssues } from './report-alerts.mjs';
+import { vendorAdsStaleClients } from './vendor-ads-health.mjs';
 const U = process.env.SUPABASE_URL, KEY = process.env.SUPABASE_SERVICE_KEY;
 const SLACK = process.env.SLACK_WEBHOOK_URL, GH = process.env.GITHUB_TOKEN;
 const REPO = process.env.GITHUB_REPOSITORY || 'adsmasters/sqp-ingest';
@@ -113,6 +114,25 @@ try {
   if (stale.sqp.length) issues.push(`SQP-Daten >9 Tage alt bei: ${stale.sqp.join(', ')} (Wochen-Refresh prüfen)`);
   if (stale.ads.length) issues.push(`Ads-Daten >3 Tage alt bei: ${stale.ads.join(', ')} (Ads-Refresh prüfen)`);
 } catch (e) { issues.push(`Watchdog: Datenfrische nicht prüfbar (${e.message})`); }
+
+// 4d) Vendor-Ads (vra_ads): neuestes period_end je Vendor-Kunde > 3 Tage alt = Import still stehengeblieben (vendor-ads.mjs meldet nur im Log)
+try {
+  const vr = await fetch(`${U}/rest/v1/vra_clients?select=id,name,ads_profile_id,created_at`, { headers: H });
+  if (!vr.ok) throw new Error(`vra_clients HTTP ${vr.status}`); // Lesefehler duerfen nicht wie "gesund" aussehen
+  const vclients = (await vr.json()).filter(c => c.ads_profile_id);
+  const newest = {}; let unreadable = 0;
+  for (const c of vclients) {
+    try {
+      const r = await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${c.id}&select=period_end&order=period_end.desc&limit=1`, { headers: H });
+      if (!r.ok) { unreadable++; continue; } // nicht gelesen -> nicht raten (kein Eintrag), aber unten melden
+      const rows = await r.json();
+      newest[c.id] = rows[0] ? rows[0].period_end : null;
+    } catch (e) { unreadable++; }
+  }
+  const staleV = vendorAdsStaleClients(vclients, newest);
+  if (staleV.length) issues.push(`Vendor-Ads-Daten >3 Tage alt bei: ${staleV.join(', ')} (Vendor-Ads-Import prüfen)`);
+  if (unreadable) issues.push(`Watchdog: Vendor-Ads-Frische bei ${unreadable} Kunde(n) nicht lesbar`);
+} catch (e) { issues.push(`Watchdog: Vendor-Ads-Frische nicht prüfbar (${e.message})`); }
 
 // 5) Ads Dashboard (eigenes Projekt): meldet nur ALARME seiner täglichen Datenprüfung (adsdash_health_check)
 //    und den Fall, dass diese Prüfung selbst >30h nicht lief. Fehlt die Tabelle noch (404), wird still übersprungen; andere Lesefehler werden gemeldet.

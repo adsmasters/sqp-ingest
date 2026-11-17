@@ -58,6 +58,7 @@ const REPORT_TYPES = [
 // Spalten-Varianten des Report-Typs durch.
 async function createReport(profile, rt, startDate, endDate) {
   await ensureAuth();
+  const wantedStart = startDate; // merkt, ob die Aufbewahrungsgrenze den Zeitraum verkuerzt hat ("clipped")
   for (const columns of rt.tries) {
     let badColumns = false;
     for (let a = 0; a < 8; a++) {
@@ -65,18 +66,18 @@ async function createReport(profile, rt, startDate, endDate) {
       const c = await fetch(`${ADS}/reporting/reports`, { method: 'POST', headers: H(profile), body: JSON.stringify(body) });
       if (c.status === 429) { await sleep(15000); continue; }
       const j = await c.json();
-      if (c.status === 425) { const id = String(j.detail || '').split(':').pop().trim(); if (id) return { reportId: id }; await sleep(15000); continue; }
+      if (c.status === 425) { const id = String(j.detail || '').split(':').pop().trim(); if (id) return { reportId: id, clipped: startDate > wantedStart }; await sleep(15000); continue; }
       if (c.status === 400) {
         const m = String(j.detail || '').match(/data retention start date \((\d{4}-\d{2}-\d{2})\)/);
         if (m && m[1] > startDate) { if (m[1] > endDate) return null; startDate = m[1]; continue; }
         if (/column|invalid|unknown|not supported/i.test(JSON.stringify(j))) { badColumns = true; break; }
       }
-      if (!j.reportId) throw new Error(`${rt.key} create ${c.status}: ${JSON.stringify(j).slice(0, 160)}`);
-      return { reportId: j.reportId };
+      if (!j.reportId) { const err = new Error(`${rt.key} create ${c.status}: ${JSON.stringify(j).slice(0, 160)}`); err.permanent = c.status >= 400 && c.status < 500; throw err; } // 4xx = dauerhaft (z. B. 403 "kein SB/SD fuer dieses Konto"), 5xx = vorubergehend
+      return { reportId: j.reportId, clipped: startDate > wantedStart };
     }
     if (!badColumns) throw new Error(`${rt.key} create: zu viele Versuche`);
   }
-  throw new Error(`${rt.key}: keine gültige Spalten-Variante`);
+  const noCols = new Error(`${rt.key}: keine gültige Spalten-Variante`); noCols.permanent = true; throw noCols;
 }
 
 async function downloadReport(url) {
@@ -88,12 +89,36 @@ async function downloadReport(url) {
 // Monat überspringen nur, wenn er schon mit DEMSELBEN Profil und VOLLSTÄNDIG
 // importiert wurde — bei Profilwechsel oder wenn nur ein Teilmonat gespeichert
 // ist (z. B. Juli während des Monats importiert), wird neu importiert.
+// Beurteilt den GANZEN Monat, nicht eine beliebige Zeile: die Zeile mit dem aeltesten period_end entscheidet ueber
+// "Teilmonat", und jede Zeile mit anderem Profil macht es zum Profilwechsel. Sonst koennte ein uebrig gebliebener
+// alter Teil (z. B. nach abgebrochenem Schreiben/Loeschen) hinter einer neuen Zeile verborgen bleiben und der
+// Monat fuer immer als "aktuell" gelten (Doppel-/Altdaten).
 async function monthState(clientId, m, profile, monthEnd) {
-  const r = await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${clientId}&period_start=eq.${m}&select=profile_id,period_end&limit=1`, { headers: sbHead });
-  const rows = await r.json();
+  const q = `${U}/rest/v1/vra_ads?client_id=eq.${clientId}&period_start=eq.${m}&select=profile_id,period_end`;
+  const rows = await (await fetch(`${q}&order=period_end.asc&limit=1`, { headers: sbHead })).json();
   if (!Array.isArray(rows) || !rows.length) return 'fehlt';
   if (rows[0].profile_id !== String(profile)) return 'profilwechsel';
+  const other = await (await fetch(`${q}&profile_id=neq.${profile}&limit=1`, { headers: sbHead })).json();
+  if (Array.isArray(other) && other.length) return 'profilwechsel';
   return rows[0].period_end < monthEnd ? 'teilmonat' : 'aktuell';
+}
+
+// Alle vra_ads-Zeilen (id, asin) eines Kunden-Monats (seitenweise bis zur leeren Seite, unabhaengig vom Server-max-rows)
+async function adsOldRows(clientId, periodStart) {
+  const out = [];
+  for (let from = 0; ;) {
+    const r = await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${clientId}&period_start=eq.${periodStart}&select=id,asin&order=id.asc&limit=1000&offset=${from}`, { headers: sbHead });
+    if (!r.ok) throw new Error(`vra_ads lesen ${r.status}`);
+    const rows = await r.json(); if (!Array.isArray(rows) || !rows.length) break;
+    out.push(...rows); from += rows.length;
+  }
+  return out;
+}
+async function deleteAdsIds(ids) {
+  for (let i = 0; i < ids.length; i += 50) {
+    const d = await fetch(`${U}/rest/v1/vra_ads?id=in.(${ids.slice(i, i + 50).join(',')})`, { method: 'DELETE', headers: sbHead });
+    if (!d.ok) throw new Error(`vra_ads loeschen ${d.status}`);
+  }
 }
 
 async function listProfiles() {
@@ -147,8 +172,13 @@ async function main() {
   for (const job of jobs) {
     try {
       const r = await createReport(job.cl.ads_profile_id, job.rt, job.m.start, job.m.end);
-      if (!r) { job.state = 'retention'; } else { job.reportId = r.reportId; job.state = 'wartet'; }
-    } catch (e) { job.state = 'fehler'; console.log(`${job.cl.name} ${job.m.start} ${job.rt.key}: ${e.message}`); }
+      if (!r) { job.state = 'retention'; } else { job.reportId = r.reportId; job.clipped = !!r.clipped; job.state = 'wartet'; }
+    } catch (e) {
+      // Ein DAUERHAFTER Fehler (HTTP 4xx / keine gueltige Spaltenvariante) beim Anfordern von SD oder SB heisst: dieses Konto hat
+      // das Werbeprodukt nicht bzw. keinen Zugriff darauf — kein Grund, den ganzen Monat (SP) zu blockieren. Nur SP ist unverzichtbar.
+      if (e.permanent && job.rt.key !== 'SP') { job.state = 'unavailable'; console.log(`${job.cl.name} ${job.m.start} ${job.rt.key}: nicht verfuegbar fuer dieses Konto (${e.message.slice(0, 120)}) — Monat wird ohne ${job.rt.key} gespeichert.`); }
+      else { job.state = 'fehler'; console.log(`${job.cl.name} ${job.m.start} ${job.rt.key}: ${e.message}`); }
+    }
     await sleep(400); // Amazon-Rate-Limit schonen
   }
 
@@ -165,6 +195,19 @@ async function main() {
       console.log(`${cl.name} ${m.start}: ${mine.every(j => j.state === 'retention') ? 'außerhalb der Ads-Datenaufbewahrung' : 'keine Daten (alle Reports fehlgeschlagen)'}`);
       return;
     }
+    // Ein Monat wird nur gespeichert/ersetzt, wenn er VOLLSTAENDIG ist. Ein einmal gespeicherter Monat gilt sonst als
+    // "aktuell" und wird nie wieder geholt — unvollstaendige Daten (z. B. ohne SP, der einzigen Quelle der Kosten je ASIN)
+    // blieben dauerhaft stehen und verfaelschten TACoS; ausserdem koennten sie vollstaendige Altdaten ersetzen.
+    // Nicht gespeichert -> bleibt "fehlt"/"Teilmonat" und wird beim naechsten Lauf erneut versucht.
+    const spJob = mine.find(j => j.rt.key === 'SP');
+    const failedKeys = mine.filter(j => j.state === 'fehler').map(j => j.rt.key);
+    if (!spJob || spJob.state !== 'fertig') { console.log(`${cl.name} ${m.start}: SP-Bericht fehlt — Monat nicht gespeichert, vorhandene Zeilen bleiben unveraendert (naechster Lauf versucht es erneut).`); return; }
+    if (failedKeys.length) { console.log(`${cl.name} ${m.start}: Bericht(e) ${failedKeys.join('+')} fehlgeschlagen — Monat nicht gespeichert, vorhandene Zeilen bleiben unveraendert (naechster Lauf versucht es erneut).`); return; }
+    // Aufbewahrungsgrenze: ist SP (die Kostenquelle) verkuerzt, wird der Monat nie als vollstaendig gespeichert. Sind nur SB/SD verkuerzt
+    // (deren Fenster ist kuerzer als das von SP), gilt: vorhandene Daten werden nicht ersetzt (unten); ohne vorhandene Daten wird gespeichert —
+    // aeltere Daten holt Amazon nie wieder heraus, ein spaeterer Versuch bringt nichts.
+    if (spJob.clipped) { console.log(`${cl.name} ${m.start}: SP-Daten liegen teilweise ausserhalb der Ads-Datenaufbewahrung — Monat nicht als vollstaendiger Monat gespeichert, vorhandene Zeilen bleiben unveraendert.`); return; }
+    const clippedOther = mine.some(j => j.clipped);
     const agg = new Map();
     for (const job of done) {
       for (const r of job.rows) {
@@ -177,15 +220,44 @@ async function main() {
       }
       job.rows = null; // Speicher freigeben
     }
-    await fetch(`${U}/rest/v1/vra_ads?client_id=eq.${cl.id}&period_start=eq.${m.start}`, { method: 'DELETE', headers: sbHead });
+    // Ersetzen in der Reihenfolge "erst schreiben, dann aufraeumen" (CLAUDE.md-Regel 4). Frueher wurde der Monat VOR dem
+    // Schreiben geloescht — schlug das Schreiben fehl, war der Monat leer. vra_ads hat einen UNIQUE-Index auf
+    // (client_id, asin, period_start): ein reines Einfuegen neben den alten Zeilen waere mit HTTP 409 gescheitert, ein
+    // Upsert auf diesen Schluessel aktualisiert die vorhandenen Zeilen und legt neue an — Doppelzeilen sind unmoeglich.
+    //  1. alte Zeilen (id, asin) vorab lesen,  2. Upsert aller neuen Zeilen,  3. NUR alte Zeilen loeschen, deren ASIN
+    //  im neuen Bericht nicht mehr vorkommt. Bricht das Schreiben ab, wird nichts geloescht; Zeilen, die noch das alte
+    //  (Teil-)period_end tragen, lassen den Monat beim naechsten Lauf wieder als unvollstaendig erkennen (monthState).
     const vals = [...agg.values()];
+    let oldRows;
+    try { oldRows = await adsOldRows(cl.id, m.start); }
+    catch (e) { console.log(`${cl.name} ${m.start}: alte Zeilen nicht lesbar (${e.message}) — Monat uebersprungen, nichts veraendert.`); return; }
+    if (!vals.length) { console.log(`${cl.name} ${m.start}: Berichte ohne Daten — vorhandene Zeilen bleiben stehen.`); return; }
+    if (clippedOther && oldRows.length) { console.log(`${cl.name} ${m.start}: SB/SD-Daten liegen teilweise ausserhalb der Ads-Datenaufbewahrung — vorhandener Monat (${oldRows.length} Zeilen) bleibt unveraendert.`); return; }
     let ins = 0;
-    for (let i = 0; i < vals.length; i += 500) {
-      const chunk = vals.slice(i, i + 500);
-      const w = await fetch(`${U}/rest/v1/vra_ads`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify(chunk) });
-      if (w.ok) ins += chunk.length; else { console.log('  INSERT', w.status, (await w.text()).slice(0, 150)); break; }
+    for (let i = 0; i < vals.length; i += 200) {
+      const chunk = vals.slice(i, i + 200);
+      let ok = false, why = '';
+      for (let a = 0; a < 2 && !ok; a++) { // 1 Wiederholung (einmalige Timeouts); auch ein Netzwerkfehler (fetch wirft) zaehlt als Fehlschlag
+        try {
+          const w = await fetch(`${U}/rest/v1/vra_ads?on_conflict=client_id,asin,period_start`, { method: 'POST', headers: { ...sbHead, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(chunk) });
+          if (w.ok) ok = true; else why = w.status + ' ' + (await w.text()).slice(0, 150);
+        } catch (e) { why = e.message; }
+        if (!ok && a === 0) await sleep(5000);
+      }
+      if (!ok) {
+        console.log('  UPSERT', why);
+        console.log(`${cl.name} ${m.start}: Schreiben abgebrochen nach ${ins}/${vals.length} Zeilen — nichts geloescht, alte Zeilen bleiben, naechster Lauf versucht es erneut.`);
+        return;
+      }
+      ins += chunk.length;
     }
-    console.log(`${cl.name} ${m.start}: ${ins} Zeilen (${done.map(j => j.rt.key).join('+')})`);
+    // Eine gespeicherte SB-Kontosumme bleibt stehen, wenn SB diesmal nicht geliefert wurde (nicht verfuegbar/ausserhalb Aufbewahrung) —
+    // sonst wuerde sie als "veraltet" geloescht.
+    const sbJob = mine.find(j => j.rt.key === 'SB'); const keepSb = !sbJob || sbJob.state !== 'fertig';
+    const stale = oldRows.filter(r => !agg.has(r.asin) && !(keepSb && r.asin === '_SB_TOTAL_')).map(r => r.id);
+    try { await deleteAdsIds(stale); }
+    catch (e) { console.log(`  ${cl.name} ${m.start}: veraltete Zeilen konnten nicht geloescht werden (${e.message}) — neue Daten sind geschrieben, Aufraeumen beim naechsten Lauf.`); }
+    console.log(`${cl.name} ${m.start}: ${ins} Zeilen (${done.map(j => j.rt.key).join('+')})${stale.length ? `, ${stale.length} veraltete entfernt` : ''}`);
   }
 
   // Phase 2: Alle angeforderten Reports gesammelt abholen (Laufzeit = langsamster Report).
@@ -204,7 +276,7 @@ async function main() {
     }
     if (jobs.some(j => j.state === 'wartet')) await sleep(15000);
   }
-  // Zeitüberschreitung: übrig gebliebene Reports abschreiben, Monate mit Teildaten trotzdem schreiben
+  // Zeitüberschreitung: übrig gebliebene Reports abschreiben ('fehler') — betroffene Monate werden NICHT mit Teildaten gespeichert (siehe writeMonthIfReady), der nächste Lauf versucht sie erneut
   for (const job of jobs.filter(j => j.state === 'wartet')) { job.state = 'fehler'; console.log(`${job.cl.name} ${job.m.start} ${job.rt.key}: Timeout`); }
   for (const job of jobs) await writeMonthIfReady(job.cl, job.m);
 
