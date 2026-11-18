@@ -4,7 +4,7 @@ name: Pipeline-Wächter
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: '0 5,11,17,23 * * *'   # 4× täglich, Laufzeit < 1 Min
+    - cron: '30 5,17,23 * * *'   # 3× täglich (05:30, 17:30, 23:30 UTC), Laufzeit < 1 Min — kein Lauf mehr um 11:00 UTC (Arbeitszeit des Teams): seine Frische-Abfragen lesen Millionen Zeilen
 permissions:
   actions: read     # Läufe der anderen Workflows abfragen
   contents: read    # Checkout — ein permissions-Block setzt alles Ungenannte auf none!

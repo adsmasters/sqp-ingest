@@ -1,7 +1,7 @@
 name: Vendor Sales Import
 on:
   schedule:
-    - cron: '30 4 * * *'   # täglich 04:30 UTC
+    - cron: '0 18 * * *'   # täglich 18:00 UTC (19:00 CET, 23:30 IST) — Nachtfenster, vor dem Ads-Lauf (19:30); seit 18.11.2026 nicht mehr 04:30
   workflow_dispatch:
     inputs:
       client:

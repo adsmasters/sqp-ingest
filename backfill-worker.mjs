@@ -4,6 +4,7 @@
 // darum laufen bis zu 4 Kunden gleichzeitig — statt dass ein Riesen-Katalog alle anderen blockiert.
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import { daemonAdsAllowed } from './daemon-policy.mjs';
 const U = process.env.SUPABASE_URL, KEY = process.env.SUPABASE_SERVICE_KEY;
 if (!U || !KEY) { console.error('FEHLER: SUPABASE_URL/SERVICE_KEY fehlen.'); process.exit(1); }
 const H = { apikey: KEY, Authorization: 'Bearer ' + KEY, 'Content-Type': 'application/json' };
@@ -83,7 +84,8 @@ const rangeFor = j => /voll|full/i.test(j.note || '')
 
 // SQP-Fenster: alles bis auf eine Reserve fuer den Ads-Block am Ende —
 // wird der Ads-Block ohnehin uebersprungen (6h-Gate), gehoert die Zeit dem SQP
-const adsDue = sideDue('/tmp/sqpr-ads-last');
+// Ads-Block nur, wenn der Daemon ihn ueberhaupt starten darf (daemon-policy.mjs, Standard: NEIN) — sonst gehoert die Zeit ganz dem SQP.
+const adsDue = daemonAdsAllowed() && sideDue('/tmp/sqpr-ads-last');
 const sqpDeadlineMs = Math.max(20, leftMin() - (adsDue ? 25 : 2)) * 60000;
 console.log(`SQP-Fenster: ${Math.round(sqpDeadlineMs / 60000)} Min, bis zu ${MAX_PAR} Kunden parallel.`);
 
@@ -179,7 +181,9 @@ while (windowLeft() > MIN_START_MS && queues.some(q => q.length)) {
 }
 
 // PPC-Daten EINMAL am Ende (Ads-API, EINE Agentur-Quota — deshalb nicht parallel und nicht je Job)
-if (leftMin() > 10 && sideDue('/tmp/sqpr-ads-last')) {
+if (!daemonAdsAllowed()) {
+  console.log('Ads-Block im Backfill-Worker aus (DAEMON_ADS!=1; gilt fuer Server-Daemon UND backfill.yml) — der naechtliche GitHub-Lauf ads.yml (19:30 UTC) ist allein zustaendig.');
+} else if (leftMin() > 10 && sideDue('/tmp/sqpr-ads-last')) {
   console.log('\n--- PPC-Daten (Ads), einmal fuer alle Kunden ---');
   // Math.round: spawnSync verlangt Integer-Timeout — Float crashte den Ads-Block (01.08.)
   spawnSync('node', ['ads-refresh.mjs'], { stdio: 'inherit', env: process.env, timeout: Math.round(Math.max(60000, leftMin() * 60000)), killSignal: 'SIGTERM' });

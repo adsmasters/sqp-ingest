@@ -16,7 +16,8 @@ on:
         required: false
         default: ''
   schedule:
-    - cron: '30 5 * * *'   # täglich 05:30 UTC — unabhängig vom SQP-Zeitbudget
+    - cron: '30 19 * * *'  # täglich 19:30 UTC (20:30 CET, 01:00 IST) — Nachtfenster, NACH dem Vendor-Import (18:00); seit 18.11.2026 nicht mehr 05:30, weil der Lauf
+                           # (2-4 h, Millionen Zeilen) in die Arbeitszeit des Teams reichte und die kleine Datenbank ueberlastet hat; fertig spaetestens ~23:30 UTC
                            # (im Backfill-Worker verhungerte der Ads-Block regelmäßig)
 concurrency:
   group: sqp-ads-refresh   # nicht parallel zu sich selbst (verhindert nur zwei GitHub-
@@ -57,7 +58,7 @@ jobs:
         # 57014 oder Datenverlust bestaetigt. ads-refresh.mjs (oben) lief die ganze Zeit
         # unveraendert taeglich weiter.
         if: always()
-        run: node ads-periodic.mjs 2 3
+        run: node ads-periodic.mjs 4 3   # 4 Monate + 3 Wochen (wie bisher der Server-Daemon): nur FEHLENDE Zeitraeume werden nachgeladen — neue Kunden bekommen so ihre volle Historie, bestehende kosten nichts extra
         env:
           ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
           ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}

@@ -168,7 +168,7 @@ const d = new Date();
 if (issues.length) {
   console.log('PROBLEME:\n- ' + issues.join('\n- '));
   // Anti-Spam: dieselbe Problemlage wird höchstens 1x pro 24h gemeldet — der Wächter
-  // läuft 4x täglich und wiederholte sonst jede ungelöste Meldung (Feedback 11.08.).
+  // läuft 3x täglich (05:30/17:30/23:30 UTC; frueher 4x) und wiederholte sonst jede ungelöste Meldung (Feedback 11.08.).
   // NEUE oder veränderte Probleme melden sofort.
   const fp = issues.map(x => x.replace(/\d+/g, '#')).sort().join('|'); // Zahlen raus: 'vor 170 Min' und 'vor 519 Min' sind DIESELBE Problemlage
   let suppress = false;
