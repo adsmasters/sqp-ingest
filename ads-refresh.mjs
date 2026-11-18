@@ -69,6 +69,8 @@ async function downloadReport(url) {
 
 // Lauf-Probleme (Schreib- oder Aufraeumfehler): am Ende exit 1, damit der Workflow-Alert (ads.yml) feuert statt nur ein Log-Eintrag.
 let problems = 0;
+// Aufraeumen alter Zeilen nur auf ausdruecklichen Wunsch (siehe writeClient).
+const CLEANUP = process.env.ADS_REFRESH_CLEANUP === '1';
 
 // Ein Upsert-Chunk mit 1 Wiederholung nach 5 s (auch ein Netzwerkfehler = fetch wirft zaehlt als Fehlschlag). '' = ok, sonst der Grund.
 async function postChunk(chunk) {
@@ -161,7 +163,12 @@ async function writeClient(cl, advRows, stRows) {
   const ins = await writeRows(rows);
   const secs = Math.round((Date.now() - t0) / 1000);
   console.log(`${cl.name}: ${advRows.length} adv / ${stRows.length} terms / ${agToAsins.size} adGroups -> ${ins} (ASIN×Begriff) geschrieben (${secs} s).`);
-  if (ins === rows.length) {
+  if (ins === rows.length && !CLEANUP) {
+    // Aufraeumen ist AUS (Standard, seit 18.11.2026): das Loeschen alter Zeilen hat die gemeinsame Datenbank ueberlastet (jedes
+    // DELETE je ASIN musste alle Zeilen dieses ASINs von der Platte lesen — bei 24,7 Mio. Zeilen, ein Konto allein ~18 Mio., ~10 s
+    // je Anfrage, tausende je Lauf) und alle Tools verlangsamt. Alte, nicht mehr gelieferte Zeilen bleiben vorerst stehen.
+    // Wieder einschalten nur mit ADS_REFRESH_CLEANUP=1, sobald es eine guenstigere Methode gibt.
+  } else if (ins === rows.length) {
     // Alles geschrieben -> jetzt NUR die alten Zeilen dieses Kunden (aelter als dieser Lauf) entfernen.
     const asins = [...new Set(rows.map(r => r.asin))];
     const c = await cleanupOld(cl.ads_profile_id, asins, runTs);

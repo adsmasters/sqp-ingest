@@ -58,11 +58,26 @@ describe('ads-refresh.mjs replaces ads_asin_terms safely', () => {
   const NEW_KEYS = ['B0NEW00001', 'B0NEW00002'].flatMap((a) => ['term 1', 'term 2', 'term 3'].map((t) => a + '|' + t)).sort();
   const writes = (reqs) => reqs.filter((q) => q.method === 'POST' && q.url.includes('/rest/v1/ads_asin_terms'));
 
-  test('success: the client ends with exactly the new rows (old stale rows gone), other clients untouched, insert came before delete', () => {
+  // The old-row clean-up is OFF by default since 18.11.2026: on the real database (24.7M rows, one account ~18M) each per-ASIN delete
+  // had to read every row of that ASIN from disk (~10 s each, thousands per run) and slowed every tool that uses the shared database.
+  // It stays available as an opt-in (ADS_REFRESH_CLEANUP=1) until a cheaper way exists.
+  const CLEAN = { ADS_REFRESH_CLEANUP: '1' };
+
+  test('DEFAULT (clean-up off): all new rows are written and refreshed, NOTHING is ever deleted, other clients untouched', () => {
     const o = run('ads-refresh.mjs', base);
     assert.equal(o.status, 0, o.stderr + o.stdout.slice(-800));
-    assert.deepEqual(keys(o.db, '555'), NEW_KEYS);
+    for (const k of NEW_KEYS) assert.ok(keys(o.db, '555').includes(k), 'missing new row ' + k);
+    assert.ok(keys(o.db, '555').includes('B0OLD00001|old term'), 'old rows are left alone when the clean-up is off');
     assert.notEqual(o.db.ads_asin_terms.find((r) => r.asin === 'B0NEW00001' && r.search_term === 'term 1').clicks, 999, 'a row that existed before must be refreshed with the new numbers, not left at its old value');
+    assert.equal(deletes(o.reqs, 'ads_asin_terms').length, 0, 'no DELETE request at all by default');
+    assert.deepEqual(keys(o.db, '999'), ['B0OTHER001|keep me']);
+    assertSafeRequests(o.reqs);
+  });
+
+  test('OPT-IN clean-up: the client ends with exactly the new rows (old stale rows gone), other clients untouched, insert came before delete', () => {
+    const o = run('ads-refresh.mjs', { ...base, ...CLEAN });
+    assert.equal(o.status, 0, o.stderr + o.stdout.slice(-800));
+    assert.deepEqual(keys(o.db, '555'), NEW_KEYS);
     assert.deepEqual(keys(o.db, '999'), ['B0OTHER001|keep me']);
     assertInsertBeforeDelete(o.reqs, 'ads_asin_terms');
     assertSafeRequests(o.reqs);
@@ -74,22 +89,20 @@ describe('ads-refresh.mjs replaces ads_asin_terms safely', () => {
     const w = writes(o.reqs);
     assert.ok(w.length >= 6, 'expected several chunks for 3000 rows, got ' + w.length);
     assert.ok(Math.max(...w.map((q) => q.rows)) <= 500, 'chunk too big: ' + Math.max(...w.map((q) => q.rows)));
-    assert.equal(keys(o.db, '555').length, 3000);
+    assert.equal(keys(o.db, '555').filter((k) => k.startsWith('B0NEW')).length, 3000);
   });
 
-  test('big batches time out in the database (8 s, 57014): the job falls back to SMALL pieces and still writes everything, then cleans up', () => {
+  test('big batches time out in the database (8 s, 57014): the job falls back to SMALL pieces and still writes everything', () => {
     const o = run('ads-refresh.mjs', { ...base, FAKE_TERMS: '1500', FAKE_MAX_ROWS: '250' });
     assert.equal(o.status, 0, o.stderr + o.stdout.slice(-500));
-    assert.equal(keys(o.db, '555').length, 3000);
-    assert.ok(!keys(o.db, '555').includes('B0OLD00001|old term'), 'stale row must be gone after a complete run');
+    assert.equal(keys(o.db, '555').filter((k) => k.startsWith('B0NEW')).length, 3000);
     assert.ok(Math.max(...writes(o.reqs).filter((q) => q.rows <= 250).map((q) => q.rows)) <= 100, 'fallback pieces must be small');
   });
 
-  test('a ONE-OFF write failure (timeout on one chunk) is retried: everything is written and the stale rows are cleaned up', () => {
+  test('a ONE-OFF write failure (timeout on one chunk) is retried: everything is written, the run is NOT reported as failed', () => {
     const o = run('ads-refresh.mjs', { ...base, FAKE_TERMS: '1500', FAKE_INSERT_FAIL_NTH: '1' });
     assert.equal(o.status, 0, o.stderr);
-    assert.equal(keys(o.db, '555').length, 3000);
-    assert.ok(!keys(o.db, '555').includes('B0OLD00001|old term'), 'stale row must be gone after a complete run');
+    assert.equal(keys(o.db, '555').filter((k) => k.startsWith('B0NEW')).length, 3000);
   });
 
   test('a PERSISTENT write failure in the first chunk: ALL old rows are still there, nothing is deleted, and the run is reported as FAILED (exit code 1, so the Slack alert fires)', () => {
@@ -121,16 +134,16 @@ describe('ads-refresh.mjs replaces ads_asin_terms safely', () => {
     assert.equal(deletes(o.reqs, 'ads_asin_terms').length, 0);
   });
 
-  test('only the final clean-up fails completely: new rows are all in place, the job finishes, and the failure is VISIBLE (exit code 1) instead of silent', () => {
-    const o = run('ads-refresh.mjs', { ...base, FAKE_DELETE_FAIL: '1' });
+  test('OPT-IN clean-up fails completely: new rows are all in place, the job finishes, and the failure is VISIBLE (exit code 1) instead of silent', () => {
+    const o = run('ads-refresh.mjs', { ...base, ...CLEAN, FAKE_DELETE_FAIL: '1' });
     assert.equal(o.status, 1, o.stderr);
     for (const k of NEW_KEYS) assert.ok(keys(o.db, '555').includes(k), 'missing new row ' + k);
     assert.match(o.stdout, /ADS-REFRESH FERTIG/);
   });
 
-  test('a whole-client DELETE is too big for the 8 s limit (huge accounts have millions of rows): the clean-up still removes stale rows ASIN by ASIN', () => {
+  test('OPT-IN clean-up: a whole-client DELETE is too big for the 8 s limit (huge accounts have millions of rows): stale rows are still removed ASIN by ASIN', () => {
     const seed = [...SEED, { profile_id: '555', asin: 'B0NEW00001', search_term: 'gone term', clicks: 3, cost: 1, purchases7d: 0, sales7d: 0, ingested_at: OLD }]; // same ASIN as the report, term no longer there
-    const o = run('ads-refresh.mjs', { ...base, FAKE_DB: JSON.stringify({ ads_asin_terms: seed }), FAKE_DELETE_FAIL_NOASIN: '1' });
+    const o = run('ads-refresh.mjs', { ...base, ...CLEAN, FAKE_DB: JSON.stringify({ ads_asin_terms: seed }), FAKE_DELETE_FAIL_NOASIN: '1' });
     assert.equal(o.status, 0, o.stderr + o.stdout.slice(-500));
     assert.ok(!keys(o.db, '555').includes('B0NEW00001|gone term'), 'stale term of a known ASIN must be removed by the per-ASIN clean-up');
     for (const k of NEW_KEYS) assert.ok(keys(o.db, '555').includes(k), 'missing new row ' + k);
