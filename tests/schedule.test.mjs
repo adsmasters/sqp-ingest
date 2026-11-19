@@ -31,7 +31,7 @@ const axis = (hour, min) => ((hour * 60 + min) - 18 * 60 + 1440) % 1440; // minu
 const DAILY = [
   { name: 'vendor', start: () => { const c = cron('vendor.yml'); return axis(c.hours[0], c.min); }, minutes: 90 },
   { name: 'ads', start: () => { const c = cron('ads.yml'); return axis(c.hours[0], c.min); }, minutes: 240 },
-  { name: 'audit-terms (server timer 00:30 UTC)', start: () => axis(0, 30), minutes: 55 },
+  { name: 'audit-terms (server timer 00:30 UTC)', start: () => axis(0, 30), minutes: 75 }, // first nights: 52 min, then 73 min
   { name: 'daily-data', start: () => { const c = cron('daily-data.yml'); return axis(c.hours[0], c.min); }, minutes: 180 },
 ];
 
