@@ -44,11 +44,23 @@ describe('vendor-ads.mjs: the current (running) month', () => {
     assert.match(o.stdout, /fehlgeschlagen/, 'the failure must still be logged');
   });
 
-  test('SD report FAILS but SP finished: the month is stored from SP + SB', opt, () => {
+  test('SD report FAILS and the month already has stored rows: the stored rows are KEPT (SD spend is merged into the per-ASIN rows, so a day without SD would overwrite good numbers and delete SD-only ASINs)', opt, () => {
     const o = run({ ...base, FAKE_FAIL_TYPES: 'sdAdvertisedProduct' });
     assert.equal(o.status, 0, o.stderr + o.stdout.slice(-600));
+    assert.deepEqual(keys(o.db, cur), ['B0OLDSP001', '_SB_TOTAL_']);
+    assert.equal(rowsOf(o.db, cur).find((r) => r.asin === 'B0OLDSP001').period_end, cur, 'old rows untouched');
+  });
+
+  test('SD report FAILS and the month has NO stored rows yet: it is stored from SP + SB (nothing to protect; heals the next day)', opt, () => {
+    const o = run({ ...base, FAKE_DB: JSON.stringify({ vra_ads: [] }), FAKE_FAIL_TYPES: 'sdAdvertisedProduct' });
+    assert.equal(o.status, 0, o.stderr + o.stdout.slice(-600));
     assert.deepEqual(keys(o.db, cur), ['B0NEW00001', 'B0NEW00002', '_SB_TOTAL_']);
-    assert.notEqual(rowsOf(o.db, cur).find((r) => r.asin === '_SB_TOTAL_').cost, 77, 'SB finished, so its total is refreshed');
+  });
+
+  test('SB report FAILS and there is no stored SB total yet: the month is stored from SP (+SD) without a SB total', opt, () => {
+    const o = run({ ...base, FAKE_DB: JSON.stringify({ vra_ads: [row('B0OLDSP001')] }), FAKE_FAIL_TYPES: 'sbCampaigns' });
+    assert.equal(o.status, 0, o.stderr + o.stdout.slice(-600));
+    assert.deepEqual(keys(o.db, cur), ['B0NEW00001', 'B0NEW00002']);
   });
 
   test('SP report FAILS: nothing is stored, the old rows stay (SP is the only source of per-ASIN cost)', opt, () => {

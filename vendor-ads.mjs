@@ -202,9 +202,10 @@ async function main() {
     const spJob = mine.find(j => j.rt.key === 'SP');
     const failedKeys = mine.filter(j => j.state === 'fehler').map(j => j.rt.key);
     if (!spJob || spJob.state !== 'fertig') { console.log(`${cl.name} ${m.start}: SP-Bericht fehlt — Monat nicht gespeichert, vorhandene Zeilen bleiben unveraendert (naechster Lauf versucht es erneut).`); return; }
-    // Ausnahme (19.11.2026): der LAUFENDE Monat wird ohnehin JEDEN Tag neu geholt — faellt nur SB oder SD aus (z. B. Amazon drosselt die SB-Berichtsanfrage:
-    // "SB create: zu viele Versuche", in der ersten Nacht bei 3 von 8 Kunden), heilt das am naechsten Tag von selbst. Dann wird mit SP (+was fertig ist)
-    // gespeichert; eine gespeicherte SB-Kontosumme bleibt dank keepSb unten stehen. Abgeschlossene Vormonate bleiben streng (werden nie wieder geholt).
+    // Ausnahme (19.11.2026): der LAUFENDE Monat wird ohnehin JEDEN Tag neu geholt — faellt SB aus (z. B. Amazon drosselt die SB-Berichtsanfrage:
+    // "SB create: zu viele Versuche", in der ersten Nacht bei 3 von 8 Kunden), heilt das am naechsten Tag von selbst. Dann wird mit SP (+SD) gespeichert;
+    // eine gespeicherte SB-Kontosumme bleibt dank keepSb unten stehen. Faellt SD aus, wird ein VORHANDENER laufender Monat nicht ueberschrieben (siehe unten).
+    // Abgeschlossene Vormonate bleiben streng (werden nie wieder geholt).
     const partialMonth = m.end < iso(new Date(Date.UTC(+m.start.slice(0, 4), +m.start.slice(5, 7), 0)));
     if (failedKeys.length && !partialMonth) { console.log(`${cl.name} ${m.start}: Bericht(e) ${failedKeys.join('+')} fehlgeschlagen — Monat nicht gespeichert, vorhandene Zeilen bleiben unveraendert (naechster Lauf versucht es erneut).`); return; }
     if (failedKeys.length) console.log(`${cl.name} ${m.start}: Bericht(e) ${failedKeys.join('+')} fehlgeschlagen — laufender Monat wird trotzdem aus SP gespeichert (wird taeglich neu geholt).`);
@@ -237,6 +238,11 @@ async function main() {
     try { oldRows = await adsOldRows(cl.id, m.start); }
     catch (e) { console.log(`${cl.name} ${m.start}: alte Zeilen nicht lesbar (${e.message}) — Monat uebersprungen, nichts veraendert.`); return; }
     if (!vals.length) { console.log(`${cl.name} ${m.start}: Berichte ohne Daten — vorhandene Zeilen bleiben stehen.`); return; }
+    // Laufender Monat + SD ausgefallen: SD-Kosten stecken in den Zeilen je ASIN (mit SP zusammengefuehrt). Ein Tag ohne SD wuerde gute Zeilen mit
+    // SP-only-Werten ueberschreiben und reine SD-ASINs als "veraltet" loeschen (Kosten/TACoS kurzzeitig zu niedrig). Deshalb: vorhandener Monat
+    // bleibt unveraendert (naechster Lauf versucht es erneut); ohne vorhandene Zeilen gibt es nichts zu schuetzen. SB-Ausfall ist unkritisch
+    // (eigene Zeile _SB_TOTAL_, bleibt dank keepSb stehen).
+    if (partialMonth && failedKeys.includes('SD') && oldRows.length) { console.log(`${cl.name} ${m.start}: SD-Bericht fehlgeschlagen — vorhandener laufender Monat (${oldRows.length} Zeilen) bleibt unveraendert, naechster Lauf versucht es erneut.`); return; }
     if (clippedOther && oldRows.length) { console.log(`${cl.name} ${m.start}: SB/SD-Daten liegen teilweise ausserhalb der Ads-Datenaufbewahrung — vorhandener Monat (${oldRows.length} Zeilen) bleibt unveraendert.`); return; }
     let ins = 0;
     for (let i = 0; i < vals.length; i += 200) {
