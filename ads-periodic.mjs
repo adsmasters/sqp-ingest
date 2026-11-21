@@ -1,6 +1,7 @@
 // Echte Ad-Historie je Monat & ASIN×Suchbegriff -> ads_asin_terms_periodic.
 // Multi-Client: alle sqp_clients mit ads_profile_id. ENV: ADS_CLIENT_ID/SECRET/REFRESH_TOKEN, SUPABASE_*.
 import zlib from 'node:zlib';
+import { notify } from './notify.mjs';
 const CID = process.env.ADS_CLIENT_ID, SEC = process.env.ADS_CLIENT_SECRET, RT = process.env.ADS_REFRESH_TOKEN;
 const U = process.env.SUPABASE_URL, KEY = process.env.SUPABASE_SERVICE_KEY, ADS = 'https://advertising-api-eu.amazon.com';
 if (!CID || !SEC || !RT) { console.log('Ads-Secrets fehlen — übersprungen.'); process.exit(0); }
@@ -207,10 +208,9 @@ async function alertFailOpenIfAny() {
   if (!failOpenEvents.length) return;
   const text = `⚠️ *ASIN-Deckel Fail-Open* (${failOpenEvents.length}x diesen Lauf) — Deckel/Schutz manuell gepinnter ASINs war fuer diese Kunden AUS:\n• ${failOpenEvents.join('\n• ')}`;
   console.log(text);
-  const webhook = process.env.SLACK_WEBHOOK_URL;
-  if (!webhook) { console.log('(Kein SLACK_WEBHOOK_URL-Secret — nur im Log gemeldet.)'); return; }
-  try { const r = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }); if (!r.ok) console.log('Slack-POST fuer Fail-Open-Meldung fehlgeschlagen: HTTP ' + r.status); }
-  catch (e) { console.log('Slack-POST fuer Fail-Open-Meldung fehlgeschlagen: ' + e.message); }
+  // Gemeinsamer Meldeweg (notify.mjs): mit SLACK_WEBHOOK_URL (GitHub) direkt nach Slack wie bisher; auf dem Server (kein Slack-Secret) als
+  // Zeile 'alert' in server_job_runs vorgemerkt — der GitHub-Waechter leitet sie weiter. Wirft nie.
+  await notify({ text, job: 'ads/periodic' });
 }
 
 // Manuell gepinnte ASINs (15.09., Kundenwunsch: neue Produkteinfuehrungen sollen nicht

@@ -1,0 +1,24 @@
+[Unit]
+Description=ads: Ads-Refresh (PPC-Luecken je ASIN), danach Ads-Historie (wie ads.yml)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+WorkingDirectory=/opt/sqp-ingest
+Environment=NIGHT_GUARD=0
+Environment=NODE_OPTIONS=--max-old-space-size=1300
+Environment=ADS_REFRESH_BUDGET_MIN=110
+Environment=ADS_PERIODIC_BUDGET_MIN=150
+EnvironmentFile=/opt/sqp-ingest/.env
+# Gesamtlimit des Workflows war 355 Min: 150 + 180 = 330. "-": Schritt 2 laeuft auch, wenn Schritt 1 scheitert (if: always()).
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh ads/refresh 150 ads-refresh.mjs
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh ads/periodic 180 ads-periodic.mjs 4 3
+# Speicher: der groesste Konto-Lauf haelt Millionen Zeilen im RAM (BIOZOYG 4,77 Mio.) — Obergrenze, damit der Worker nicht mitstirbt.
+# Erster Lauf = Messlauf; der Spitzenwert steht danach im Journal ("memory peak").
+MemoryMax=1500M
+OOMPolicy=continue
+MemorySwapMax=0
+Nice=10
+CPUWeight=20

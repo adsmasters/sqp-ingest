@@ -1,0 +1,19 @@
+[Unit]
+Description=audit-terms: search terms with IDs into the saved audits (mit Meldung nach server_job_runs)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+WorkingDirectory=/opt/sqp-ingest
+EnvironmentFile=/opt/sqp-ingest/.env
+Environment=TERMS_CONCURRENCY=8
+Environment=TERMS_BUDGET_MIN=90
+# Budget 90 Min + 30 Min je Konto + Nachfrist < 180 Min. Frueher direkt: flock ... timeout 3h node audit-terms-refresh.mjs 30
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh audit-terms 180 audit-terms-refresh.mjs 30
+MemoryMax=1200M
+OOMPolicy=continue
+MemorySwapMax=0
+Nice=10
+CPUWeight=20

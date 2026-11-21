@@ -6,6 +6,7 @@
 import { dashboardHealthIssues } from './dashboard-health.mjs';
 import { reportAlertIssues } from './report-alerts.mjs';
 import { vendorAdsStaleClients } from './vendor-ads-health.mjs';
+import { serverJobIssues, unsentAlerts } from './server-job-alerts.mjs';
 const U = process.env.SUPABASE_URL, KEY = process.env.SUPABASE_SERVICE_KEY;
 const SLACK = process.env.SLACK_WEBHOOK_URL, GH = process.env.GITHUB_TOKEN;
 const REPO = process.env.GITHUB_REPOSITORY || 'adsmasters/sqp-ingest';
@@ -80,6 +81,18 @@ try {
     if (age > 4 * 3600e3) issues.push(`Dauer-Worker: seit ${hours(age)}h kein abgeschlossener Zyklus — Worker crasht vermutlich jede Runde (Herzschlag allein täuscht Gesundheit vor)`);
   }
 } catch (e) { /* optional */ }
+
+// 3c) Jobs auf dem Hetzner-Server (kein Slack-Secret dort): jeder Schritt schreibt eine Zeile in server_job_runs (deploy/server-job.sh).
+//     Hier: fehlgeschlagene/ueberfaellige Jobs melden (server-job-alerts.mjs) und die eigenen Meldungen der Skripte (kind 'alert') weiterleiten (unten).
+//     Ein Lesefehler wird gemeldet — er darf nie wie "gesund" aussehen.
+let serverRows = [];
+try {
+  const since = new Date(Date.now() - 12 * 24 * 3600e3).toISOString();
+  const r = await fetch(`${U}/rest/v1/server_job_runs?finished_at=gte.${encodeURIComponent(since)}&select=id,job,kind,result,exit_status,host,finished_at,detail,sent_at&order=finished_at.desc&limit=1000`, { headers: H });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  serverRows = await r.json();
+  issues.push(...serverJobIssues(serverRows, Date.now()));
+} catch (e) { issues.push(`Watchdog: Server-Job-Meldungen nicht lesbar (${e.message})`); }
 
 // 4) Datenfrische JE KUNDE (vorher global: EIN gesunder Kunde maskierte 13 tote; Deep-Dive 12.08.)
 //    a) Sales&Traffic <48h  b) SQP-Zeilen <9 Tage (Woechentlicher Refresh)  c) Ads-Terms <3 Tage
@@ -164,6 +177,16 @@ const sendSlack = async text => {
   const r = await fetch(SLACK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
   if (!r.ok) { console.error('Slack-POST fehlgeschlagen: ' + r.status); process.exit(1); }
 };
+// Eigene Meldungen der Server-Skripte (ads-periodic Fail-Open, refresh Sammelmeldung) wortgleich weiterleiten: jede einzeln, unabhaengig vom Anti-Spam der
+// Problemlage unten; erst NACH erfolgreichem Slack-POST als gesendet markieren (scheitert Slack, bleibt sie vorgemerkt und wird beim naechsten Lauf erneut versucht).
+for (const a of unsentAlerts(serverRows)) {
+  if (!SLACK) { console.log('Kein SLACK_WEBHOOK_URL — Server-Meldung bleibt vorgemerkt:\n' + a.text); break; }
+  await sendSlack(a.text);
+  try {
+    const pr = await fetch(`${U}/rest/v1/server_job_runs?id=eq.${a.id}`, { method: 'PATCH', headers: { ...H, 'Content-Type': 'application/json', Prefer: 'return=minimal' }, body: JSON.stringify({ sent_at: new Date().toISOString() }) });
+    if (!pr.ok) console.log(`Markieren als gesendet fehlgeschlagen: HTTP ${pr.status} (die Meldung kann beim naechsten Lauf doppelt kommen)`);
+  } catch (e) { console.log('Markieren als gesendet fehlgeschlagen: ' + e.message); }
+}
 const d = new Date();
 if (issues.length) {
   console.log('PROBLEME:\n- ' + issues.join('\n- '));

@@ -12,6 +12,7 @@
 // Der Job endet auch bei abgebrochenen/nicht gestarteten Kunden mit Exit 0 (gruen) — die Slack-Sammelmeldung benennt sie.
 import zlib from 'node:zlib';
 import { pathToFileURL } from 'node:url';
+import { notify } from './notify.mjs';
 const CID=process.env.SPAPI_CLIENT_ID, SEC=process.env.SPAPI_CLIENT_SECRET;
 const U=process.env.SUPABASE_URL, KEY=process.env.SUPABASE_SERVICE_KEY;
 const SPAPI='https://sellingpartnerapi-eu.amazon.com';
@@ -306,9 +307,8 @@ async function main(){
     const text=buildSlackText({problems,notStarted,outage});
     if(text){
       console.log(text);
-      const hook=process.env.SLACK_WEBHOOK_URL;
-      if(!hook) console.log('(Kein SLACK_WEBHOOK_URL — nur im Log gemeldet.)');
-      else try{ const sr=await fetch(hook,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text}),signal:AbortSignal.timeout(30000)}); if(!sr.ok) console.log('Slack-POST fehlgeschlagen: HTTP '+sr.status); }catch(e){ console.log('Slack-POST fehlgeschlagen: '+e.message); }
+      // Gemeinsamer Meldeweg (notify.mjs): Slack direkt (GitHub) bzw. auf dem Server als 'alert'-Zeile in server_job_runs (der Waechter leitet sie weiter).
+      await notify({text,job:'refresh/refresh'});
     }
   };
   // Harter Stopp: das Budget (BUDGET/HARD) kann bereits laufende Arbeit nicht unterbrechen — im Extremfall (429-Retries + 20-Min-Poll +

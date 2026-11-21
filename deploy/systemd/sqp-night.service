@@ -1,0 +1,34 @@
+[Unit]
+Description=night: alle taeglichen Jobs hintereinander (Vendor, Ads, audit-terms, Tagesdaten) — ein Lauf, keine Leerlaufluecken
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+WorkingDirectory=/opt/sqp-ingest
+EnvironmentFile=/opt/sqp-ingest/.env
+# Nachtfenster-Schutz: ein Schritt, der erst nach 04:00 UTC beginnen wuerde, wird uebersprungen und gemeldet (siehe deploy/server-job.sh).
+Environment=NIGHT_GUARD=1
+Environment=NODE_OPTIONS=--max-old-space-size=1300
+Environment=ADS_REFRESH_BUDGET_MIN=110
+Environment=ADS_PERIODIC_BUDGET_MIN=150
+Environment=AUDIT_CONCURRENCY=4
+Environment=AUDIT_BUDGET_MIN=150
+Environment=TERMS_CONCURRENCY=8
+Environment=TERMS_BUDGET_MIN=90
+# Reihenfolge wie die frueheren Zeitfenster: Vendor -> Ads -> audit-terms (IDs vorladen) -> Tagesdaten (voller Audit ersetzt danach den ganzen Inhalt).
+# "-": scheitert ein Schritt, laufen die naechsten trotzdem (wie "if: always()" / eigene Workflows). Jeder Schritt meldet selbst.
+# Gemessene Dauern auf GitHub (Maximum): Vendor 52, Ads 238, audit-terms 73, Audit 155 + Sales & Traffic 16 Min = ~9 h ab 18:00 UTC, also fertig ~03:00 UTC.
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh vendor/sales 90 vendor-sales.mjs
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh vendor/ads 90 vendor-ads.mjs
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh ads/refresh 150 ads-refresh.mjs
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh ads/periodic 180 ads-periodic.mjs 4 3
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh audit-terms 180 audit-terms-refresh.mjs 30
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh daily-data/audit 270 audit-refresh.mjs 30
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh daily-data/sales-traffic 150 sales-traffic.mjs 30
+MemoryMax=1500M
+OOMPolicy=continue
+MemorySwapMax=0
+Nice=10
+CPUWeight=20

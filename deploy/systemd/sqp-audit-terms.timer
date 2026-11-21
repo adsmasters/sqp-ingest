@@ -1,0 +1,9 @@
+[Unit]
+Description=Taeglich 00:30 UTC (01:30 CET, 06:00 IST): audit-terms
+
+[Timer]
+OnCalendar=*-*-* 00:30:00 UTC
+Persistent=false
+
+[Install]
+WantedBy=timers.target

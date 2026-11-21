@@ -1,0 +1,22 @@
+[Unit]
+Description=daily-data: PPC-Audit vorladen, danach Sales & Traffic (wie daily-data.yml, dort parallel, hier nacheinander)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+WorkingDirectory=/opt/sqp-ingest
+Environment=NIGHT_GUARD=0
+EnvironmentFile=/opt/sqp-ingest/.env
+Environment=AUDIT_CONCURRENCY=4
+Environment=AUDIT_BUDGET_MIN=150
+# Audit: Budget 150 Min + je Konto bis 105 Min Nachfrist = Worst Case ~255 Min (Workflow-Limit war 300). Sales & Traffic: Limit 150 Min.
+# "-": Schritt 2 laeuft auch, wenn Schritt 1 scheitert.
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh daily-data/audit 270 audit-refresh.mjs 30
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh daily-data/sales-traffic 150 sales-traffic.mjs 30
+MemoryMax=1200M
+OOMPolicy=continue
+MemorySwapMax=0
+Nice=10
+CPUWeight=20

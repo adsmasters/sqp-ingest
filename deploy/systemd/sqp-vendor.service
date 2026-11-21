@@ -1,0 +1,19 @@
+[Unit]
+Description=vendor: Vendor-Sales-Import, danach Vendor-Ads-Import (wie vendor.yml)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+WorkingDirectory=/opt/sqp-ingest
+Environment=NIGHT_GUARD=0
+EnvironmentFile=/opt/sqp-ingest/.env
+# "-" vor dem Pfad: schlaegt Schritt 1 fehl, laeuft Schritt 2 trotzdem (wie "if: always()" im Workflow). Jeder Schritt meldet selbst.
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh vendor/sales 90 vendor-sales.mjs
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh vendor/ads 90 vendor-ads.mjs
+MemoryMax=900M
+OOMPolicy=continue
+MemorySwapMax=0
+Nice=10
+CPUWeight=20
