@@ -125,6 +125,8 @@ async function cleanupOld(profile, asins, runTs) {
 }
 
 const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+// 32-Bit-FNV-1a-Hash eines Suchbegriffs: verteilt Begriffe gleichmaessig auf die Durchgaenge (writeClient); gleicher Begriff -> gleicher Durchgang.
+const hashStr = s => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
 // Baut aus den zwei fertigen Rohberichten eines Kunden die (ASIN x Suchbegriff)-Zeilen
 // und schreibt sie. Wird NUR aufgerufen, wenn beide Reports wirklich vollstaendig da
 // sind (siehe writeIfReady) — DELETE passiert nie ohne vollstaendige neue Daten.
@@ -134,49 +136,71 @@ async function writeClient(cl, advRows, stRows) {
   // Gewichtete Aufteilung hält die Summen exakt; die Abdeckung (Zeile existiert) bleibt.
   const agToAsins = new Map(); // adGroupId -> Map(asin -> Gewicht)
   for (const r of advRows) { const k = String(r.adGroupId); if (!agToAsins.has(k)) agToAsins.set(k, new Map()); const m = agToAsins.get(k); m.set(r.advertisedAsin, (m.get(r.advertisedAsin) || 0) + 1000 * (+r.clicks || 0) + (+r.impressions || 0) + 1); }
-  const agg = new Map();
+  // Speicher (21.11.2026): der erste manuelle Lauf auf dem 2-GB-Server brach beim groessten Konto mit "heap out of memory" ab (Exit 134) —
+  // ~4,8 Mio. (ASIN×Begriff)-Zeilen wurden auf einmal im RAM gehalten (Map) und danach noch einmal kopiert. Jetzt in DURCHGAENGEN:
+  // die Suchbegriffe werden nach Hash auf N Durchgaenge verteilt (N aus der Groesse), je Durchgang wird nur ein Teil aggregiert, geschrieben und
+  // wieder freigegeben. Aufteilung nach SUCHBEGRIFF, nicht nach Zeile: derselbe Begriff aus zwei Anzeigengruppen landet im selben Durchgang
+  // und wird weiter zu EINER Zeile je (ASIN, Begriff) summiert — das Ergebnis ist identisch zum Ein-Durchgang-Lauf.
+  const items = []; let est = 0;
   for (const r of stRows) {
     const wmap = agToAsins.get(String(r.adGroupId)); if (!wmap) continue;
     const term = norm(r.searchTerm); if (!term) continue;
-    const wtot = [...wmap.values()].reduce((s, x) => s + x, 0) || 1;
-    for (const [asin, w] of wmap) {
-      const sh = w / wtot;
-      const k = asin + '||' + term; let e = agg.get(k);
-      if (!e) { e = { profile_id: String(cl.ads_profile_id), asin, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); }
-      e.clicks += (+r.clicks || 0) * sh; e.cost += (+r.cost || 0) * sh; e.purchases7d += (+r.purchases7d || 0) * sh; e.sales7d += (+r.sales7d || 0) * sh;
-    }
+    items.push({ r, wmap, term, wtot: [...wmap.values()].reduce((s, x) => s + x, 0) || 1 });
+    est += wmap.size;
   }
+  const PASS_ROWS = +(process.env.ADS_REFRESH_PASS_ROWS || 500000); // ~500k Zeilen je Durchgang (~150 MB)
+  const passes = Math.min(24, Math.max(1, Math.ceil(est / PASS_ROWS)));
+  const part = items.map(it => hashStr(it.term) % passes);
+  if (passes > 1) console.log(`${cl.name}: Aggregation in ${passes} Durchgaengen (Schaetzung ${est} ASIN×Begriff-Paare, je Durchgang ~${Math.ceil(est / passes)}) — spart Arbeitsspeicher.`);
   // Reihenfolge bewusst "erst schreiben, dann aufraeumen" (CLAUDE.md-Regel 4; gleiches Muster wie
   // ads-periodic.mjs, 20.09.): frueher stand hier ein DELETE des ganzen Kunden VOR dem Schreiben —
   // schlug ein Chunk fehl (z.B. 57014-Timeout) oder war der Bericht leer, blieb der Kunde leer.
   // Jede Zeile bekommt jetzt ingested_at = "jetzt" (auch beim Merge-Update einer vorhandenen Zeile),
   // damit das DELETE danach NUR noch die alten, diesmal nicht geschriebenen Zeilen trifft.
   const runTs = new Date().toISOString();
-  const rows = [...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2), ingested_at: runTs }));
-  if (!rows.length) { console.log(`${cl.name}: Bericht ohne verwertbare Suchbegriffe — alte Daten bleiben stehen.`); return; }
   const t0 = Date.now();
   // Upsert statt Plain-INSERT (11.09.): der Hetzner-Daemon (backfill-worker.mjs) stoesst
   // ads-refresh.mjs unabhaengig alle 6h nochmal an — kollidiert der mit diesem Lauf auf
   // demselben Kunden, gab es bisher 409 auf (profile_id, asin, search_term) und der
   // betroffene Kunde bekam 0 Zeilen geschrieben (Diagnose 12.09., Warnick's/Zauber der
   // Gewürze/BIOZOYG). on_conflict macht die Kollision zu einem harmlosen Merge.
-  const ins = await writeRows(rows);
+  let total = 0, ins = 0, failed = false; const asinSet = new Set();
+  for (let p = 0; p < passes && !failed; p++) {
+    const agg = new Map();
+    for (let i = 0; i < items.length; i++) {
+      if (part[i] !== p) continue;
+      const { r, wmap, term, wtot } = items[i];
+      for (const [asin, w] of wmap) {
+        const sh = w / wtot;
+        const k = asin + '||' + term; let e = agg.get(k);
+        if (!e) { e = { profile_id: String(cl.ads_profile_id), asin, search_term: term, clicks: 0, cost: 0, purchases7d: 0, sales7d: 0 }; agg.set(k, e); }
+        e.clicks += (+r.clicks || 0) * sh; e.cost += (+r.cost || 0) * sh; e.purchases7d += (+r.purchases7d || 0) * sh; e.sales7d += (+r.sales7d || 0) * sh;
+      }
+    }
+    const rows = [...agg.values()].map(e => ({ ...e, clicks: Math.round(e.clicks), cost: +e.cost.toFixed(2), purchases7d: Math.round(e.purchases7d), sales7d: +e.sales7d.toFixed(2), ingested_at: runTs }));
+    agg.clear(); // Speicher dieses Durchgangs freigeben, bevor der naechste beginnt
+    if (!rows.length) continue;
+    total += rows.length; for (const r of rows) asinSet.add(r.asin);
+    const n = await writeRows(rows);
+    ins += n; if (n !== rows.length) failed = true; // anhaltender Schreibfehler: weitere Durchgaenge nicht mehr versuchen
+  }
+  if (!total) { console.log(`${cl.name}: Bericht ohne verwertbare Suchbegriffe — alte Daten bleiben stehen.`); return; }
   const secs = Math.round((Date.now() - t0) / 1000);
   console.log(`${cl.name}: ${advRows.length} adv / ${stRows.length} terms / ${agToAsins.size} adGroups -> ${ins} (ASIN×Begriff) geschrieben (${secs} s).`);
-  if (ins === rows.length && !CLEANUP) {
+  if (ins === total && !CLEANUP) {
     // Aufraeumen ist AUS (Standard, seit 18.11.2026): das Loeschen alter Zeilen hat die gemeinsame Datenbank ueberlastet (jedes
     // DELETE je ASIN musste alle Zeilen dieses ASINs von der Platte lesen — bei 24,7 Mio. Zeilen, ein Konto allein ~18 Mio., ~10 s
     // je Anfrage, tausende je Lauf) und alle Tools verlangsamt. Alte, nicht mehr gelieferte Zeilen bleiben vorerst stehen.
     // Wieder einschalten nur mit ADS_REFRESH_CLEANUP=1, sobald es eine guenstigere Methode gibt.
-  } else if (ins === rows.length) {
+  } else if (ins === total) {
     // Alles geschrieben -> jetzt NUR die alten Zeilen dieses Kunden (aelter als dieser Lauf) entfernen.
-    const asins = [...new Set(rows.map(r => r.asin))];
+    const asins = [...asinSet];
     const c = await cleanupOld(cl.ads_profile_id, asins, runTs);
     if (c.failed) { problems++; console.log(`  ${cl.name}: Aufraeumen fehlgeschlagen bei ${c.failed}/${asins.length} ASINs — neue Daten sind geschrieben, alte Zeilen bleiben bis zum naechsten Lauf.`); }
     if (c.rest) console.log(`  ${cl.name}: Sammel-Aufraeumen (ASINs, die nicht mehr im Bericht stehen) fehlgeschlagen (${c.rest}) — Zeilen verschwundener ASINs bleiben stehen.`);
   } else {
     problems++;
-    console.log(`  ${cl.name}: nur ${ins}/${rows.length} Zeilen geschrieben — alte Zeilen bleiben stehen, Aufraeumen uebersprungen.`);
+    console.log(`  ${cl.name}: nur ${ins}/${total} Zeilen geschrieben — alte Zeilen bleiben stehen, Aufraeumen uebersprungen.`);
   }
 }
 

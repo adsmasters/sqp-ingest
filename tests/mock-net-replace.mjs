@@ -49,10 +49,19 @@ if (process.env.FAKE_DB_OUT) process.on('exit', () => fs.writeFileSync(process.e
 
 function reportRows(type) {
   if (type === 'spAdvertisedProduct' && process.env.FAKE_SP_ASINS) return Array.from({ length: +process.env.FAKE_SP_ASINS }, (_, i) => ({ campaignId: 'C1', adGroupId: 'AG1', advertisedAsin: 'B0BIG' + String(i).padStart(5, '0'), impressions: 10, clicks: 1, cost: 1, purchases7d: 0, sales7d: 0, unitsSoldClicks7d: 0 }));
+  if (type === 'spAdvertisedProduct' && process.env.FAKE_TERM_GROUPS === '2') return [
+    { campaignId: 'C1', adGroupId: 'AG1', advertisedAsin: 'B0NEW00001', impressions: 100, clicks: 10, cost: 5, purchases7d: 1, sales7d: 20, unitsSoldClicks7d: 1 },
+    { campaignId: 'C1', adGroupId: 'AG1', advertisedAsin: 'B0NEW00002', impressions: 50, clicks: 5, cost: 2.5, purchases7d: 0, sales7d: 0, unitsSoldClicks7d: 0 },
+    { campaignId: 'C2', adGroupId: 'AG2', advertisedAsin: 'B0NEW00002', impressions: 70, clicks: 7, cost: 3, purchases7d: 0, sales7d: 0, unitsSoldClicks7d: 0 },
+    { campaignId: 'C2', adGroupId: 'AG2', advertisedAsin: 'B0NEW00003', impressions: 30, clicks: 3, cost: 1, purchases7d: 0, sales7d: 0, unitsSoldClicks7d: 0 }];
   if (type === 'spAdvertisedProduct') return [
     { campaignId: 'C1', adGroupId: 'AG1', advertisedAsin: 'B0NEW00001', impressions: 100, clicks: 10, cost: 5, purchases7d: 1, sales7d: 20, unitsSoldClicks7d: 1 },
     { campaignId: 'C1', adGroupId: 'AG1', advertisedAsin: 'B0NEW00002', impressions: 50, clicks: 5, cost: 2.5, purchases7d: 0, sales7d: 0, unitsSoldClicks7d: 0 }];
-  if (type === 'spSearchTerm') return Array.from({ length: nTerms }, (_, i) => ({ searchTerm: 'term ' + (i + 1), adGroupId: 'AG1', clicks: 2, cost: 1, purchases7d: 0, sales7d: 0 }));
+  if (type === 'spSearchTerm') {
+    const one = Array.from({ length: nTerms }, (_, i) => ({ searchTerm: 'term ' + (i + 1), adGroupId: 'AG1', clicks: 2, cost: 1, purchases7d: 0, sales7d: 0 }));
+    // FAKE_TERM_GROUPS=2: every term also appears in a SECOND ad group (AG2, other ASINs, other numbers) — the same (asin, term) can come from two ad groups and must be summed
+    return process.env.FAKE_TERM_GROUPS === '2' ? [...one, ...one.map((r, i) => ({ ...r, adGroupId: 'AG2', clicks: 3 + (i % 5), cost: 2.5, sales7d: 4 }))] : one;
+  }
   if (type === 'sbCampaigns') return [{ campaignId: 'SB1', impressions: 50, clicks: 5, cost: 3, purchases: 0, sales: 0 }];
   return []; // sdAdvertisedProduct
 }
