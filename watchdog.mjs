@@ -171,7 +171,7 @@ try {
   else if (cr.ok && !(ar.status === 404 || rr.status === 404)) issues.push(`Watchdog: Monatsbericht-Prüfung nicht lesbar (HTTP ${ar.status}/${rr.status})`);
 } catch (e) { issues.push(`Watchdog: Monatsbericht-Prüfung nicht prüfbar (${e.message})`); }
 
-// Melden: Probleme sofort; sonst montags 05-Uhr-Lauf als Lebenszeichen (Stille ≠ gesund)
+// Melden: Probleme sofort; sonst montags 06-Uhr-Lauf (06:30 UTC) als Lebenszeichen (Stille ≠ gesund)
 const sendSlack = async text => {
   if (!SLACK) { console.log('Kein SLACK_WEBHOOK_URL — Meldung nur im Log:\n' + text); return; }
   const r = await fetch(SLACK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
@@ -191,7 +191,7 @@ const d = new Date();
 if (issues.length) {
   console.log('PROBLEME:\n- ' + issues.join('\n- '));
   // Anti-Spam: dieselbe Problemlage wird höchstens 1x pro 24h gemeldet — der Wächter
-  // läuft 3x täglich (05:30/17:30/23:30 UTC; frueher 4x) und wiederholte sonst jede ungelöste Meldung (Feedback 11.08.).
+  // läuft 3x täglich (06:30/17:30/23:30 UTC; frueher 4x) und wiederholte sonst jede ungelöste Meldung (Feedback 11.08.).
   // NEUE oder veränderte Probleme melden sofort.
   const fp = issues.map(x => x.replace(/\d+/g, '#')).sort().join('|'); // Zahlen raus: 'vor 170 Min' und 'vor 519 Min' sind DIESELBE Problemlage
   let suppress = false;
@@ -209,5 +209,5 @@ if (issues.length) {
   console.log('Alles gesund.');
   // Gelöste Probleme: Fingerprint löschen, damit ein Rückfall wieder sofort meldet
   try { await fetch(`${U}/rest/v1/watchdog_state?id=eq.1`, { method: 'DELETE', headers: H }); } catch (e) {}
-  if (d.getUTCDay() === 1 && d.getUTCHours() === 5) await sendSlack('✅ *SQPR-Pipeline-Wächter*: Wochen-Check — Queue, Nachtläufe und Datenfrische in Ordnung.');
+  if (d.getUTCDay() === 1 && d.getUTCHours() === 6) await sendSlack('✅ *SQPR-Pipeline-Wächter*: Wochen-Check — Queue, Nachtläufe und Datenfrische in Ordnung.');
 }

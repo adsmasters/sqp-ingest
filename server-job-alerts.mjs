@@ -4,10 +4,16 @@
 // Reine Funktionen, kein Netzwerk.
 
 // Jobs, die bereits auf dem Server laufen UND melden. Beim Umzug eines Jobs wird er hier eingetragen
-// (fristH = wie lange ohne erfolgreichen Lauf erlaubt ist, seit = ab wann ein fehlender Lauf zaehlt) und im selben Zug aus
+// (fristH = wie lange ohne erfolgreichen Lauf erlaubt ist, seit = Aktivierung) und im selben Zug aus
 // WF_FRIST in watchdog.mjs entfernt. Leer = nichts wird erwartet (kein Fehlalarm, bevor der Melder installiert ist).
+// `seit` wirkt doppelt (Review 22.11.2026): (1) Zeilen von VOR `seit` (manuelle Tests/Probelaeufe vor dem Umzug) zaehlen gar nicht;
+// (2) hat ein Job nach `seit` noch keine Zeile, wird ab seit + graceH gemeldet (graceH optional, sonst fristH). Richtwert fuer den Umzug:
+// `seit` = Start des ersten Nachtlaufs (18:00 UTC am Umzugstag), graceH 12 fuer alle 8 Nacht-Jobs (der Waechter-Lauf 06:30 UTC faengt eine nie
+// gestartete Nacht noch am selben Morgen; die Kette endet normal ~01:30, schlechte Nacht ~04:00 UTC); fristH je Job: vendor/sales, vendor/ads,
+// daily-data/sales-traffic, daily-data/audit 27; ads/refresh, audit-terms 29; ads/periodic, night/chain 26 (Zeilenalter bei normaler und um
+// 2,5 h verspaeteter Nacht durchgerechnet).
 export const SERVER_JOBS = {
-  // 'vendor/sales': { fristH: 30, seit: '2026-11-21T00:00:00Z' },
+  // 'vendor/sales': { fristH: 27, graceH: 12, seit: '2026-11-22T18:00:00Z' },
 };
 
 const stamp = x => String(x).slice(0, 16) + 'Z';
@@ -16,14 +22,16 @@ const stamp = x => String(x).slice(0, 16) + 'Z';
 export function serverJobIssues(rows, now = Date.now(), config = SERVER_JOBS) {
   const out = [];
   for (const [job, c] of Object.entries(config)) {
+    const seitMs = Date.parse(c.seit);
     const runs = rows
-      .filter(r => r.job === job && (r.kind || 'run') === 'run')
+      .filter(r => r.job === job && (r.kind || 'run') === 'run' && !(Date.parse(r.finished_at) < seitMs)) // Zeilen vor `seit` zaehlen nicht
       .sort((a, b) => Date.parse(b.finished_at) - Date.parse(a.finished_at));
     const latest = runs[0];
     const lastOk = runs.find(r => r.result === 'success');
     const fristMs = c.fristH * 3600e3;
     if (!latest) {
-      if (now > Date.parse(c.seit) + fristMs) out.push(`${job}: seit ${String(c.seit).slice(0, 10)} noch kein Lauf auf dem Server gemeldet`);
+      const graceMs = (c.graceH > 0 ? c.graceH : c.fristH) * 3600e3; // graceH (optional): Wartezeit auf die ERSTE Zeile nach `seit`; ohne Angabe = fristH
+      if (now > Date.parse(c.seit) + graceMs) out.push(`${job}: seit ${String(c.seit).slice(0, 10)} noch kein Lauf auf dem Server gemeldet`);
       continue;
     }
     if (latest.result === 'skipped') { // vom Nachtfenster-Schutz uebersprungen (deploy/server-job.sh)

@@ -22,19 +22,32 @@ export function buildRunRow({ job, exitCode, host, detail, now = new Date() }) {
   return { job, kind: 'run', result: runResult(exitCode), exit_status: String(exitCode), host, detail: d ? d.slice(-1500) : null, finished_at: now.toISOString() };
 }
 
-export async function reportRun({ job, exitCode, detail, env = process.env, fetchImpl = fetch, host = os.hostname(), log = console.log }) {
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+// Ein Schritt endet genau dann, wenn die gemeinsame Datenbank am ehesten ueberlastet ist (Review 21.11.2026):
+// bis zu 3 Versuche (Pause 5 s, dann 20 s), aber NUR bei Netzfehler, 5xx oder 429 — ein 4xx (400/401/403/404) wird nie klappen.
+const RETRYABLE = (status) => status >= 500 || status === 429;
+export async function reportRun({ job, exitCode, detail, env = process.env, fetchImpl = fetch, host = os.hostname(), log = console.log, sleepImpl = sleep }) {
   const U = env.SUPABASE_URL, K = env.SUPABASE_SERVICE_KEY;
   if (!U || !K) { log('report-job-run: SUPABASE_URL/SUPABASE_SERVICE_KEY fehlen — nichts gemeldet.'); return false; }
-  try {
-    const r = await fetchImpl(`${U}/rest/v1/server_job_runs`, {
-      method: 'POST',
-      headers: { apikey: K, Authorization: 'Bearer ' + K, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify(buildRunRow({ job, exitCode, host, detail })),
-      signal: AbortSignal.timeout(30000),
-    });
-    if (!r.ok) { log(`report-job-run: HTTP ${r.status} — Lauf von ${job} nicht gemeldet.`); return false; }
-    return true;
-  } catch (e) { log(`report-job-run: ${e.message} — Lauf von ${job} nicht gemeldet.`); return false; }
+  const body = JSON.stringify(buildRunRow({ job, exitCode, host, detail })); // einmal bauen: alle Versuche tragen dieselbe Zeit
+  const ATTEMPTS = 3, PAUSE = [5000, 20000];
+  for (let a = 1; a <= ATTEMPTS; a++) {
+    let retry = false;
+    try {
+      const r = await fetchImpl(`${U}/rest/v1/server_job_runs`, {
+        method: 'POST',
+        headers: { apikey: K, Authorization: 'Bearer ' + K, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        body,
+        signal: AbortSignal.timeout(30000),
+      });
+      if (r.ok) return true;
+      log(`report-job-run: HTTP ${r.status} (Versuch ${a}/${ATTEMPTS}) — Lauf von ${job} nicht gemeldet.`);
+      retry = RETRYABLE(r.status);
+    } catch (e) { log(`report-job-run: ${e.message} (Versuch ${a}/${ATTEMPTS}) — Lauf von ${job} nicht gemeldet.`); retry = true; }
+    if (!retry || a === ATTEMPTS) return false;
+    await sleepImpl(PAUSE[a - 1]);
+  }
+  return false;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

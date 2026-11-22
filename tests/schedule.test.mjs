@@ -18,22 +18,26 @@ import { daemonAdsAllowed } from '../daemon-policy.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const wf = (name) => fs.readFileSync(path.join(here, '..', '.github', 'workflows', name), 'utf8');
-// first cron of a workflow: { min, hours: [..], dow }
-function cron(name) {
+// first cron of a workflow: { min, hours: [..], dow }, or null when the workflow has no schedule any more (the server night chain owns it)
+function cronOrNull(name) {
   const m = wf(name).match(/^\s*-\s*cron:\s*'([^']+)'/m);
-  assert.ok(m, 'no cron found in ' + name);
+  if (!m) return null;
   const [min, hour, , , dow] = m[1].trim().split(/\s+/);
   return { min: +min, hours: hour.split(',').map(Number), dow };
 }
+function cron(name) { const c = cronOrNull(name); assert.ok(c, 'no cron found in ' + name); return c; }
 const TEAM_START = 7 * 60, TEAM_END = 17 * 60;  // minutes of the UTC day
 const NIGHT_LEN = 11 * 60;                       // the night axis runs 18:00 -> 05:00 UTC = 660 minutes
 const axis = (hour, min) => ((hour * 60 + min) - 18 * 60 + 1440) % 1440; // minutes after 18:00 UTC
-const DAILY = [
-  { name: 'vendor', start: () => { const c = cron('vendor.yml'); return axis(c.hours[0], c.min); }, minutes: 90 },
-  { name: 'ads', start: () => { const c = cron('ads.yml'); return axis(c.hours[0], c.min); }, minutes: 240 },
+// A workflow whose cron was removed at the cutover is owned by the server night chain: it drops out of this model (start = null).
+const fromCron = (file) => () => { const c = cronOrNull(file); return c ? axis(c.hours[0], c.min) : null; };
+const ALL_DAILY = [
+  { name: 'vendor', start: fromCron('vendor.yml'), minutes: 90 },
+  { name: 'ads', start: fromCron('ads.yml'), minutes: 240 },
   { name: 'audit-terms (server timer 00:30 UTC)', start: () => axis(0, 30), minutes: 75 }, // first nights: 52 min, then 73 min
-  { name: 'daily-data', start: () => { const c = cron('daily-data.yml'); return axis(c.hours[0], c.min); }, minutes: 180 },
+  { name: 'daily-data', start: fromCron('daily-data.yml'), minutes: 180 },
 ];
+const DAILY = ALL_DAILY.filter((j) => j.start() !== null);
 
 describe('night-window schedule', () => {
   test('every daily heavy job starts after the team has finished (>= 18:00 UTC) and is done by 05:00 UTC even in the worst case', () => {
@@ -54,6 +58,25 @@ describe('night-window schedule', () => {
     for (const h of c.hours) {
       const t = h * 60 + c.min;
       assert.ok(t < TEAM_START || t >= TEAM_END, `watchdog runs at ${h}:${c.min} UTC, inside working hours`);
+    }
+  });
+
+  // Review 2026-11-21: the night chain ends ~01:30 UTC; a failure must be visible BEFORE the team starts, not at ~17:30 UTC.
+  test('the watchdog runs once between 06:00 and 07:00 UTC (before the team starts), so a failed night is seen in the morning', () => {
+    const c = cron('watchdog.yml');
+    assert.ok(c.hours.some((h) => h * 60 + c.min >= 6 * 60 && h * 60 + c.min < TEAM_START), 'no watchdog run in 06:00-07:00 UTC; hours: ' + c.hours.join(','));
+  });
+
+  test('the Monday "alive" message is sent at an hour the watchdog really runs (otherwise it never appears)', () => {
+    const m = fs.readFileSync(path.join(here, '..', 'watchdog.mjs'), 'utf8').match(/getUTCDay\(\)\s*===\s*1\s*&&\s*d\.getUTCHours\(\)\s*===\s*(\d+)/);
+    assert.ok(m, 'Monday alive check not found in watchdog.mjs');
+    assert.ok(cron('watchdog.yml').hours.includes(+m[1]), `watchdog.mjs sends it at ${m[1]}:xx UTC but the cron runs at ${cron('watchdog.yml').hours.join(',')}`);
+  });
+
+  test('workflows without a schedule (server night chain owns them) can still be started by hand (the platform "Vendor import" button needs vendor.yml)', () => {
+    for (const f of ['vendor.yml', 'ads.yml', 'daily-data.yml']) {
+      if (cronOrNull(f)) continue; // still scheduled on GitHub: nothing to check
+      assert.match(wf(f), /workflow_dispatch/, f + ' lost its schedule AND its manual trigger');
     }
   });
 

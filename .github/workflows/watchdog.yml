@@ -4,7 +4,7 @@ name: Pipeline-Wächter
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: '30 5,17,23 * * *'   # 3× täglich (05:30, 17:30, 23:30 UTC), Laufzeit < 1 Min — kein Lauf mehr um 11:00 UTC (Arbeitszeit des Teams): seine Frische-Abfragen lesen Millionen Zeilen
+    - cron: '30 6,17,23 * * *'   # 3× täglich (06:30, 17:30, 23:30 UTC), Laufzeit < 1 Min — kein Lauf um 11:00 UTC (Arbeitszeit des Teams): seine Frische-Abfragen lesen Millionen Zeilen. 06:30 (statt 05:30, seit 21.11.2026): die Server-Nachtkette endet ~01:30 UTC; ein Fehler soll VOR Arbeitsbeginn (~07:00 UTC) sichtbar sein
 permissions:
   actions: read     # Läufe der anderen Workflows abfragen
   contents: read    # Checkout — ein permissions-Block setzt alles Ungenannte auf none!

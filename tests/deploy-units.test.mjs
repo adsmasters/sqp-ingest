@@ -26,12 +26,18 @@ const VENDOR = [['vendor/sales', 'vendor-sales.mjs'], ['vendor/ads', 'vendor-ads
 const ADS = [['ads/refresh', 'ads-refresh.mjs'], ['ads/periodic', 'ads-periodic.mjs 4 3']];
 const AUDIT = [['audit-terms', 'audit-terms-refresh.mjs 30']];
 const DAILY = [['daily-data/audit', 'audit-refresh.mjs 30'], ['daily-data/sales-traffic', 'sales-traffic.mjs 30']];
+// Night order (review 2026-11-21): sales-traffic runs EARLY because ads-periodic's ASIN cap uses its data; ads-periodic runs LAST of the real jobs
+// (the most likely one to be cut by the night guard if the chain overruns); then a tiny "chain finished" marker step the watchdog can rely on.
+// The marker is night-summary.mjs: it checks what the 7 real steps reported tonight and ends with exit code 1 if any step was not successful,
+// because systemd shows the whole chain as "success" even when a step failed (steps run with ExecStart=-). See tests/night-summary.test.mjs.
+const MARKER = ['night/chain', 'night-summary.mjs'];
+const NIGHT = [VENDOR[0], VENDOR[1], DAILY[1], ADS[0], AUDIT[0], DAILY[0], ADS[1], MARKER];
 const SERVICES = [
   { file: 'sqp-vendor', steps: VENDOR, manual: true },
   { file: 'sqp-ads', steps: ADS, manual: true },
   { file: 'sqp-daily-data', steps: DAILY, manual: true },
   { file: 'sqp-audit-terms', steps: AUDIT, timer: '00:30:00' }, // standalone until the night chain takes over (then its timer is disabled)
-  { file: 'sqp-night', steps: [...VENDOR, ...ADS, ...AUDIT, ...DAILY], timer: '18:00:00', guard: true },
+  { file: 'sqp-night', steps: NIGHT, timer: '18:00:00', guard: true },
 ];
 
 describe('deploy/systemd units', () => {
@@ -47,7 +53,8 @@ describe('deploy/systemd units', () => {
       assert.deepEqual(st.map((x) => [x.job, x.cmd]), s.steps);
       for (const x of st) {
         assert.equal(x.wrapper, '/opt/sqp-ingest/deploy/server-job.sh');
-        assert.ok(x.dash, `${x.job}: ExecStart must start with "-" so the next step still runs`);
+        if (x.job === 'night/chain') assert.ok(!x.dash, 'the final summary step must NOT start with "-": otherwise systemd ignores its failure and the unit shows success although a step failed');
+        else assert.ok(x.dash, `${x.job}: ExecStart must start with "-" so the next step still runs`);
         assert.ok(x.minutes > 0 && x.minutes <= 300, `${x.job}: unreasonable timeout ${x.minutes}`);
       }
     });
@@ -85,8 +92,19 @@ describe('deploy/systemd units', () => {
     }
   });
   test('each step stays below its old workflow limit', () => {
-    const lim = { 'vendor/sales': 180, 'vendor/ads': 180, 'ads/refresh': 355, 'ads/periodic': 355, 'daily-data/audit': 300, 'daily-data/sales-traffic': 330, 'audit-terms': 180 };
+    const lim = { 'vendor/sales': 180, 'vendor/ads': 180, 'ads/refresh': 355, 'ads/periodic': 355, 'daily-data/audit': 300, 'daily-data/sales-traffic': 330, 'audit-terms': 180, 'night/chain': 5 };
     for (const x of steps(unit('sqp-night.service'))) assert.ok(x.minutes <= lim[x.job], `${x.job} ${x.minutes} > ${lim[x.job]}`);
+  });
+  test('night order: sales-traffic before ads-periodic (its ASIN cap uses that data); ads-periodic is the LAST real job; the "chain finished" marker is the very last step', () => {
+    const jobs = steps(unit('sqp-night.service')).map((x) => x.job);
+    assert.ok(jobs.indexOf('daily-data/sales-traffic') < jobs.indexOf('ads/periodic'), 'sales-traffic must run before ads/periodic');
+    assert.equal(jobs[jobs.length - 1], 'night/chain', 'the marker must be last');
+    assert.equal(jobs[jobs.length - 2], 'ads/periodic', 'ads/periodic must be the last real job');
+  });
+  test('the marker step runs night-summary.mjs (a few seconds, reads the night rows) and that file exists', () => {
+    const m = steps(unit('sqp-night.service')).find((x) => x.job === 'night/chain');
+    assert.ok(m && m.cmd === 'night-summary.mjs');
+    assert.ok(fs.existsSync(path.join(here, '..', 'night-summary.mjs')));
   });
   test('the OLD single timers are gone (vendor, ads, daily-data run only inside the night chain)', () => {
     for (const f of ['sqp-vendor.timer', 'sqp-ads.timer', 'sqp-daily-data.timer']) assert.ok(!fs.existsSync(depPath('systemd/' + f)), f + ' must not exist');

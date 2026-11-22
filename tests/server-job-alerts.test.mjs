@@ -79,6 +79,76 @@ describe('serverJobIssues', () => {
   });
 });
 
+// Review finding 2026-11-22: rows written BEFORE a job's activation date (`seit`) are manual tests / retests from the days before the cutover.
+// They must not count at all: an old test success must not trigger "no successful run in 27h" before the first real night, and an old test failure
+// must not raise an alert. With this the cutover commit can be pushed at ANY time of day (no race against the 17:30 UTC watchdog run).
+describe('rows older than the activation date (seit) are ignored', () => {
+  const SEIT = new Date(NOW + 6 * H).toISOString(); // activation tonight, 6 hours from NOW
+  const cfg = { 'vendor/sales': { fristH: 27, seit: SEIT } };
+  test('an old test success (31 h old, before seit) does NOT raise "no successful run" before the first night', () => {
+    assert.deepEqual(serverJobIssues([run('vendor/sales', 'success', 31)], NOW, cfg), []);
+  });
+  test('an old test failure before seit is ignored (no alert for a retest that happened before the cutover)', () => {
+    assert.deepEqual(serverJobIssues([run('vendor/sales', 'failed', 20)], NOW, cfg), []);
+  });
+  test('when the grace period after seit is over and only pre-seit rows exist, the job counts as "never reported"', () => {
+    const late = Date.parse(SEIT) + 28 * H;
+    const out = serverJobIssues([run('vendor/sales', 'success', 31)], late, cfg);
+    assert.equal(out.length, 1);
+    assert.match(out[0], /noch kein Lauf/);
+  });
+  test('a row AFTER seit counts normally (a failure raises, a later success clears it)', () => {
+    const after = Date.parse(SEIT) + 10 * H, finished = (h) => new Date(after - h * H).toISOString();
+    const f = { id: 1, job: 'vendor/sales', kind: 'run', result: 'failed', exit_status: '1', finished_at: finished(2) };
+    const s = { id: 2, job: 'vendor/sales', kind: 'run', result: 'success', exit_status: '0', finished_at: finished(1) };
+    assert.equal(serverJobIssues([f], after, cfg).length, 1);
+    assert.deepEqual(serverJobIssues([f, s], after, cfg), []);
+  });
+  test('a row exactly at seit counts (the boundary belongs to the new period)', () => {
+    const r = { id: 3, job: 'vendor/sales', kind: 'run', result: 'success', exit_status: '0', finished_at: SEIT };
+    assert.deepEqual(serverJobIssues([r], Date.parse(SEIT) + 3 * H, cfg), []);
+  });
+});
+
+// Review finding 2026-11-22: a night chain that never starts (timer forgotten / enabled too late) was noticed only ~29 h after its planned start,
+// because the "never reported" wait was seit + fristH (26-29 h). Optional per-job `graceH` = how long to wait after `seit` for the FIRST row;
+// the night jobs use 12 h so the 06:30 UTC watchdog run of the next morning catches it. Without graceH the old rule (fristH) applies.
+describe('graceH: how long to wait for the first row after seit', () => {
+  const SEIT = Date.parse('2026-11-22T18:00:00Z');
+  const cfg = { 'vendor/sales': { fristH: 27, graceH: 12, seit: '2026-11-22T18:00:00Z' } };
+  test('no row, 11 h after seit: still waiting (the chain may be running), nothing', () => {
+    assert.deepEqual(serverJobIssues([], SEIT + 11 * H, cfg), []);
+  });
+  test('no row, 12.5 h after seit (the 06:30 UTC run): one message naming the job, although fristH is 27 h', () => {
+    const out = serverJobIssues([], SEIT + 12.5 * H, cfg);
+    assert.equal(out.length, 1);
+    assert.match(out[0], /vendor\/sales/);
+    assert.match(out[0], /noch kein Lauf/);
+  });
+  test('without graceH the wait is still fristH (old behaviour)', () => {
+    const c = { 'vendor/sales': { fristH: 27, seit: '2026-11-22T18:00:00Z' } };
+    assert.deepEqual(serverJobIssues([], SEIT + 20 * H, c), []);
+    assert.equal(serverJobIssues([], SEIT + 28 * H, c).length, 1);
+  });
+  test('graceH only matters while there is NO row: a row after seit is judged by fristH as before', () => {
+    const r = { id: 1, job: 'vendor/sales', kind: 'run', result: 'success', exit_status: '0', finished_at: new Date(SEIT + 1 * H).toISOString() };
+    assert.deepEqual(serverJobIssues([r], SEIT + 20 * H, cfg), []); // 19 h old < 27 h
+    assert.equal(serverJobIssues([r], SEIT + 30 * H, cfg).length, 1); // 29 h old > 27 h
+  });
+  test('a healthy first night raises nothing at the three watchdog runs (23:30 UTC, 06:30 UTC) when all rows are there', () => {
+    const night = { 'vendor/sales': { fristH: 27, graceH: 12, seit: '2026-11-22T18:00:00Z' }, 'ads/periodic': { fristH: 26, graceH: 12, seit: '2026-11-22T18:00:00Z' } };
+    const rows = [
+      { id: 1, job: 'vendor/sales', kind: 'run', result: 'success', exit_status: '0', finished_at: '2026-11-22T18:16:00Z' },
+      { id: 2, job: 'ads/periodic', kind: 'run', result: 'success', exit_status: '0', finished_at: '2026-11-23T01:24:00Z' },
+    ];
+    assert.deepEqual(serverJobIssues(rows.slice(0, 1), Date.parse('2026-11-22T23:30:00Z'), night), []); // ads/periodic not yet due at 23:30
+    assert.deepEqual(serverJobIssues(rows, Date.parse('2026-11-23T06:30:00Z'), night), []);
+  });
+  test('the planned night values are accepted: graceH is a positive number when present', () => {
+    for (const [name, c] of Object.entries(SERVER_JOBS)) if ('graceH' in c) assert.ok(c.graceH > 0, name + ' graceH');
+  });
+});
+
 describe('unsentAlerts', () => {
   const alert = (id, hoursAgo, sent = null) => ({ id, job: 'ads/periodic', kind: 'alert', result: null, finished_at: ago(hoursAgo), detail: 'Alert text ' + id, sent_at: sent });
   test('returns only unsent alert rows, oldest first, as {id, text}', () => {

@@ -47,11 +47,38 @@ describe('reportRun', () => {
     assert.equal(JSON.parse(calls[0].opts.body).result, 'success');
     assert.equal(calls[0].opts.headers.apikey, 'fake-key');
   });
+  const noWait = async () => {}; // tests must not really sleep between attempts
   test('a failed POST or missing env is logged and returns false, it never throws', async () => {
     const f = async () => new Response('no', { status: 500 });
-    assert.equal(await reportRun({ job: 'j', exitCode: 1, detail: '', env, fetchImpl: f, host: 'h', log: () => {} }), false);
-    assert.equal(await reportRun({ job: 'j', exitCode: 1, detail: '', env: {}, fetchImpl: f, host: 'h', log: () => {} }), false);
+    assert.equal(await reportRun({ job: 'j', exitCode: 1, detail: '', env, fetchImpl: f, host: 'h', log: () => {}, sleepImpl: noWait }), false);
+    assert.equal(await reportRun({ job: 'j', exitCode: 1, detail: '', env: {}, fetchImpl: f, host: 'h', log: () => {}, sleepImpl: noWait }), false);
     const g = async () => { throw new Error('down'); };
-    assert.equal(await reportRun({ job: 'j', exitCode: 1, detail: '', env, fetchImpl: g, host: 'h', log: () => {} }), false);
+    assert.equal(await reportRun({ job: 'j', exitCode: 1, detail: '', env, fetchImpl: g, host: 'h', log: () => {}, sleepImpl: noWait }), false);
+  });
+  // Review finding 2026-11-21: a step ends exactly when the shared database is most likely overloaded; one failed POST must not lose the result.
+  const seq = (...answers) => { const calls = []; const f = async (u, o) => { calls.push(u); const a = answers[Math.min(calls.length - 1, answers.length - 1)]; if (a instanceof Error) throw a; return new Response(null, { status: a }); }; f.calls = calls; return f; };
+  test('a temporary database error (HTTP 500) is retried and the row is finally written', async () => {
+    const f = seq(500, 500, 201);
+    assert.equal(await reportRun({ job: 'j', exitCode: 0, detail: '', env, fetchImpl: f, host: 'h', log: () => {}, sleepImpl: noWait }), true);
+    assert.equal(f.calls.length, 3);
+  });
+  test('a network error and a rate limit (429) are retried too', async () => {
+    const f1 = seq(new Error('network down'), 201);
+    assert.equal(await reportRun({ job: 'j', exitCode: 0, detail: '', env, fetchImpl: f1, host: 'h', log: () => {}, sleepImpl: noWait }), true);
+    const f2 = seq(429, 201);
+    assert.equal(await reportRun({ job: 'j', exitCode: 0, detail: '', env, fetchImpl: f2, host: 'h', log: () => {}, sleepImpl: noWait }), true);
+    assert.equal(f1.calls.length + f2.calls.length, 4);
+  });
+  test('it gives up after 3 attempts when the error stays', async () => {
+    const f = seq(500);
+    assert.equal(await reportRun({ job: 'j', exitCode: 1, detail: '', env, fetchImpl: f, host: 'h', log: () => {}, sleepImpl: noWait }), false);
+    assert.equal(f.calls.length, 3);
+  });
+  test('a permanent client error (HTTP 400/401/403/404) is NOT retried (it would never succeed)', async () => {
+    for (const status of [400, 401, 403, 404]) {
+      const f = seq(status);
+      assert.equal(await reportRun({ job: 'j', exitCode: 1, detail: '', env, fetchImpl: f, host: 'h', log: () => {}, sleepImpl: noWait }), false, 'status ' + status);
+      assert.equal(f.calls.length, 1, 'status ' + status + ' must not be retried');
+    }
   });
 });
