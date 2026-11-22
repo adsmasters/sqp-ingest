@@ -9,8 +9,8 @@ on:
         description: 'Nur dieses SP-API Seller-Konto (spid) fuer Sales&Traffic — Diagnose/Einzeltest, leer = alle Kunden'
         required: false
         default: ''
-  schedule:
-    - cron: '0 2 * * *'     # 02:00 UTC — fertig bevor der Backfill um 04:30 startet
+  # Kein Zeitplan mehr (Umzug 22.11.2026): Audit und Sales&Traffic laufen im Nachtlauf sqp-night auf dem Hetzner-Server (siehe deploy/README.md).
+  # Dieser Workflow bleibt nur fuer MANUELLE Laeufe/Diagnose. Rollback: schedule-Block ('0 2 * * *') aus der Git-Historie zurueck.
 concurrency:
   group: sqp-daily-data
 jobs:

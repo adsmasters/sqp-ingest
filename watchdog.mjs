@@ -38,7 +38,8 @@ try {
 // 2) Geplante Workflows: gab es innerhalb der Frist einen erfolgreichen Lauf?
 //    (vorher nur backfill+daily-data — ads/vendor/refresh/bid-rules konnten wochenlang
 //    still sterben, weil deren Skripte Fehler schlucken; Deep-Dive 12.08.)
-const WF_FRIST = { 'backfill.yml': 30, 'daily-data.yml': 30, 'ads.yml': 30, 'vendor.yml': 30, 'bid-rules.yml': 30, 'refresh.yml': 8 * 24 };
+// Umzug 22.11.2026: daily-data/ads/vendor laufen im Server-Nachtlauf und werden ueber SERVER_JOBS (server-job-alerts.mjs, Tabelle server_job_runs) ueberwacht.
+const WF_FRIST = { 'backfill.yml': 30, 'bid-rules.yml': 30, 'refresh.yml': 8 * 24 };
 for (const [wf, fristH] of Object.entries(WF_FRIST)) {
   try {
     const gh = (url) => fetch(url, { headers: { Authorization: 'Bearer ' + GH, Accept: 'application/vnd.github+json' } });

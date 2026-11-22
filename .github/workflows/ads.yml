@@ -15,10 +15,8 @@ on:
         description: 'ASINs pro Loesch-Batch (leer = 100). Bei 57014-Timeout kleiner setzen, z.B. 10.'
         required: false
         default: ''
-  schedule:
-    - cron: '30 19 * * *'  # täglich 19:30 UTC (20:30 CET, 01:00 IST) — Nachtfenster, NACH dem Vendor-Import (18:00); seit 18.11.2026 nicht mehr 05:30, weil der Lauf
-                           # (2-4 h, Millionen Zeilen) in die Arbeitszeit des Teams reichte und die kleine Datenbank ueberlastet hat; fertig spaetestens ~23:30 UTC
-                           # (im Backfill-Worker verhungerte der Ads-Block regelmäßig)
+  # Kein Zeitplan mehr (Umzug 22.11.2026): ads-refresh und ads-periodic laufen im Nachtlauf sqp-night auf dem Hetzner-Server (siehe deploy/README.md).
+  # Dieser Workflow bleibt nur fuer MANUELLE Laeufe/Diagnose. Rollback: schedule-Block ('30 19 * * *') aus der Git-Historie zurueck.
 concurrency:
   group: sqp-ads-refresh   # nicht parallel zu sich selbst (verhindert nur zwei GitHub-
                            # Actions-Läufe gegeneinander, z.B. manueller Trigger + Schedule

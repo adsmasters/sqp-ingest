@@ -1,7 +1,7 @@
 name: Vendor Sales Import
+# Kein Zeitplan mehr (Umzug 22.11.2026): der Hetzner-Server fuehrt diesen Job im Nachtlauf sqp-night (18:00 UTC) aus, siehe deploy/README.md.
+# Der Workflow bleibt fuer MANUELLE Laeufe (Vendor-Import-Knopf der Plattform, Einzelkunde/Monate). Rollback: schedule-Block aus der Git-Historie zurueck.
 on:
-  schedule:
-    - cron: '0 18 * * *'   # täglich 18:00 UTC (19:00 CET, 23:30 IST) — Nachtfenster, vor dem Ads-Lauf (19:30); seit 18.11.2026 nicht mehr 04:30
   workflow_dispatch:
     inputs:
       client:

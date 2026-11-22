@@ -13,7 +13,15 @@
 // daily-data/sales-traffic, daily-data/audit 27; ads/refresh, audit-terms 29; ads/periodic, night/chain 26 (Zeilenalter bei normaler und um
 // 2,5 h verspaeteter Nacht durchgerechnet).
 export const SERVER_JOBS = {
-  // 'vendor/sales': { fristH: 27, graceH: 12, seit: '2026-11-22T18:00:00Z' },
+  // Umzug 22.11.2026 (Werte siehe Kommentar oben und deploy/README.md): seit = Start des ersten Nachtlaufs, graceH 12, fristH je Job.
+  'vendor/sales':             { fristH: 27, graceH: 12, seit: '2026-11-22T18:00:00Z' },
+  'vendor/ads':               { fristH: 27, graceH: 12, seit: '2026-11-22T18:00:00Z' },
+  'daily-data/sales-traffic': { fristH: 27, graceH: 12, seit: '2026-11-22T18:00:00Z' },
+  'ads/refresh':              { fristH: 29, graceH: 12, seit: '2026-11-22T18:00:00Z' },
+  'audit-terms':              { fristH: 29, graceH: 12, seit: '2026-11-22T18:00:00Z' },
+  'daily-data/audit':         { fristH: 27, graceH: 12, seit: '2026-11-22T18:00:00Z' },
+  'ads/periodic':             { fristH: 26, graceH: 12, seit: '2026-11-22T18:00:00Z' },
+  'night/chain':              { fristH: 26, graceH: 12, seit: '2026-11-22T18:00:00Z' },
 };
 
 const stamp = x => String(x).slice(0, 16) + 'Z';
