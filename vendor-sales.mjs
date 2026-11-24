@@ -33,23 +33,33 @@ function makeApi(H){ return async function api(path,opts={},retries=10){
     netErr=null; if(r.status===429){ if(i<retries-1) await sleep(25000+Math.random()*10000); continue; } return r; }
   if(netErr) throw netErr; // dauerhafter Netzwerkfehler: laut scheitern statt still "übersprungen"
   return null; }; }
-async function pollDoc(api,id){ for(let i=0;i<120;i++){await sleep(5000);const g=await api(`/reports/2021-06-30/reports/${id}`);if(!g)return null;const gj=await g.json();if(gj.processingStatus==='DONE')return gj.reportDocumentId;if(['FATAL','CANCELLED'].includes(gj.processingStatus))return null;} return null; }
+// Wartet bis zu maxPolls*5 s (Standard 120 = 10 Min) auf den Report. Ergebnis: {docId} (fertig), {failed:true} (FATAL/CANCELLED/API-Fehler: wird nie fertig)
+// oder {pending:true} (Zeit abgelaufen, Report läuft bei Amazon evtl. noch → der laufende Monat prüft ihn am Ende des Laufs noch einmal, 23.11.2026).
+// DONE ohne reportDocumentId zählt als fehlgeschlagen (wie früher: pollDoc gab null zurück, kein Abruf eines Dokuments "undefined").
+async function pollDocState(api,id,maxPolls=120){ for(let i=0;i<maxPolls;i++){await sleep(5000);const g=await api(`/reports/2021-06-30/reports/${id}`);if(!g)return {failed:true};const gj=await g.json();if(gj.processingStatus==='DONE')return gj.reportDocumentId?{docId:gj.reportDocumentId}:{failed:true};if(['FATAL','CANCELLED'].includes(gj.processingStatus))return {failed:true};} return {pending:true}; }
 async function download(api,docId){ const dr=await api(`/reports/2021-06-30/documents/${docId}`);if(!dr)return null;const drj=await dr.json();if(!drj.url)return null;let buf=await fetchBuf(drj.url);if(drj.compressionAlgorithm==='GZIP')buf=zlib.gunzipSync(buf);return JSON.parse(buf.toString('utf8')); }
 
 // Vendor-Sales-Report anfordern und salesByAsin zurückgeben (FATAL/429-Erschöpfung/fehlende Download-URL → null, z. B. keine Daten im Zeitraum;
 // Netzwerk-/HTTP-Fehler beim Download werfen nach den Retries → Kunde zählt als Fehler)
-async function fetchVendorSales(api,mkt,period,start,end){
+// Ergebnis von requestVendorSales: {rows} | {failed:true} | {pending:true, reportId} (nach 10 Min noch nicht fertig, Report-ID bleibt erhalten)
+async function requestVendorSales(api,mkt,period,start,end,maxPolls=120){
   const body={reportType:'GET_VENDOR_SALES_REPORT',marketplaceIds:[mkt],
     dataStartTime:start+'T00:00:00Z',dataEndTime:end+'T23:59:59Z',
     reportOptions:{reportPeriod:period,distributorView:'MANUFACTURING',sellingProgram:'RETAIL'}};
   const c=await api('/reports/2021-06-30/reports',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(!c||c.status>=400){console.log(`    createReport ${c?c.status:'-'}: ${c?await c.text():''}`);return null;}
-  const docId=await pollDoc(api,(await c.json()).reportId);
-  if(!docId) return null;
-  const doc=await download(api,docId);
-  if(!doc) return null; // Download fehlgeschlagen ≠ "keine Daten" (sonst würde ein Teilmonat still ersetzt)
-  return Array.isArray(doc.salesByAsin)?doc.salesByAsin:[];
+  if(!c||c.status>=400){console.log(`    createReport ${c?c.status:'-'}: ${c?await c.text():''}`);return {failed:true};}
+  const reportId=(await c.json()).reportId;
+  return collectVendorReport(api,reportId,await pollDocState(api,reportId,maxPolls));
 }
+async function collectVendorReport(api,reportId,polled){
+  if(polled.pending) return {pending:true,reportId};
+  if(polled.failed) return {failed:true};
+  const doc=await download(api,polled.docId);
+  if(!doc) return {failed:true}; // Download fehlgeschlagen ≠ "keine Daten" (sonst würde ein Teilmonat still ersetzt)
+  return {rows:Array.isArray(doc.salesByAsin)?doc.salesByAsin:[]};
+}
+// Wie bisher: Zeilen oder null (Fehler/Zeitüberschreitung) — für die kompletten Monate (die nächste Nacht holt einen fehlenden Monat von selbst nach)
+async function fetchVendorSales(api,mkt,period,start,end){ const r=await requestVendorSales(api,mkt,period,start,end); return r.rows||null; }
 const amt=v=>v&&typeof v.amount==='number'?v.amount:0;
 const cur=rows=>{for(const r of rows){const c=(r.orderedRevenue&&r.orderedRevenue.currencyCode)||(r.shippedRevenue&&r.shippedRevenue.currencyCode);if(c)return c;}return 'EUR';};
 
@@ -151,6 +161,54 @@ if(ONLY) clients=clients.filter(c=>c.name.toLowerCase().includes(ONLY));
 console.log(`${clients.length} Vendor-Kunde(n) mit API-Verbindung.`);
 
 let failed=0;
+// Laufender Monat (DAY-Reports, höchstens 14 Tage je Report): Kunden, deren Report nach 10 Min noch nicht fertig war, werden hier gemerkt und am
+// Ende des Laufs noch EINMAL geprüft (derselbe Report, kein neuer Request). Nur eine Zeitüberschreitung wird gemerkt — ein von Amazon als
+// FATAL/CANCELLED markierter Report wird nie fertig. Vorher ging die Report-ID nach 10 Min verloren (2–3 Kunden pro Nacht, auch schon auf GitHub).
+const deferred=[];
+const RECHECK_BUDGET_MS=(process.env.VENDOR_RECHECK_BUDGET_MIN===undefined?30:+process.env.VENDOR_RECHECK_BUDGET_MIN)*60000;
+// Gesamt-Limit (Review 24.11.2026): der Schritt hat auf dem Server ein hartes Zeitlimit von 90 Min (deploy/systemd/sqp-night.service, `timeout`). Ab
+// DEADLINE Minuten Laufzeit seit Skriptstart startet KEINE Nachprüfung mehr (eine Nachprüfung braucht höchstens ~12 Min: 5 Min Report + 5 Min Folge-Häppchen
+// + Titel), damit der Schritt in der Regel nicht mitten im Schreiben einer Nachprüfung getötet wird (kein Schutz für den ersten Durchgang und nicht bei
+// langem 429-Backoff; ein Abbruch beim Schreiben heilt sich in der nächsten Nacht, weil erst eingefügt und dann gelöscht wird). Normale Nacht ~8–40 Min, die Nachprüfung bleibt also meist erlaubt.
+const T_START=Date.now();
+const DEADLINE_MS=(process.env.VENDOR_DEADLINE_MIN===undefined?70:+process.env.VENDOR_DEADLINE_MIN)*60000;
+const nextDay=d=>{const n=new Date(d+'T00:00:00Z'); n.setUTCDate(n.getUTCDate()+1); return iso(n);};
+// st = {rows, s (Start des nächsten Häppchens), pending}. 'ok' | 'failed' | 'pending' (nur wenn allowDefer: st.pending merkt Report-ID + Häppchen-Ende)
+async function runChunks(api,mkt,lastAvail,st,allowDefer,maxPolls=120){
+  while(st.s<=lastAvail){
+    const sd=new Date(st.s+'T00:00:00Z');
+    const e=new Date(sd); e.setUTCDate(sd.getUTCDate()+13);
+    const chunkEnd=iso(e)<lastAvail?iso(e):lastAvail;
+    const r=await requestVendorSales(api,mkt,'DAY',st.s,chunkEnd,maxPolls);
+    if(r.pending){ if(!allowDefer) return 'failed'; st.pending={reportId:r.reportId,chunkEnd}; return 'pending'; }
+    if(r.failed) return 'failed';
+    st.rows.push(...r.rows);
+    st.s=nextDay(chunkEnd);
+    await sleep(3000);
+  }
+  return 'ok';
+}
+async function finishRunningMonth(client,api,mkt,curStart,rows,note){
+  if(!rows.length){ console.log('  Laufender Monat: keine Daten.'); return; }
+  const agg=aggregate(rows);
+  const maxEnd=Object.values(agg).reduce((s2,v)=>v.maxEnd&&v.maxEnd>s2?v.maxEnd:s2,curStart);
+  const names=await titleMap(api,client.id,mkt,Object.keys(agg));
+  const n=await writeReport(client,curStart,maxEnd,cur(rows),agg,names);
+  console.log(`  ${curStart} (laufend, bis ${maxEnd}): ${n} ASINs${note}.`);
+}
+// Zweiter Blick auf den gemerkten Report (bis zu 5 Min), danach die restlichen Häppchen (falls vorhanden) und Speichern. true = gespeichert.
+async function resumeRunningMonth(d){
+  const {client,mkt,curStart,lastAvail,st}=d;
+  const at=await accessToken(client.spid); // frisches Token: der erste Durchgang liegt evtl. eine halbe Stunde zurück
+  if(!at){ console.log('  Kein Refresh-Token — übersprungen.'); return false; }
+  const api=makeApi({'x-amz-access-token':at});
+  const r=await collectVendorReport(api,st.pending.reportId,await pollDocState(api,st.pending.reportId,60));
+  if(!r.rows) return false;
+  st.rows.push(...r.rows); st.s=nextDay(st.pending.chunkEnd); st.pending=null;
+  if(await runChunks(api,mkt,lastAvail,st,false,60)!=='ok') return false; // Folge-Häppchen: höchstens 5 Min Wartezeit (nicht 10)
+  await finishRunningMonth(client,api,mkt,curStart,st.rows,' (nach Nachprüfung)');
+  return true;
+}
 async function syncClient(client){
   console.log(`\n== ${client.name} (${client.spid}, ${client.marketplace}) ==`);
   const mkt=MKT_BY_CC[client.marketplace]||MKT_BY_CC.DE;
@@ -185,30 +243,30 @@ async function syncClient(client){
   const curStart=iso(new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),1)));
   const lastAvail=iso(new Date(Date.now()-4*86400_000));
   if(lastAvail>=curStart){
-    let rows=[], ok=true, s=curStart;
-    while(s<=lastAvail){
-      const sd=new Date(s+'T00:00:00Z');
-      const e=new Date(sd); e.setUTCDate(sd.getUTCDate()+13);
-      const chunkEnd=iso(e)<lastAvail?iso(e):lastAvail;
-      const part=await fetchVendorSales(api,mkt,'DAY',s,chunkEnd);
-      if(part===null){ ok=false; break; }
-      rows.push(...part);
-      const nx=new Date(chunkEnd+'T00:00:00Z'); nx.setUTCDate(nx.getUTCDate()+1); s=iso(nx);
-      await sleep(3000);
-    }
-    if(ok&&rows.length){
-      const agg=aggregate(rows);
-      const maxEnd=Object.values(agg).reduce((s2,v)=>v.maxEnd&&v.maxEnd>s2?v.maxEnd:s2,curStart);
-      const names=await titleMap(api,client.id,mkt,Object.keys(agg));
-      const n=await writeReport(client,curStart,maxEnd,cur(rows),agg,names);
-      console.log(`  ${curStart} (laufend, bis ${maxEnd}): ${n} ASINs.`);
-    } else console.log(`  Laufender Monat: ${ok?'keine Daten':'Report fehlgeschlagen'}.`);
+    const st={rows:[],s:curStart,pending:null};
+    const res=await runChunks(api,mkt,lastAvail,st,true);
+    if(res==='pending'){ console.log('  Laufender Monat: Report nach 10 Min noch nicht fertig — wird am Ende des Laufs noch einmal geprüft.'); deferred.push({client,mkt,curStart,lastAvail,st}); }
+    else if(res==='failed') console.log('  Laufender Monat: Report fehlgeschlagen.');
+    else await finishRunningMonth(client,api,mkt,curStart,st.rows,'');
   }
 }
 // Ein Kunde mit Fehler darf die übrigen nicht abbrechen; am Ende trotzdem Exit 1 (→ Slack-Alert)
 for(const client of clients){
   try{ await syncClient(client); }
   catch(e){ failed++; console.log(`  FEHLER bei ${client.name}: ${(e.cause&&e.cause.code)||e.message}`); if(!(e.cause&&e.cause.code)) console.log(e.stack); }
+}
+// Nachprüfung: gemerkte Reports des laufenden Monats noch einmal ansehen (Zeitbudget VENDOR_RECHECK_BUDGET_MIN, Standard 30 Min)
+if(deferred.length){
+  console.log(`\nNachprüfung: ${deferred.length} Bericht(e) des laufenden Monats waren nach 10 Min noch nicht fertig — werden erneut geprüft.`);
+  const t0=Date.now(); let got=0;
+  for(const d of deferred){
+    if(Date.now()-T_START>=DEADLINE_MS){ console.log(`  ${d.client.name}: Zeitgrenze für Nachprüfungen erreicht (${Math.round(DEADLINE_MS/60000)} Min seit Skriptstart) — keine Nachprüfung mehr, alter Stand bleibt.\n  Laufender Monat: nicht nachgeprüft.`); continue; }
+    if(Date.now()-t0>=RECHECK_BUDGET_MS){ console.log(`  ${d.client.name}: Zeitbudget der Nachprüfung aufgebraucht — übersprungen, alter Stand bleibt.\n  Laufender Monat: nicht nachgeprüft.`); continue; }
+    console.log(`  == ${d.client.name} ==`);
+    try{ if(await resumeRunningMonth(d)) got++; else console.log('  Laufender Monat: Report fehlgeschlagen (auch nach Nachprüfung) — alter Stand bleibt.'); }
+    catch(e){ failed++; console.log(`  FEHLER bei ${d.client.name} (Nachprüfung): ${(e.cause&&e.cause.code)||e.message}`); if(!(e.cause&&e.cause.code)) console.log(e.stack); }
+  }
+  console.log(`Nachprüfung: ${got} von ${deferred.length} nachträglich geholt.`);
 }
 console.log('\nFertig.');
 if(failed){ console.log(`${failed} Kunde(n) mit Fehler.`); process.exit(1); }

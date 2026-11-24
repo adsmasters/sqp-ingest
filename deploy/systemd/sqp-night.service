@@ -21,7 +21,8 @@ Environment=TERMS_BUDGET_MIN=90
 # audit-terms (IDs vorladen) -> voller Audit (ersetzt danach den ganzen Inhalt) -> ads-periodic ZULETZT (falls die Kette zu lang wird, trifft
 # der Nachtfenster-Schutz zuerst diesen Schritt) -> Marker "night/chain" (Kette bis zum Ende durchgelaufen; der Watchdog prueft diese Zeile).
 # "-": scheitert ein Schritt, laufen die naechsten trotzdem (wie "if: always()" / eigene Workflows). Jeder Schritt meldet selbst.
-# Auf dem Server gemessen: Vendor 16 + 32, Sales & Traffic 16, ads-refresh ~85, audit-terms ~52, Audit 160, ads-periodic 83 Min = ~7,5 h ab 18:00 UTC, fertig ~01:30 UTC.
+# Testläufe 21.11.: Vendor 16 + 32, Sales & Traffic 16, ads-refresh ~85, audit-terms ~52, Audit 160, ads-periodic 83 Min = ~7,5 h ab 18:00 UTC. Echte Nächte 22./23.11.: fertig 21:30 / 21:54 UTC.
+# vendor/sales (90 Min hartes Limit): ca. 8 Min + 10 Min je Kunde mit nicht fertigem Amazon-Bericht (erster Durchgang) + bis ca. 5–12 Min je Nachprüfung am Ende; das Skript startet ab 70 Min keine Nachprüfung mehr (VENDOR_DEADLINE_MIN).
 ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh vendor/sales 90 vendor-sales.mjs
 ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh vendor/ads 90 vendor-ads.mjs
 ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh daily-data/sales-traffic 150 sales-traffic.mjs 30
