@@ -28,6 +28,40 @@ test('the night chain moves as a whole: either ALL three workflows are still in 
   }
 });
 
+// The weekly SQP refresh moves on its own (a separate, later cutover, 2026-11-24 plan): refresh.yml leaves WF_FRIST in the SAME commit that adds both of its
+// steps to SERVER_JOBS. Never both, never neither.
+const WEEKLY = { 'refresh.yml': ['refresh/refresh', 'refresh/asin-meta'] };
+for (const [wf, steps] of Object.entries(WEEKLY)) {
+  test(`${wf} (weekly): watched in exactly one place (WF_FRIST on GitHub OR both steps in SERVER_JOBS), never both, never neither`, () => {
+    const onGithub = WF.includes(wf);
+    const inServer = steps.filter((s) => s in SERVER_JOBS);
+    if (onGithub) assert.equal(inServer.length, 0, `${wf} is still in WF_FRIST but ${inServer.join(', ')} are already in SERVER_JOBS`);
+    else assert.deepEqual(inServer.sort(), [...steps].sort(), `${wf} left WF_FRIST but not every step is in SERVER_JOBS`);
+  });
+}
+
+// Once the weekly jobs are watched on the server, their activation date must be sane (reviewer, 2026-11-24): `seit` = the first scheduled start, i.e. a MONDAY
+// 03:00:00 UTC (a past date or another time would raise a false "noch kein Lauf" alert after seit + graceH; a far-future date would silence the watchdog), and the
+// deadline must cover a weekly cadence (168 h) plus the run itself (<= ~6 h) with a margin, but not be so long that a missed week goes unnoticed for more than ~9 days.
+for (const job of WEEKLY['refresh.yml']) {
+  test(`${job}: if watched on the server, seit is a Monday 03:00:00 UTC and fristH is between 176 and 216 hours`, (t) => {
+    const c = SERVER_JOBS[job];
+    if (!c) return t.skip('not on the server yet');
+    const d = new Date(c.seit);
+    // Not in the past relative to the plan: the first Monday after the plan date (24 Nov 2026) is 30 Nov 03:00 UTC. A `seit` before that (e.g. 23 Nov) would raise a
+    // false "noch kein Lauf auf dem Server gemeldet" alert after seit + graceH although the first server run has not happened yet. If the cutover slips, `seit` only
+    // moves LATER, so this floor stays valid. Upper bound: at most two weeks after the date the test runs (i.e. the commit date): a far-future seit (a typo like 2027)
+    // would silence the watchdog for the weekly refresh, but a legitimate slip of the cutover by weeks must not turn a correct commit red (reviewer, round 4). It only
+    // loosens as time passes, so it cannot become a time bomb.
+    const FLOOR = Date.parse('2026-11-30T03:00:00Z');
+    assert.ok(d.getTime() >= FLOOR, `${job}: seit ${c.seit} is before the first planned server run (2026-11-30T03:00:00Z)`);
+    assert.ok(d.getTime() <= Date.now() + 14 * 86400e3, `${job}: seit ${c.seit} is more than 14 days after today — the watchdog would stay silent too long (typo?)`);
+    assert.equal(d.getUTCDay(), 1, `${job}: seit ${c.seit} is not a Monday`);
+    assert.equal(d.toISOString().slice(11), '03:00:00.000Z', `${job}: seit ${c.seit} is not 03:00:00 UTC`);
+    assert.ok(c.fristH >= 176 && c.fristH <= 216, `${job}: fristH ${c.fristH} outside 176-216`);
+  });
+}
+
 for (const [wf, steps] of Object.entries(GROUPS)) {
   test(`${wf}: watched in exactly one place (WF_FRIST on GitHub OR all its steps in SERVER_JOBS), never both, never neither`, () => {
     const onGithub = WF.includes(wf);

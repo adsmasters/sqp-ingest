@@ -1,0 +1,25 @@
+[Unit]
+Description=Woechentlicher SQP-Refresh (refresh.mjs, danach asin-meta.mjs) mit Meldung nach server_job_runs — ersetzt den GitHub-Workflow refresh.yml
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+WorkingDirectory=/opt/sqp-ingest
+EnvironmentFile=/opt/sqp-ingest/.env
+# Kein Nachtfenster-Schutz: asin-meta beginnt ca. 3 h nach dem Refresh und wuerde sonst als "nach dem Nachtfenster" uebersprungen. Der Refresh startet
+# Montag 03:00 UTC, die Nachtkette vom Sonntag ist normal um ~22:00 UTC fertig (Sperre /run/sqp-heavy.lock sorgt fuer die Reihenfolge, falls sie je laenger laeuft).
+Environment=NIGHT_GUARD=0
+Environment=NODE_OPTIONS=--max-old-space-size=1300
+# Die Zeitbudgets des Skripts (SQP_BUDGET_MIN 270, SQP_HARD_MIN 285, SQP_EXIT_MIN 300 = sauberes Ende mit Exit 0 und Sammelmeldung) bleiben auf den Standardwerten
+# wie im Workflow; das harte Limit des Wrappers (330) liegt 30 Min darueber. Sammelmeldungen (fehlgeschlagene/abgebrochene Kunden) gehen ueber notify.mjs als
+# 'alert'-Zeile nach server_job_runs, der GitHub-Waechter leitet sie weiter (auf dem Server gibt es bewusst kein Webhook-Secret).
+# "-": scheitert der Refresh, laeuft asin-meta trotzdem (wie "if: always()" im Workflow). asin-meta: 35 Min wie im Workflow.
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh refresh/refresh 330 refresh.mjs
+ExecStart=-/usr/bin/bash /opt/sqp-ingest/deploy/server-job.sh refresh/asin-meta 35 asin-meta.mjs
+MemoryMax=1500M
+OOMPolicy=continue
+MemorySwapMax=0
+Nice=10
+CPUWeight=20

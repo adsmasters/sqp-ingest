@@ -15,14 +15,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { daemonAdsAllowed } from '../daemon-policy.mjs';
+import { SERVER_JOBS } from '../server-job-alerts.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const wf = (name) => fs.readFileSync(path.join(here, '..', '.github', 'workflows', name), 'utf8');
 // first cron of a workflow: { min, hours: [..], dow }, or null when the workflow has no schedule any more (the server night chain owns it)
 function cronOrNull(name) {
-  const m = wf(name).match(/^\s*-\s*cron:\s*'([^']+)'/m);
-  if (!m) return null;
-  const [min, hour, , , dow] = m[1].trim().split(/\s+/);
+  const text = wf(name);
+  // YAML allows single-quoted, double-quoted AND unquoted values, with an optional trailing comment (reviewer 2026-11-24: a double-quoted or unquoted cron used to look like "no cron")
+  const m = text.match(/^\s*-\s*cron:\s*(['"]?)([^'"#\n]+?)\1\s*(?:#.*)?$/m);
+  if (!m) {
+    assert.ok(!/^\s*schedule:/m.test(text), `${name} has a schedule: block but no cron line could be parsed — the guard must not read that as "no cron"`);
+    return null;
+  }
+  const [min, hour, , , dow] = m[2].trim().split(/\s+/);
   return { min: +min, hours: hour.split(',').map(Number), dow };
 }
 function cron(name) { const c = cronOrNull(name); assert.ok(c, 'no cron found in ' + name); return c; }
@@ -80,12 +86,35 @@ describe('night-window schedule', () => {
     }
   });
 
-  test('the weekly SQP refresh stays on Monday 03:00 UTC (small tables, depends on when Amazon publishes the week)', () => {
-    const c = cron('refresh.yml');
-    assert.equal(c.dow, '1');
-    assert.deepEqual(c.hours, [3]);
-    assert.equal(c.min, 0);
+  test('the weekly SQP refresh stays on Monday 03:00 UTC (small tables, depends on when Amazon publishes the week) — on GitHub (cron) or, after the move to the server, on the server timer', () => {
+    const c = cronOrNull('refresh.yml');
+    if (c) {
+      assert.equal(c.dow, '1');
+      assert.deepEqual(c.hours, [3]);
+      assert.equal(c.min, 0);
+    } else {
+      const t = fs.readFileSync(path.join(here, '..', 'deploy', 'systemd', 'sqp-refresh.timer'), 'utf8');
+      assert.match(t, /OnCalendar=Mon \*-\*-\* 03:00:00 UTC/);
+      assert.match(wf('refresh.yml'), /workflow_dispatch/, 'refresh.yml lost its schedule AND its manual trigger (the "Nachholen" run for a single client)');
+    }
   });
+
+  // Review finding 2026-11-24 (test reviewer): a half-done cutover must not pass. A job is owned by GitHub (cron in its workflow) XOR by the server
+  // (SERVER_JOBS + timer). Both = it runs twice (double load on the shared database, Amazon's report quota is app-wide); neither = it never runs.
+  const OWNERS = {
+    'refresh.yml': ['refresh/refresh', 'refresh/asin-meta'],
+    'vendor.yml': ['vendor/sales', 'vendor/ads'],
+    'ads.yml': ['ads/refresh', 'ads/periodic'],
+    'daily-data.yml': ['daily-data/audit', 'daily-data/sales-traffic'],
+  };
+  for (const [file, jobs] of Object.entries(OWNERS)) {
+    test(`${file}: owned by GitHub (cron) OR by the server (all of ${jobs.join(', ')} in SERVER_JOBS), never both and never neither`, () => {
+      const hasCron = cronOrNull(file) !== null;
+      const onServer = jobs.filter((j) => j in SERVER_JOBS);
+      if (hasCron) assert.equal(onServer.length, 0, `${file} still has a cron AND ${onServer.join(', ')} are watched on the server: it would run twice`);
+      else assert.deepEqual(onServer.sort(), [...jobs].sort(), `${file} has no cron any more but not every job is watched on the server: nothing would run it, or the watchdog would not know`);
+    });
+  }
 
   test('the server worker does NOT start the ads job on its own by default (GitHub nightly run is the single owner)', () => {
     assert.equal(daemonAdsAllowed({}), false);

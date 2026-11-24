@@ -1,0 +1,9 @@
+[Unit]
+Description=Montags 03:00 UTC (04:00 CET, 08:30 IST): woechentlicher SQP-Refresh
+
+[Timer]
+OnCalendar=Mon *-*-* 03:00:00 UTC
+Persistent=false
+
+[Install]
+WantedBy=timers.target

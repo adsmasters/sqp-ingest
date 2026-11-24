@@ -32,7 +32,12 @@ const DAILY = [['daily-data/audit', 'audit-refresh.mjs 30'], ['daily-data/sales-
 // because systemd shows the whole chain as "success" even when a step failed (steps run with ExecStart=-). See tests/night-summary.test.mjs.
 const MARKER = ['night/chain', 'night-summary.mjs'];
 const NIGHT = [VENDOR[0], VENDOR[1], DAILY[1], ADS[0], AUDIT[0], DAILY[0], ADS[1], MARKER];
+// Weekly SQP refresh (moved from GitHub 2026-11-24 so the 6 h / ~730 min a month of GitHub minutes are not needed once the repo is private). Same steps as
+// .github/workflows/refresh.yml: refresh.mjs, then asin-meta.mjs (35-min cap, a failure must not skip it: the worker's own meta side job never runs, it sits
+// behind the "queue empty -> exit" check in backfill-worker.mjs, so this weekly step is the ONLY thing that keeps product titles fresh).
+const REFRESH = [['refresh/refresh', 'refresh.mjs'], ['refresh/asin-meta', 'asin-meta.mjs']];
 const SERVICES = [
+  { file: 'sqp-refresh', steps: REFRESH, timerLine: 'Mon *-*-* 03:00:00 UTC' },
   { file: 'sqp-vendor', steps: VENDOR, manual: true },
   { file: 'sqp-ads', steps: ADS, manual: true },
   { file: 'sqp-daily-data', steps: DAILY, manual: true },
@@ -55,16 +60,16 @@ describe('deploy/systemd units', () => {
         assert.equal(x.wrapper, '/opt/sqp-ingest/deploy/server-job.sh');
         if (x.job === 'night/chain') assert.ok(!x.dash, 'the final summary step must NOT start with "-": otherwise systemd ignores its failure and the unit shows success although a step failed');
         else assert.ok(x.dash, `${x.job}: ExecStart must start with "-" so the next step still runs`);
-        assert.ok(x.minutes > 0 && x.minutes <= 300, `${x.job}: unreasonable timeout ${x.minutes}`);
+        assert.ok(x.minutes > 0 && x.minutes <= 345, `${x.job}: unreasonable timeout ${x.minutes}`); // 345 = the longest old workflow limit (weekly refresh)
       }
     });
     test(`${s.file}: no Slack secret on the server`, () => {
       assert.ok(!/SLACK/i.test(unit(s.file + '.service')));
     });
-    if (s.timer) {
-      test(`${s.file}: timer at ${s.timer} UTC`, () => {
+    if (s.timer || s.timerLine) {
+      test(`${s.file}: timer at ${s.timerLine || s.timer + ' UTC daily'}`, () => {
         const t = unit(s.file + '.timer');
-        assert.match(t, new RegExp('OnCalendar=\\*-\\*-\\* ' + s.timer + ' UTC'));
+        assert.match(t, new RegExp('OnCalendar=' + (s.timerLine ? s.timerLine.replace(/[*]/g, '\\*') : '\\*-\\*-\\* ' + s.timer + ' UTC')));
         assert.match(t, /Persistent=false/);
         assert.match(t, /\[Install\][\s\S]*WantedBy=timers\.target/);
       });
@@ -112,7 +117,7 @@ describe('deploy/systemd units', () => {
 });
 
 describe('safety settings (validator findings 2026-11-21)', () => {
-  const ALL = ['sqp-night', 'sqp-ads', 'sqp-vendor', 'sqp-daily-data', 'sqp-audit-terms'];
+  const ALL = ['sqp-night', 'sqp-ads', 'sqp-vendor', 'sqp-daily-data', 'sqp-audit-terms', 'sqp-refresh'];
   test('a killed step (out of memory) must not stop the rest of the chain and must not thrash the swap: OOMPolicy=continue, MemorySwapMax=0', () => {
     for (const f of ALL) {
       assert.match(unit(f + '.service'), /OOMPolicy=continue/, f);
@@ -120,7 +125,7 @@ describe('safety settings (validator findings 2026-11-21)', () => {
     }
   });
   test('node gets an explicit heap limit below the memory cap in the ads units (the default heap of a 2 GB machine may be smaller than the biggest account needs)', () => {
-    for (const f of ['sqp-night', 'sqp-ads']) {
+    for (const f of ['sqp-night', 'sqp-ads', 'sqp-refresh']) {
       const v = unit(f + '.service');
       const m = v.match(/Environment=NODE_OPTIONS=--max-old-space-size=(\d+)/);
       assert.ok(m, f + ': NODE_OPTIONS missing');
@@ -135,6 +140,39 @@ describe('safety settings (validator findings 2026-11-21)', () => {
       assert.ok(refresh <= st.find((x) => x.job === 'ads/refresh').minutes - 30, f + ' ads-refresh budget ' + refresh);
       assert.ok(periodic <= st.find((x) => x.job === 'ads/periodic').minutes - 30, f + ' ads-periodic budget ' + periodic);
     }
+  });
+});
+
+describe('weekly refresh unit (sqp-refresh)', () => {
+  const v = () => unit('sqp-refresh.service');
+  const st = () => steps(v());
+  const exitDefault = () => +fs.readFileSync(path.join(here, '..', 'refresh.mjs'), 'utf8').match(/numEnv\(process\.env\.SQP_EXIT_MIN,\s*(\d+)\)/)[1];
+  test("the wrapper's hard timeout for refresh.mjs is at least 20 minutes above the script's own clean stop (SQP_EXIT_MIN default), so the script ends itself with exit 0 instead of being killed", () => {
+    const r = st().find((x) => x.job === 'refresh/refresh');
+    assert.ok(r.minutes >= exitDefault() + 20, `timeout ${r.minutes} vs script stop ${exitDefault()}`);
+    assert.ok(r.minutes <= 345, 'not above the old workflow job limit (345 min)');
+  });
+  test('asin-meta keeps its 35-minute cap and runs even if refresh failed (both ExecStart lines start with "-")', () => {
+    const m = st().find((x) => x.job === 'refresh/asin-meta');
+    assert.equal(m.minutes, 35);
+    assert.ok(st().every((x) => x.dash));
+  });
+  test('the night guard is OFF: asin-meta starts about 3 hours after the refresh and must not be skipped as "after the night window" (a start delay of the refresh needs the lock only if the night chain overran)', () => {
+    const flat = v().replace(/\\\r?\n\s*/g, ' ');
+    assert.match(flat, /^\s*Environment\s*=.*\bNIGHT_GUARD=0\b/m);
+    assert.ok(!/^\s*Environment\s*=.*\bNIGHT_GUARD=1\b/m.test(flat));
+  });
+  test('the unit does not override the script budgets (SQP_BUDGET_MIN / SQP_HARD_MIN / SQP_EXIT_MIN): the defaults in refresh.mjs apply, as in the workflow', () => {
+    // refresh.mjs reads SQP_ONLY (would silently restrict the weekly run to one client), SQP_BREAKER, SQP_*_MIN, WEEKS, CONC, CONC_CLIENTS; also the quoted form Environment="X=1"
+    // ONE Environment= line may hold several space-separated assignments (and may start with spaces): check every assignment on every Environment= line
+    // systemd also allows a backslash line continuation and spaces around the "=": join continuation lines and accept Environment = ...
+    const flat = v().replace(/\\\r?\n\s*/g, ' ');
+    assert.ok(!/^\s*Environment\s*=.*(\bSQP_[A-Z_]+=|\bWEEKS=|\bCONC(_CLIENTS)?=)/m.test(flat), 'an Environment= line sets SQP_*, WEEKS or CONC*');
+  });
+  test('the timer is Monday 03:00 UTC, like the old GitHub schedule, and does not run on other days', () => {
+    const t = unit('sqp-refresh.timer');
+    assert.match(t, /OnCalendar=Mon \*-\*-\* 03:00:00 UTC/);
+    assert.equal((t.match(/^OnCalendar=/gm) || []).length, 1);
   });
 });
 
