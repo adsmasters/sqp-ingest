@@ -22,6 +22,10 @@ export const SERVER_JOBS = {
   'daily-data/audit':         { fristH: 27, graceH: 12, seit: '2026-11-22T18:00:00Z' },
   'ads/periodic':             { fristH: 26, graceH: 12, seit: '2026-11-22T18:00:00Z' },
   'night/chain':              { fristH: 26, graceH: 12, seit: '2026-11-22T18:00:00Z' },
+  // Umzug woechentlicher SQP-Refresh (29.11.2026): seit = erster geplanter Serverlauf (Montag 03:00 UTC), graceH 12 (Lauf dauert normal ~2,5 h, hart max. 5 h),
+  // fristH 180 = 168 h (eine Woche) + 12 h Spielraum. Zeilen von VOR seit (Testlaeufe: Job 'refresh/refresh-test' u.a.) zaehlen nicht.
+  'refresh/refresh':          { fristH: 180, graceH: 12, seit: '2026-11-30T03:00:00Z' },
+  'refresh/asin-meta':        { fristH: 180, graceH: 12, seit: '2026-11-30T03:00:00Z' },
 };
 
 const stamp = x => String(x).slice(0, 16) + 'Z';

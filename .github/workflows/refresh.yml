@@ -1,8 +1,9 @@
 name: SQP Weekly Refresh
 on:
-  schedule:
-    - cron: '0 3 * * 1'   # jeden Montag 03:00 UTC
-  workflow_dispatch:       # zusätzlich manuell auslösbar
+  # Umzug 29.11.2026: der Montag-03:00-UTC-Lauf gehoert dem Server (systemd sqp-refresh.timer, deploy/systemd/).
+  # Hier bleibt nur der manuelle Lauf, z.B. "Nachholen" fuer einen einzelnen Kunden (only_client).
+  workflow_dispatch:
+    # (manuell auslösbar)
     inputs:
       only_client:
         description: 'Nur diesen Kunden (Name exakt, z.B. "MGF - IT", oder spid) — leer = alle. Zum Nachholen nach Amazon-Timeouts.'

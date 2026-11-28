@@ -39,7 +39,8 @@ try {
 //    (vorher nur backfill+daily-data — ads/vendor/refresh/bid-rules konnten wochenlang
 //    still sterben, weil deren Skripte Fehler schlucken; Deep-Dive 12.08.)
 // Umzug 22.11.2026: daily-data/ads/vendor laufen im Server-Nachtlauf und werden ueber SERVER_JOBS (server-job-alerts.mjs, Tabelle server_job_runs) ueberwacht.
-const WF_FRIST = { 'backfill.yml': 30, 'bid-rules.yml': 30, 'refresh.yml': 8 * 24 };
+// Umzug 29.11.2026: der woechentliche SQP-Refresh (refresh.yml) laeuft ab Montag 30.11. auf dem Server (SERVER_JOBS: refresh/refresh, refresh/asin-meta).
+const WF_FRIST = { 'backfill.yml': 30, 'bid-rules.yml': 30 };
 for (const [wf, fristH] of Object.entries(WF_FRIST)) {
   try {
     const gh = (url) => fetch(url, { headers: { Authorization: 'Bearer ' + GH, Accept: 'application/vnd.github+json' } });
